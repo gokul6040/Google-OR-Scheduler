@@ -20,6 +20,7 @@ from database.models import (
 )
 from database.repository import ACTIVE_SCHEDULE_STATUSES, _plan_end_date
 from scheduling.slot_config import SLOTS, valid_consecutive_block
+from services.patient_status_service import lock_patient
 
 
 def _optional_mapping_exists(session: Session, model, *conditions) -> bool:
@@ -137,7 +138,7 @@ def _preview_reservation(
         warnings.setdefault(code, {"code": code, "message": message})
 
     if not patient.active:
-        warn("INACTIVE_PATIENT", "This patient is inactive.")
+        raise ValueError("This patient is inactive. Reactivate them before booking a new appointment.")
     if opening is not None:
         doctor = session.get(Therapist, opening.therapist_id)
         capability = doctor.department_id == opening.department_id or _optional_mapping_exists(session, TherapistCapability,
@@ -309,6 +310,9 @@ def reserve_admin_slot(
         if previous.fingerprint != fingerprint:
             raise ValueError("Booking request ID belongs to a different reservation")
         return {"appointment_ids": json.loads(previous.appointment_ids), "warnings": json.loads(previous.warnings)}
+    patient = lock_patient(session, patient_id)
+    if patient is None or not patient.active:
+        raise ValueError("Choose an active patient before booking a new appointment.")
     if opening is not None:
         # Serialize new bookings for this doctor. A second request must see the
         # first booking and obtain a new preview before overriding a conflict.

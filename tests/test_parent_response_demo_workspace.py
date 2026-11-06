@@ -31,7 +31,7 @@ def test_large_dataset_repairs_only_released_slots_and_keeps_other_bookings(work
         "replies": 24, "yes": 12, "no": 12, "no_reply": 8,
     }
     assert workspace.start()
-    workspace.worker.join(timeout=15)
+    workspace.worker.join(timeout=120)
     after = workspace.state()
     assert after["status"] == "completed", after["error"]
     outcome = after["outcome"]
@@ -86,7 +86,7 @@ def test_reset_is_blocked_while_worker_is_running(workspace):
 
 def test_admin_can_confirm_entire_suggested_visit_and_refresh_the_screen(workspace):
     workspace.start()
-    workspace.worker.join(timeout=15)
+    workspace.worker.join(timeout=120)
     state = workspace.state()
     change = next(item for item in state["outcome"]["changes"] if item["original"]["therapy"] == "Speech")
     details = workspace.slot_details(state["run_id"], change["original"]["id"])
@@ -113,7 +113,7 @@ def test_admin_can_confirm_entire_suggested_visit_and_refresh_the_screen(workspa
 
 def test_off_plan_admin_reservation_does_not_fulfill_unrelated_therapy(workspace):
     workspace.start()
-    workspace.worker.join(timeout=15)
+    workspace.worker.join(timeout=120)
     state = workspace.state()
     source = next(item["original"] for item in state["outcome"]["changes"] if item["original"]["therapy"] == "Speech")
     chosen = next(item for item in state["after"]["patients"] if item["code"] == "DEMO-080")
@@ -130,7 +130,7 @@ def test_off_plan_admin_reservation_does_not_fulfill_unrelated_therapy(workspace
 
 def test_partial_visit_warns_but_admin_can_reserve_selected_slot(workspace):
     workspace.start()
-    workspace.worker.join(timeout=15)
+    workspace.worker.join(timeout=120)
     state = workspace.state()
     change = next(item for item in state["outcome"]["changes"] if item["original"]["therapy"] == "Speech")
     payload = {

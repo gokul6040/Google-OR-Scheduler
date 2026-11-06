@@ -4,6 +4,8 @@ import copy
 import os
 import secrets
 import threading
+
+from services.whatsapp_worker import embedded_worker_enabled
 from urllib.parse import urlsplit
 
 from config import load_local_env_file
@@ -40,7 +42,7 @@ class MountedFlow:
         self.stop = threading.Event()
         self.previews = {}
         self.worker = None
-        if live:
+        if live and embedded_worker_enabled():
             self.worker = threading.Thread(target=self.work, daemon=True)
             self.worker.start()
 
@@ -62,6 +64,12 @@ class MountedFlow:
 def runtime():
     """Initialize only on test API use; the main database is never selected."""
     global _runtime
+    from main_workflow.config import data_source, enabled
+
+    if enabled() and data_source() == "test":
+        from main_workflow.mount import runtime as main_runtime
+
+        return main_runtime()
     with _lock:
         if _runtime is None:
             _runtime = MountedFlow()
@@ -83,6 +91,11 @@ def route_webhook(payload):
     instance = runtime()
     if not instance.flow.live:
         return payload
+    return route_payload(payload, instance)
+
+
+def route_payload(payload: dict, instance) -> dict:
+    """Route a signed callback to the selected retained test runtime."""
     phone_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
     allowed = instance.flow.contact_numbers()
     remaining = copy.deepcopy(payload)

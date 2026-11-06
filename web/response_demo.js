@@ -155,10 +155,10 @@ function renderPatientPicker() {
   if (!booking) return;
   const query = $("patient-search").value.trim().toLowerCase();
   const rows = (pickerMode === "all" ? booking.patients : booking.suggestions).filter(item =>
-    !query || `${item.name} ${item.code} ${item.therapies.join(" ")}`.toLowerCase().includes(query));
+    item.active && (!query || `${item.name} ${item.code} ${item.therapies.join(" ")}`.toLowerCase().includes(query)));
   $("picker-all").classList.toggle("active", pickerMode === "all");
   $("picker-suggestions").classList.toggle("active", pickerMode === "suggestions");
-  $("patient-results").innerHTML = rows.length ? rows.map(item => `<button class="patient-option ${booking.selectedId === item.id ? "selected" : ""}" data-choose-patient="${item.id}"><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.code)} · ${escapeHtml(item.therapies.join(" + ") || "No active plan")}</span><small>${item.active ? escapeHtml(item.scenario || "Patient in the demo list") : "Inactive patient · admin can override"}${item.current_proposal ? " · Current suggestion" : ""}</small></button>`).join("") : empty("No patients found", pickerMode === "suggestions" ? "Choose patient shows the full list, including people with rule mismatches." : "Try another name or patient code.");
+  $("patient-results").innerHTML = rows.length ? rows.map(item => `<button class="patient-option ${booking.selectedId === item.id ? "selected" : ""}" data-choose-patient="${item.id}"><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.code)} · ${escapeHtml(item.therapies.join(" + ") || "No active plan")}</span><small>${escapeHtml(item.scenario || "Patient in the demo list")}${item.current_proposal ? " · Current suggestion" : ""}</small></button>`).join("") : empty("No active patients found", pickerMode === "suggestions" ? "Choose patient shows all active patients." : "Try another name or patient code.");
 }
 
 async function openBooking(sourceId, suggestedPatientId=null) {

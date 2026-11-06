@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 
@@ -44,7 +45,7 @@ from database.models import (
     ZohoAppointmentSync,
     ZohoPlanDetailRecord,
 )
-from database.repository import load_scheduling_problem, save_proposed_schedule
+from database.repository import limit_new_bookings_to_day, load_scheduling_problem, save_proposed_schedule
 from importers.initialize_source import initialize_source_database
 from scheduling.cp_sat_scheduler import generate_weekly_schedule
 from scheduling.slot_config import CONSECUTIVE_TO_NEXT, SLOTS, slot_label
@@ -56,8 +57,8 @@ from services.admin_reservation_service import (
     preview_empty_slot, reserve_admin_slot, reserved_source_ids,
 )
 from services.cancellation_service import cancel_patient_appointment
+from services.patient_status_service import change_patient_status, lock_patient
 from services.replacement_service import find_pull_forward_candidates, find_replacement_candidates
-from services.rolling_schedule_service import generate_rolling_schedule
 from services.whatsapp_button_service import record_button_clicks
 from services.whatsapp_help_service import queue_help_replies, start_help_reply_worker
 from services.whatsapp_service import (
@@ -1305,6 +1306,10 @@ def serialize_preview(
     }
 
 
+def next_planning_date() -> date:
+    return datetime.now(ZoneInfo("Asia/Kolkata")).date() + timedelta(days=1)
+
+
 def overview_payload(today: date | None = None) -> dict[str, Any]:
     """Return the counts and operational health shown in the shell."""
     today = today or date.today()
@@ -1337,6 +1342,7 @@ def overview_payload(today: date | None = None) -> dict[str, Any]:
         )) or 0
     return {
         "today": today.isoformat(),
+        "nextPlanningDate": next_planning_date().isoformat(),
         "weekStart": week_start.isoformat(),
         "patients": patient_count,
         "therapists": therapist_count,
@@ -1464,6 +1470,7 @@ def serialize_patient_preferences(session, patient: Patient) -> dict[str, Any]:
             "id": patient.id,
             "code": patient.patient_code,
             "name": patient.name or patient.patient_code,
+            "active": patient.active,
         },
         "preference": {
             "day": preferred_day,
@@ -1656,6 +1663,15 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             raise ApiError(HTTPStatus.BAD_REQUEST, "WhatsApp webhook body must be valid JSON") from exc
         if not isinstance(payload, dict):
             raise ApiError(HTTPStatus.BAD_REQUEST, "WhatsApp webhook body must be an object")
+        from main_workflow.config import enabled as main_workflow_enabled
+
+        if main_workflow_enabled():
+            from main_workflow.mount import route_webhook as route_main_webhook
+
+            try:
+                payload = route_main_webhook(payload)
+            except Exception:
+                raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, "Could not save operations webhook event") from None
         if os.getenv("FLOW_TEST_LIVE", "false").lower() == "true":
             from flow_test.mount import route_webhook
 
@@ -1670,6 +1686,11 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             f"statusCounts={summary.get('statusCounts', {})} "
             f"failureCodes={summary.get('failureCodes', {})}"
         )
+        if main_workflow_enabled():
+            # The full app owns its selected workflow store. Never fall through
+            # to the old main database/help queue while using test records.
+            self.send_json({"ok": True})
+            return
         phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
         if phone_number_id:
             try:
@@ -1688,6 +1709,21 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         parsed = urlparse(self.path)
         try:
+            if WORKSPACE_CONTEXT.get() is None:
+                from main_workflow.mount import dispatch_root
+
+                if dispatch_root(self):
+                    return
+            if parsed.path == "/api/workflow/status":
+                from main_workflow.config import enabled
+
+                self.send_json({"enabled": enabled(), "path": "/" if enabled() else None})
+                return
+            if parsed.path == "/workflow" or parsed.path.startswith("/workflow/"):
+                from main_workflow.mount import dispatch
+
+                dispatch(self)
+                return
             if parsed.path == "/test" or parsed.path.startswith("/test/"):
                 from flow_test.mount import dispatch
 
@@ -1752,6 +1788,11 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
                 self.path = "/index.html"
             elif not (WEB_DIR / parsed.path.lstrip("/")).is_file():
                 self.path = "/index.html"
+                # SPA fallback pages need the selected workflow's configuration
+                # and login UI just like /. Do not serve the legacy shell while
+                # /api belongs to the authenticated workflow runtime.
+                if WORKSPACE_CONTEXT.get() is None and dispatch_root(self):
+                    return
             super().do_GET()
         except ApiError as exc:
             self.send_json({"error": exc.message}, exc.status)
@@ -1764,6 +1805,16 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         parsed = urlparse(self.path)
         try:
+            if WORKSPACE_CONTEXT.get() is None:
+                from main_workflow.mount import dispatch_root
+
+                if dispatch_root(self):
+                    return
+            if parsed.path == "/workflow" or parsed.path.startswith("/workflow/"):
+                from main_workflow.mount import dispatch
+
+                dispatch(self)
+                return
             if parsed.path == "/test" or parsed.path.startswith("/test/"):
                 from flow_test.mount import dispatch
 
@@ -1786,6 +1837,10 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
                 return
             if parsed.path == "/api/assistant/memory/clear":
                 self.clear_assistant_memory(body)
+                return
+            match = re.fullmatch(r"/api/patients/(\d+)/status", parsed.path)
+            if match:
+                self.save_patient_status(int(match.group(1)), body)
                 return
             match = re.fullmatch(r"/api/patients/(\d+)/preferences", parsed.path)
             if match:
@@ -1863,6 +1918,32 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
         clear_assistant_memory(assistant_session_id(body.get("sessionId")))
         self.send_json({"message": "Temporary assistant memory cleared"})
 
+    def save_patient_status(self, patient_id: int, body: dict[str, Any]) -> None:
+        """Update internal scheduling eligibility and retain the reason."""
+        from zoneinfo import ZoneInfo
+
+        active = body.get("active")
+        if type(active) is not bool:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Choose Active or Inactive")
+        reason = body.get("reason")
+        reason = reason.strip() if isinstance(reason, str) else ""
+        if not active and not 1 <= len(reason) <= 1000:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Enter a reason of 1 to 1,000 characters")
+        context = WORKSPACE_CONTEXT.get() or {}
+        flow = context.get("flow")
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        with SessionLocal() as session:
+            patient = lock_patient(session, patient_id)
+            if patient is None:
+                raise ApiError(HTTPStatus.NOT_FOUND, "Patient not found")
+            if patient.active and not active and flow is not None:
+                flow.review_inactive_patient_offers(session, patient, today)
+            change_patient_status(
+                session, patient, active, reason, today, context.get("admin_user", "scheduler_manager"),
+            )
+            session.commit()
+        self.send_json({"active": active})
+
     def save_patient_preferences(self, patient_id: int, body: dict[str, Any]) -> None:
         """Store one recurring preferred day and morning/afternoon time band."""
         day = body.get("day")
@@ -1914,6 +1995,9 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
 
     def replacement_candidates(self, appointment_id: int) -> None:
         """Return the current eligible children for one released appointment."""
+        scope = parse_qs(urlparse(getattr(self, "path", "")).query).get("wholeVisit", ["true"])[0]
+        if scope not in {"true", "false"}:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "wholeVisit must be true or false")
         with SessionLocal() as session:
             appointment = session.get(Appointment, appointment_id)
             if appointment is None:
@@ -1923,7 +2007,7 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             group = replacement_group(
                 session,
                 appointment,
-                find_replacement_candidates(session, appointment, monday(appointment.date)),
+                find_replacement_candidates(session, appointment, monday(appointment.date), whole_visit=scope == "true"),
             )
         self.send_json(group, HTTPStatus.OK)
 
@@ -1966,7 +2050,8 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
                         whole_visit=body.get("wholeVisit", True),
                         request_id=body.get("requestId"), preview_token=body.get("previewToken"),
                         override_warnings=body.get("overrideWarnings", False),
-                        mode=body.get("mode", "without_messaging"), admin_user="scheduler_manager",
+                        mode=body.get("mode", "without_messaging"),
+                        admin_user=(WORKSPACE_CONTEXT.get() or {}).get("admin_user", "scheduler_manager"),
                     )
                     session.commit()
                     result["message"] = "Reservation confirmed without messaging"
@@ -1999,7 +2084,8 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
                         patient_id=body["patientId"], request_id=body.get("requestId"),
                         preview_token=body.get("previewToken"),
                         override_warnings=body.get("overrideWarnings", False),
-                        mode=body.get("mode", "without_messaging"), admin_user="scheduler_manager",
+                        mode=body.get("mode", "without_messaging"),
+                        admin_user=(WORKSPACE_CONTEXT.get() or {}).get("admin_user", "scheduler_manager"),
                     )
                     session.commit()
                     result["message"] = "Appointment confirmed without messaging"
@@ -2337,45 +2423,53 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
         self.send_json({"message": "Appointment moved safely"})
 
     def generate_schedule(self, body: dict[str, Any]) -> None:
-        selected_date = parse_date(body.get("start"), "start")
-        run_date = max(selected_date, date.today())
-        search_seconds = parse_search_seconds(body.get("searchSeconds"))
+        target = parse_date(body.get("start"), "start")
+        if body.get("planningMode", "day") != "day":
+            raise ApiError(HTTPStatus.BAD_REQUEST, "The generator plans one day at a time")
+        if target != next_planning_date():
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Refresh the page and generate tomorrow's schedule")
+        if target.weekday() == 6:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "The centre does not schedule sessions on Sundays")
+        settings = replace(SOLVER_SETTINGS, max_time_seconds=parse_search_seconds(body.get("searchSeconds")))
         with SessionLocal() as session:
-            result, start, planning_end = generate_rolling_schedule(
-                session,
-                run_date,
-                mode=SolverMode.BEST_EFFORT,
-                settings=replace(
-                    SOLVER_SETTINGS,
-                    max_time_seconds=search_seconds,
-                ),
-            )
+            problem = load_scheduling_problem(session, monday(target), planning_start_date=target)
+            limit_new_bookings_to_day(problem, target)
+            result = generate_weekly_schedule(problem, mode=SolverMode.BEST_EFFORT, settings=settings)
+        day_result = replace(result, appointments=[item for item in result.appointments if item.date == target])
         preview_id = str(uuid4())
-        horizon_days = (planning_end - start).days + 1
         workspace_previews()[preview_id] = {
-            "result": result,
-            "start": start,
-            "horizon_days": horizon_days,
+            "result": day_result,
+            "start": target,
+            "horizon_days": 1,
             "created": datetime.utcnow(),
         }
-        payload = serialize_preview(result, start, planning_end)
-        # The saved window begins on Monday so existing appointments can be
-        # preserved, while new placements begin on the day the planner runs.
-        payload["planningStart"] = run_date.isoformat()
-        payload["previewId"] = preview_id
+        payload = serialize_preview(day_result, target, target)
+        payload.update({
+            "previewId": preview_id,
+            "planningStart": target.isoformat(),
+            "planningMode": "day",
+            "planningDays": 1,
+            "newSessions": sum(item not in problem.pinned for item in day_result.appointments),
+            "scheduledOnSelectedDay": len(day_result.appointments),
+        })
         self.send_json(payload, HTTPStatus.CREATED)
 
     def save_schedule(self, preview_id: str) -> None:
         preview = workspace_previews().get(preview_id)
         if preview is None:
             raise ApiError(HTTPStatus.NOT_FOUND, "This preview has expired. Generate it again.")
+        if preview["start"] != next_planning_date():
+            raise ApiError(HTTPStatus.CONFLICT, "The planning date changed. Generate tomorrow's preview again")
         result = preview["result"]
         if result.status not in ("OPTIMAL", "FEASIBLE") or any(result.validation.values()):
             raise ApiError(HTTPStatus.CONFLICT, "This preview did not pass validation")
         with SessionLocal() as session:
-            added = save_proposed_schedule(
-                session, result, preview["start"], preview["horizon_days"]
-            )
+            try:
+                added = save_proposed_schedule(
+                    session, result, preview["start"], preview["horizon_days"]
+                )
+            except ValueError as exc:
+                raise ApiError(HTTPStatus.CONFLICT, str(exc)) from exc
         workspace_previews().pop(preview_id, None)
         self.send_json({"message": f"Saved {added} new proposed appointments", "added": added})
 
@@ -2713,7 +2807,24 @@ def run_response_demo(port: int = 8766) -> None:
 
 def run(host: str = "127.0.0.1", port: int = 8765, *, local_ui_only: bool = False) -> None:
     """Start the local therapy scheduler web application."""
-    if local_ui_only:
+    from main_workflow.config import enabled as main_workflow_enabled, local_no_auth
+
+    if local_no_auth():
+        import ipaddress
+
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = False
+        if not loopback:
+            raise ValueError("Password-free test mode requires a loopback-only host")
+
+    workflow_mode = main_workflow_enabled()
+    if workflow_mode:
+        from main_workflow.mount import runtime as main_workflow_runtime
+
+        main_workflow_runtime()  # Bind the chosen existing database; no legacy imports.
+    elif local_ui_only:
         # Use the configured original records without workbook imports, unrelated
         # migrations, or automatic WhatsApp sends during local UI review.
         init_admin_booking_tables()
@@ -2723,7 +2834,8 @@ def run(host: str = "127.0.0.1", port: int = 8765, *, local_ui_only: bool = Fals
             initialize_source_database(session)
     server = ThreadingHTTPServer((host, port), TherapySchedulerHandler)
     help_worker_stop, help_worker = (None, None)
-    if not local_ui_only:
+    from services.whatsapp_worker import embedded_worker_enabled
+    if not local_ui_only and not workflow_mode and embedded_worker_enabled():
         help_worker_stop, help_worker = start_help_reply_worker(SessionLocal)
     print(f"EIC Therapy Scheduler is ready at http://{host}:{port}", flush=True)
     try:
@@ -2736,6 +2848,8 @@ def run(host: str = "127.0.0.1", port: int = 8765, *, local_ui_only: bool = Fals
 
         if "flow_test.mount" in sys.modules:
             sys.modules["flow_test.mount"].close()
+        if "main_workflow.mount" in sys.modules:
+            sys.modules["main_workflow.mount"].close()
         if help_worker_stop is not None:
             help_worker_stop.set()
             help_worker.join(timeout=2)

@@ -17,11 +17,12 @@ from services.zoho_creator_service import ZohoCreatorSettings, authorization_url
 SCOPES = tuple(sorted(REQUIRED_SCOPES))
 
 
-def save_test_refresh_token(path: Path, token: str) -> None:
+def save_test_refresh_token(path: Path, token: str, *, key: str = "FLOW_TEST_ZOHO_REFRESH_TOKEN") -> None:
     """Preserve existing local settings and atomically replace only the test token."""
     if not token or any(c in token for c in "\r\n"):
         raise ValueError("Zoho did not return a valid refresh token")
-    key = "FLOW_TEST_ZOHO_REFRESH_TOKEN"
+    if key not in {"FLOW_TEST_ZOHO_REFRESH_TOKEN", "MAIN_WORKFLOW_ZOHO_REFRESH_TOKEN"}:
+        raise ValueError("Unsupported workflow credential key")
     lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     lines = [line for line in lines if not line.startswith(key + "=")]
     lines.append(f"{key}={token}")
@@ -37,9 +38,10 @@ def save_test_refresh_token(path: Path, token: str) -> None:
     os.environ[key] = token
 
 
-def authorize(settings: ZohoCreatorSettings, destination: Path) -> None:
+def authorize(settings: ZohoCreatorSettings, destination: Path, *, verify=verify_target,
+              token_key: str = "FLOW_TEST_ZOHO_REFRESH_TOKEN", label: str = "test") -> None:
     """Serve the already-registered loopback callback; the user approves in Zoho."""
-    verify_target(settings)
+    verify(settings)
     redirect = urlsplit(settings.redirect_uri)
     if (redirect.scheme != "http" or redirect.hostname not in {"127.0.0.1", "localhost"}
             or redirect.path != "/oauth/zoho/callback" or redirect.query or redirect.fragment):
@@ -67,9 +69,9 @@ def authorize(settings: ZohoCreatorSettings, destination: Path) -> None:
                         refreshed = refresh_access_token(replace(settings, refresh_token=token))
                         if not set(SCOPES).issubset(set(refreshed.get("scope", "").split())):
                             raise ValueError("Zoho did not grant the requested permissions")
-                        save_test_refresh_token(destination, token)
+                        save_test_refresh_token(destination, token, key=token_key)
                         result["ok"] = True
-                        status, message = 200, "Test Scheduler connected. You can close this tab."
+                        status, message = 200, f"{label.title()} Scheduler connected. You can close this tab."
                     except (ValueError, OSError):
                         result["error"] = "Zoho connection was not saved; check consent and existing client configuration"
             data = message.encode()
@@ -86,7 +88,7 @@ def authorize(settings: ZohoCreatorSettings, destination: Path) -> None:
         raise ValueError("The local callback port is busy. Stop the local scheduler server, then rerun this helper") from None
     server.timeout = 1
     try:
-        print("Open this Zoho link and approve create/read/update and reading form definitions for the test connection:", flush=True)
+        print(f"Open this Zoho link and approve create/read/update and reading form definitions for the {label} connection:", flush=True)
         print(authorization_url(replace(settings, scopes=SCOPES), state), flush=True)
         while not result and time.monotonic() < deadline:
             server.handle_request()
@@ -94,7 +96,7 @@ def authorize(settings: ZohoCreatorSettings, destination: Path) -> None:
         server.server_close()
     if not result.get("ok"):
         raise ValueError(result.get("error", "Zoho connection timed out; existing settings were kept"))
-    print("Test-only refresh token saved in ignored flow_test/.env. No schedule records were pushed.")
+    print(f"{label.title()} refresh token saved in its ignored environment file. No schedule records were pushed.")
 
 
 def main() -> None:

@@ -126,12 +126,46 @@ for (const rows of Object.values(records)) {
     row.Modified_Time = indiaWallTime(row.Modified_Time);
   }
 }
+// Expanded source contract: stable fields, extra columns and phones stored only
+// on registrations. No Modified_Time is exposed by these fictional reports.
+records.Mapped_Plans = records.Plan_Report.map(({Parent_No, Modified_Time, PatientName, RegistrationID, ...row}) =>
+  ({...row, Name:PatientName, Registration_Id:RegistrationID, Extra_Plan_Column:{ignored:true}}));
+records.Mapped_Consultants = records.All_Consultants.map(({Modified_Time, ...row}) =>
+  ({...row, Extra_Consultant_Column:"ignored"}));
+records.All_Registrations = records.Plan_Report.map((row, index) => ({
+  ID:String(980000 + index), Registration_Id:row.RegistrationID, Phone:row.Parent_No,
+  Added_Time:row.Added_Time, Extra_Registration_Column:["ignored"]
+}));
 records.Scheduler_Report = [{ID:"950000",Reg_ID:"DEMO",PatientName:"Fictional Existing Row",Doctor:"Demo Doctor",
   Therapy_Date:"24-10-2026",TherapyTime:"09:00 AM",Scheduler_Key:"",Status:"",Added_Time:"23-Oct-2026 11:05:33"}];
 let schedulerSequence = 950000, failAfterCreate = false, schedulerKeyUnique = true;
+let fault = null;
 http.createServer((req, res) => {
   const url = new URL(req.url, "http://localhost");
+  // A separate fictional main-workflow namespace exercises target configuration.
+  // This alias exists only in the local mock, never in application code.
+  url.pathname = url.pathname.replace('/fictional-clinic/eic-pilot/', '/nidhin.kumar_turnb/test-gokul/');
   res.setHeader("Content-Type", "application/json");
+  if (req.method === "POST" && url.pathname === "/__test__/fault") {
+    fault = req.body?.count ? {...req.body} : null;
+    res.end(JSON.stringify({armed:Boolean(fault)})); return;
+  }
+  if (req.method === "POST" && url.pathname === "/__test__/registration-phone") {
+    const row = records.All_Registrations.find(item => item.Registration_Id === req.body?.registration);
+    if (!row || !/^[1-9]\d{7,14}$/.test(req.body?.phone || "")) {
+      res.writeHead(400);res.end(JSON.stringify({message:"Invalid fictional registration contact"}));return;
+    }
+    row.Phone = req.body.phone;
+    res.end(JSON.stringify({updated:true}));return;
+  }
+  const activeFault = fault && url.pathname.endsWith(fault.path) &&
+    (!fault.cursor || req.headers.record_cursor === fault.cursor) && fault.count > 0 ? fault : null;
+  if (activeFault && !activeFault.afterWrite) {
+    activeFault.count--;
+    res.writeHead(activeFault.status || 503, {"Retry-After":String(activeFault.retryAfter || 0)});
+    res.end(JSON.stringify(Object.hasOwn(activeFault, "payload") ? activeFault.payload :
+      {code:activeFault.status === 429 ? 2955 : 500})); return;
+  }
   const schedulerBase = "/creator/v2.1/data/nidhin.kumar_turnb/test-gokul/";
   if (req.method === "GET" && url.pathname === "/creator/v2.1/meta/nidhin.kumar_turnb/test-gokul/form/Scheduler/fields") {
     res.end(JSON.stringify({code:3000,fields:["Reg_ID","PatientName","Doctor","Therapy_Date","TherapyTime","Scheduler_Key","Status"].map(link_name =>
@@ -153,7 +187,7 @@ http.createServer((req, res) => {
   if ((req.method === "POST" && url.pathname === schedulerBase + "form/Scheduler") || (req.method === "PATCH" && schedulerUpdate)) {
     const data = req.body?.data;
     const fields = ["Reg_ID","PatientName","Doctor","Therapy_Date","TherapyTime","Scheduler_Key","Status"];
-    if (!data || Object.keys(data).sort().join() !== fields.sort().join() || !data.Scheduler_Key.startsWith("test-") || req.body.skip_workflow) {
+    if (!data || Object.keys(data).sort().join() !== fields.sort().join() || !/^(test|main)-/.test(data.Scheduler_Key) || req.body.skip_workflow) {
       res.writeHead(400); res.end(JSON.stringify({code:3001})); return;
     }
     let row;
@@ -168,6 +202,16 @@ http.createServer((req, res) => {
       row = {ID:String(++schedulerSequence),...data,Added_Time:"23-Oct-2026 12:00:00"};
       records.Scheduler_Report.push(row);
       if (failAfterCreate) {failAfterCreate=false;res.writeHead(500);res.end(JSON.stringify({code:500}));return;}
+    }
+    if (activeFault && activeFault.afterWrite) {
+      activeFault.count--;
+      // The provider committed but the client cannot see the response.
+      if (activeFault.disconnect) {req.socket.destroy();return;}
+      if (activeFault.delayMs) {
+        setTimeout(() => res.end(JSON.stringify({code:3000,data:{ID:row.ID}})), activeFault.delayMs);
+        return;
+      }
+      res.writeHead(503);res.end(JSON.stringify({code:500}));return;
     }
     res.end(JSON.stringify({code:3000,data:{ID:row.ID}}));return;
   }
@@ -207,18 +251,18 @@ http.createServer((req, res) => {
       const modifiedEnd = criteria.match(/Modified_Time < '([^']+)'/);
       const addedStart = criteria.match(/Added_Time >= '([^']+)'/);
       const modifiedStart = criteria.match(/Modified_Time >= '([^']+)'/);
-      if (!addedEnd || !modifiedEnd || Boolean(addedStart) !== Boolean(modifiedStart)) {
+      if (!addedEnd || Boolean(addedStart) !== Boolean(modifiedStart) || (addedStart && !modifiedEnd)) {
         res.writeHead(400); res.end(JSON.stringify({code:3330,message:"Unsupported criteria"})); return;
       }
       data = data.filter(row => wallTime(row.Added_Time) < wallTime(addedEnd[1]) &&
-        wallTime(row.Modified_Time) < wallTime(modifiedEnd[1]) &&
+        (!modifiedEnd || wallTime(row.Modified_Time) < wallTime(modifiedEnd[1])) &&
         (!addedStart || wallTime(row.Added_Time) >= wallTime(addedStart[1]) ||
           wallTime(row.Modified_Time) >= wallTime(modifiedStart[1])));
     }
     if (!data.length) {
       res.writeHead(400); res.end(JSON.stringify({code:9280,message:"No records found matching the given criteria."})); return;
     }
-    if (report === "Plan_Report" && data.length > 4) {
+    if (["Plan_Report", "Mapped_Plans", "All_Registrations"].includes(report) && data.length > 4) {
       if (!req.headers.record_cursor) { res.setHeader("record_cursor", "next-page"); data = data.slice(0,4); }
       else if (req.headers.record_cursor === "next-page") data = data.slice(4);
       else { res.writeHead(400); res.end(JSON.stringify({message:"Bad cursor"})); return; }

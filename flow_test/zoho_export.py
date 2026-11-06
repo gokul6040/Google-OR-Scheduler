@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from database.models import Appointment, AppointmentStatus, AuditLog, Patient, Therapist
 from flow_test.models import FlowInbox, FlowJob, FlowOffer, FlowSetting
-from flow_test.zoho_import import put_setting
+from flow_test.zoho_import import put_setting, require_reconciled_source
 from scheduling.slot_config import SLOTS
 
 if TYPE_CHECKING:
@@ -46,7 +46,10 @@ def finalise_unanswered(flow: "FlowTest", session: Session, target: date, *, dry
     assumed = 0
     inbound = list(session.scalars(select(FlowJob).where(FlowJob.kind == "INBOUND")))
     unresolved = list(session.scalars(select(FlowInbox).where(FlowInbox.resolved == 0)))
+    active_codes = set(session.scalars(select(Patient.patient_code).where(Patient.active.is_(True))))
     for offer in session.scalars(select(FlowOffer).where(FlowOffer.state.in_(("PENDING", "EXPIRED")))):
+        if offer.patient_code not in active_codes:
+            continue
         try:
             items = flow._offer_items(session, offer)
         except ValueError:
@@ -132,7 +135,7 @@ def export_preview(flow: "FlowTest", target: date) -> dict:
     with flow.lock, flow.sessions() as session:
         namespace = setting(session, "namespace", "preview")
         rows, blocked = export_rows(flow, session, target, namespace)
-        return {"target": TARGET, "date": target.isoformat(), "changes": rows,
+        return {"target": getattr(flow, "export_target", TARGET), "date": target.isoformat(), "changes": rows,
                 "awaitingFinalisation": blocked, "lastPush": setting(session, "last_push"),
                 "wouldAssumeAcceptedVisits": finalise_unanswered(flow, session, target, dry_run=True),
                 "openBatch": setting(session, "batch"), "mode": "PREVIEW ONLY"}
@@ -142,6 +145,7 @@ def prepare_export(flow: "FlowTest", target: date) -> dict:
     """Freeze one resumable batch; parent events already queued take precedence."""
     with flow.lock, flow.inbound_lock:
         with flow.sessions() as session:
+            require_reconciled_source(session)
             batch = setting(session, "batch")
         if batch is not None:
             if batch["date"] != target.isoformat():
@@ -157,11 +161,11 @@ def prepare_export(flow: "FlowTest", target: date) -> dict:
             if session.scalar(select(FlowJob.id).where(
                     FlowJob.kind == "INBOUND", FlowJob.status.in_(("FAILED", "PROCESSING")))) is not None:
                 raise ValueError("An incoming reply needs staff review before finalising the schedule")
-            namespace = setting(session, "namespace") or f"test-{uuid4().hex}"
+            namespace = setting(session, "namespace") or f"{getattr(flow, 'export_key_prefix', 'test')}-{uuid4().hex}"
             store(session, "namespace", namespace)
             assumed = finalise_unanswered(flow, session, target)
             rows, blocked = export_rows(flow, session, target, namespace)
-            batch = {"id": uuid4().hex, "date": target.isoformat(), "target": TARGET,
+            batch = {"id": uuid4().hex, "date": target.isoformat(), "target": getattr(flow, "export_target", TARGET),
                      "cutoffIST": ist_time(utc_now()), "assumedAcceptedVisits": assumed,
                      "changes": rows, "awaitingStaff": blocked, "acknowledged": {}}
             store(session, "batch", batch)

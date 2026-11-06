@@ -1,6 +1,5 @@
 const state = {
   activeView: "schedule",
-  calendarView: "day",
   perspective: "therapist",
   currentDate: new Date(),
   overview: null,
@@ -19,6 +18,15 @@ const state = {
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const icon = (name) => `<svg aria-hidden="true"><use href="#i-${name}"/></svg>`;
+
+function newRequestId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 15) | 64;
+  bytes[8] = (bytes[8] & 63) | 128;
+  return Array.from(bytes, (byte, index) => `${[4, 6, 8, 10].includes(index) ? "-" : ""}${byte.toString(16).padStart(2, "0")}`).join("");
+}
 
 function assistantMemorySessionId() {
   if (state.assistantSessionId) return state.assistantSessionId;
@@ -113,21 +121,23 @@ function therapyClass(name) {
 }
 
 const testWorkspace = /^\/test(?:\/|$)/.test(location.pathname);
-const dailyPlanning = () => state.overview?.planningMode === "day";
+const mainWorkflowWorkspace = Boolean(window.therapyWorkspace) || /^\/workflow(?:\/|$)/.test(location.pathname);
+const workflowWorkspace = testWorkspace || mainWorkflowWorkspace;
+const workflowPrefix = window.therapyWorkspace?.apiPrefix ?? (mainWorkflowWorkspace ? '/workflow' : '/test');
 const savePreviewLabel = result => result.autoOfferOnSave
-  ? (result.liveMessaging ? "Save & send WhatsApp offers" : "Save & queue preview offers")
+  ? (result.messagingPaused ? "Save & queue offers (messaging OFF)" : result.liveMessaging ? "Save & send WhatsApp offers" : "Save & queue preview offers")
   : "Save as proposed";
 
 async function api(path, options = {}) {
-  const response = await fetch(testWorkspace ? `/test${path}` : path, {
+  const response = await fetch(workflowWorkspace ? `${workflowPrefix}${path}` : path, {
     ...options,
     headers: {
       "Content-Type": "application/json",
       ...(options.headers || {}),
-      ...(testWorkspace ? { Authorization: `Bearer ${sessionStorage.getItem('flowAdminToken') || ''}` } : {}),
+      ...(workflowWorkspace && !window.therapyWorkspace?.localNoAuth && window.therapyWorkspace?.requiresAccessKey !== false ? { Authorization: `Bearer ${sessionStorage.getItem(mainWorkflowWorkspace ? 'mainWorkflowAdminToken' : 'flowAdminToken') || ''}` } : {}),
     },
   });
-  if (testWorkspace && response.status === 401) {
+  if (workflowWorkspace && response.status === 401) {
     document.dispatchEvent(new Event("test-workspace-login"));
   }
   let payload = {};
@@ -264,7 +274,6 @@ async function initialize() {
   try {
     state.overview = await api("/api/overview");
     state.currentDate = parseLocalDate(state.overview.today);
-    if (dailyPlanning()) $("[data-planning-label] span").textContent = "Plan selected day";
     const badge = $("#attentionBadge");
     badge.textContent = state.overview.needsAttention;
     badge.hidden = !state.overview.needsAttention;
@@ -276,7 +285,9 @@ async function initialize() {
 
 function bindShellEvents() {
   $$("[data-view]").forEach((button) => button.addEventListener("click", () => setView(button.dataset.view)));
-  $$("[data-view-link]").forEach((button) => button.addEventListener("click", () => setView(button.dataset.viewLink)));
+  $$("[data-view-link]").forEach((button) => button.addEventListener("click", () => {
+    setView(button.dataset.viewLink);
+  }));
   $("#menuButton").addEventListener("click", () => $("#sidebar").classList.toggle("open"));
   $("#filterButton").addEventListener("click", () => openDrawer("filterDrawer"));
   $$('[data-close-drawer]').forEach((button) => button.addEventListener("click", closeDrawers));
@@ -302,23 +313,14 @@ function bindShellEvents() {
     state.currentDate = parseLocalDate(event.target.value);
     await loadSchedule();
   });
-  $$('[data-calendar-view]').forEach((button) => button.addEventListener("click", async () => {
-    state.calendarView = button.dataset.calendarView;
-    $$('[data-calendar-view]').forEach((item) => item.classList.toggle("active", item === button));
-    await loadSchedule();
-  }));
   $$('[data-perspective]').forEach((button) => button.addEventListener("click", async () => {
     state.perspective = button.dataset.perspective;
     $$('[data-perspective]').forEach((item) => item.classList.toggle("active", item === button));
     if (state.perspective === "patient") {
-      state.calendarView = "week";
       if (!state.filters.patient && state.schedule?.appointments.length) {
         state.filters.patient = String(state.schedule.appointments[0].patientId);
       }
-    } else {
-      state.calendarView = "day";
     }
-    $$('[data-calendar-view]').forEach((item) => item.classList.toggle("active", item.dataset.calendarView === state.calendarView));
     populatePerspectivePicker();
     await loadSchedule();
   }));
@@ -353,14 +355,9 @@ function bindShellEvents() {
       return;
     }
     if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName)) return;
-    if (event.key === "Escape") { closeSearchableSelects(); closeDrawers(); }
+    if (event.key === "Escape" && !$(".patient-status-dialog[open]")) { closeSearchableSelects(); closeDrawers(); }
     if (state.activeView !== "schedule") return;
     const shortcut = event.key.toLowerCase();
-    if ({ d: "day", w: "week", a: "agenda" }[shortcut]) {
-      state.calendarView = { d: "day", w: "week", a: "agenda" }[shortcut];
-      $$('[data-calendar-view]').forEach((item) => item.classList.toggle("active", item.dataset.calendarView === state.calendarView));
-      await loadSchedule();
-    }
     if (shortcut === "t") {
       state.currentDate = parseLocalDate(state.overview.today);
       await loadSchedule();
@@ -369,15 +366,13 @@ function bindShellEvents() {
 }
 
 async function stepDate(direction) {
-  const amount = state.calendarView === "day" ? direction : direction * 7;
-  state.currentDate = addDays(state.currentDate, amount);
-  if (state.calendarView === "day" && state.currentDate.getDay() === 0) state.currentDate = addDays(state.currentDate, direction);
+  state.currentDate = addDays(state.currentDate, direction * 7);
   await loadSchedule();
 }
 
 async function loadSchedule() {
-  const start = state.calendarView === "day" ? state.currentDate : startOfWeek(state.currentDate);
-  const days = state.calendarView === "day" ? 1 : 6;
+  const start = startOfWeek(state.currentDate);
+  const days = 6;
   $("#calendarSurface").innerHTML = `<div class="loading-state"><span class="spinner"></span>Loading the practice schedule…</div>`;
   try {
     state.schedule = await api(`/api/schedule?start=${isoDate(start)}&days=${days}`);
@@ -392,7 +387,7 @@ async function loadSchedule() {
     }
     populateFilterOptions();
     renderSchedule();
-    if (testWorkspace) window.therapyWhatsapp.mountCalendar({
+    if (workflowWorkspace) window.therapyWhatsapp.mountCalendar({
       root: $(".schedule-heading .heading-actions"), date: isoDate(state.currentDate), api,
       onChanged: refreshAfterWhatsapp,
       onOpen: () => setView("operations", {operationsTab:"whatsapp"}),
@@ -502,66 +497,17 @@ function renderSchedule() {
   $("#previewBanner").hidden = !(state.showPreview && state.latestPreview);
   renderFilterChips();
   updateDateDisplay();
-  if (state.calendarView === "day") renderDayCalendar(appointments);
-  if (state.calendarView === "week") renderWeekCalendar(appointments);
-  if (state.calendarView === "agenda") renderAgenda(appointments);
+  renderWeekCalendar(appointments);
 }
 
 function updateDateDisplay() {
   const display = $("#dateDisplay");
-  if (state.calendarView === "day") {
-    display.textContent = formatDate(state.currentDate, { weekday: "long", day: "numeric", month: "long", year: "numeric" });
-  } else {
-    const start = startOfWeek(state.currentDate);
-    const end = addDays(start, 5);
-    const sameMonth = start.getMonth() === end.getMonth();
-    display.textContent = sameMonth
-      ? `${start.getDate()}–${formatDate(end, { day: "numeric", month: "long", year: "numeric" })}`
-      : `${formatDate(start, { day: "numeric", month: "short" })} – ${formatDate(end, { day: "numeric", month: "short", year: "numeric" })}`;
-  }
-}
-
-function renderDayCalendar(appointments) {
-  const showingTherapists = state.perspective === "therapist";
-  const entities = showingTherapists
-    ? state.schedule.therapists
-        .filter((item) => (!state.filters.therapist || String(item.id) === state.filters.therapist) && (
-          appointments.some((appointment) => appointment.therapistId === item.id) ||
-          (!appointments.length && item.active)
-        ))
-        .map((item) => ({ id: item.id, name: item.name, code: item.code, meta: `${item.department} · ${item.location}` }))
-    : [...new Map(appointments.map((item) => [item.patientId, {
-        id: item.patientId,
-        name: item.patientName,
-        code: item.patientCode,
-        meta: `${new Set(appointments.filter((appointment) => appointment.patientId === item.patientId).map((appointment) => appointment.therapy)).size} therapies`,
-      }])).values()];
-  if (!entities.length && !appointments.length) {
-    $("#calendarSurface").innerHTML = emptySchedule();
-    return;
-  }
-  entities.sort((a, b) => a.name.localeCompare(b.name));
-  const columns = entities.length;
-  const header = entities.map((entity) => {
-    const count = appointments.filter((item) => (
-      showingTherapists ? item.therapistId === entity.id : item.patientId === entity.id
-    )).length;
-    return `<div class="clinician-header ${showingTherapists ? "doctor-header" : "patient-header"}"><span class="avatar">${escapeHtml(initials(entity.name))}</span><span><strong>${escapeHtml(entity.name)}</strong><small>${escapeHtml(entity.code)} · ${escapeHtml(entity.meta)}</small></span><span class="clinician-count">${count}</span></div>`;
-  }).join("");
-  const rows = state.schedule.slotLabels.map((label, slot) => {
-    const cells = entities.map((entity) => {
-      const items = appointments.filter((item) => item.slot === slot && (
-        showingTherapists ? item.therapistId === entity.id : item.patientId === entity.id
-      ));
-      const empty = !items.length ? emptySlotAttributes(isoDate(state.currentDate), slot,
-        showingTherapists ? entity.id : null, showingTherapists ? null : entity.id) : "";
-      return `<div class="schedule-cell" ${empty}>${items.map(appointmentCard).join("")}</div>`;
-    }).join("");
-    return `<div class="day-grid-row"><div class="time-label">${escapeHtml(label.split("–")[0])}</div>${cells}</div>${calendarBreakRow(slot, "day")}`;
-  }).join("");
-  $("#calendarSurface").innerHTML = `<div class="day-calendar" style="--columns:${columns}"><div class="day-grid-header"><div class="time-corner">Time</div>${header}</div>${rows}</div>`;
-  bindAppointmentCards();
-  bindEmptySlots();
+  const start = startOfWeek(state.currentDate);
+  const end = addDays(start, 5);
+  const sameMonth = start.getMonth() === end.getMonth();
+  display.textContent = sameMonth
+    ? `${start.getDate()}–${formatDate(end, { day: "numeric", month: "long", year: "numeric" })}`
+    : `${formatDate(start, { day: "numeric", month: "short" })} – ${formatDate(end, { day: "numeric", month: "short", year: "numeric" })}`;
 }
 
 function calendarBreakRow(afterSlot, view) {
@@ -579,20 +525,13 @@ function renderWeekCalendar(appointments) {
   const rows = state.schedule.slotLabels.map((label, slot) => {
     const cells = days.map((day) => {
       const items = appointments.filter((item) => item.slot === slot && item.date === isoDate(day));
-      const visible = items.slice(0, 3);
-      return `<div class="week-cell" ${!items.length ? emptySlotAttributes(isoDate(day), slot, state.filters.therapist || null) : ""}>${visible.map(appointmentCard).join("")}${items.length > visible.length ? `<button class="overflow-button" data-overflow-date="${isoDate(day)}">+${items.length - visible.length} more</button>` : ""}</div>`;
+      return `<div class="week-cell" ${!items.length ? emptySlotAttributes(isoDate(day), slot, state.filters.therapist || null) : ""}>${items.map(appointmentCard).join("")}</div>`;
     }).join("");
     return `<div class="week-grid-row"><div class="time-label">${escapeHtml(label.split("–")[0])}</div>${cells}</div>${calendarBreakRow(slot, "week")}`;
   }).join("");
   $("#calendarSurface").innerHTML = `<div class="week-calendar"><div class="week-grid-header"><div class="time-corner">Time</div>${headers}</div>${rows}</div>`;
   bindAppointmentCards();
   bindEmptySlots();
-  $$('[data-overflow-date]').forEach((button) => button.addEventListener("click", () => {
-    state.currentDate = parseLocalDate(button.dataset.overflowDate);
-    state.calendarView = "agenda";
-    $$('[data-calendar-view]').forEach((item) => item.classList.toggle("active", item.dataset.calendarView === "agenda"));
-    renderSchedule();
-  }));
 }
 
 function emptySlotAttributes(date, slot, therapistId = null, patientId = null) {
@@ -621,18 +560,6 @@ function bindEmptySlots() {
   });
 }
 
-function renderAgenda(appointments) {
-  if (!appointments.length) {
-    $("#calendarSurface").innerHTML = emptySchedule();
-    return;
-  }
-  const groups = Object.groupBy ? Object.groupBy(appointments, (item) => item.date) : appointments.reduce((acc, item) => ((acc[item.date] ||= []).push(item), acc), {});
-  $("#calendarSurface").innerHTML = `<div class="agenda-list">${Object.entries(groups).sort(([a], [b]) => a.localeCompare(b)).map(([day, items]) => `
-    <section class="agenda-day"><div class="agenda-day-title">${formatDate(parseLocalDate(day), { weekday: "long", day: "numeric", month: "long" })}<span>${items.length}</span></div>
-    ${items.map((item) => `<button class="agenda-row" data-appointment-id="${item.id}"><span class="agenda-time">${escapeHtml(item.time.split("–")[0])}</span><span class="agenda-person"><strong>${escapeHtml(state.perspective === "therapist" ? item.patientName : item.therapistName)}</strong><small>${escapeHtml(state.perspective === "therapist" ? item.patientCode : item.therapistCode)} · ${escapeHtml(item.therapy)}</small></span><span class="agenda-clinician"><strong>${escapeHtml(state.perspective === "therapist" ? item.therapistName : item.patientName)}</strong><small>${escapeHtml(state.perspective === "therapist" ? item.therapistCode : item.patientCode)}</small></span><span class="soft-pill">${escapeHtml(item.location)}</span><span class="status-pill status-${item.status.toLowerCase()}">${escapeHtml(formatStatus(item.status))}</span>${icon("chevron-right")}</button>`).join("")}</section>`).join("")}</div>`;
-  bindAppointmentCards();
-}
-
 function appointmentCard(item) {
   const primary = state.perspective === "therapist" ? item.patientName : item.therapistName;
   const secondary = state.perspective === "therapist" ? item.patientCode : item.therapistCode;
@@ -649,7 +576,7 @@ function bindAppointmentCards() {
 function emptySchedule() {
   const filtersActive = Object.values(state.filters).some(Boolean);
   const perspective = state.perspective === "therapist" ? "doctor" : "patient";
-  return `<div class="empty-state"><span class="empty-state-icon">${icon(filtersActive ? "filter" : "calendar")}</span><h3>${filtersActive ? `No ${perspective} schedules match these filters` : "This schedule is ready to plan"}</h3><p>${filtersActive ? "Clear or adjust the calendar filters to broaden the view." : "Generate a validated Monday–Saturday plan to place patient sessions into available clinician time."}</p><button class="${filtersActive ? "secondary-button" : "primary-button"}" id="emptyAction">${filtersActive ? "Clear filters" : "Plan this week"}</button></div>`;
+  return `<div class="empty-state"><span class="empty-state-icon">${icon(filtersActive ? "filter" : "calendar")}</span><h3>${filtersActive ? `No ${perspective} schedules match these filters` : "This schedule is ready to plan"}</h3><p>${filtersActive ? "Clear or adjust the calendar filters to broaden the view." : "Generate tomorrow’s draft to place patient sessions into available clinician time."}</p><button class="${filtersActive ? "secondary-button" : "primary-button"}" id="emptyAction">${filtersActive ? "Clear filters" : "Plan tomorrow"}</button></div>`;
 }
 
 function errorState(message) {
@@ -661,7 +588,7 @@ function bindEmptyAction() {
   if (!action) return;
   action.addEventListener("click", () => {
     if (Object.values(state.filters).some(Boolean)) { clearFilters(); renderSchedule(); }
-    else setView("generator");
+    else { setView("generator"); }
   });
 }
 
@@ -701,7 +628,7 @@ async function loadOverviewView() {
             <div class="detail-item"><span>${icon("team")}</span><div><small>Active therapists</small><strong>${state.overview.therapists.toLocaleString("en-IN")} available</strong></div></div>
             <div class="detail-item"><span>${icon("activity")}</span><div><small>Import warnings</small><strong>${state.overview.importWarnings.toLocaleString("en-IN")} recorded for review</strong></div></div>
           </div>
-          <button class="primary-button" data-overview-generate style="width:100%;margin-top:18px">${dailyPlanning() ? "Plan selected day" : "Generate the next 14 days"}</button>
+          <button class="primary-button" data-overview-generate style="width:100%;margin-top:18px">Plan tomorrow</button>
         </div></aside>
       </div>`;
     $('[data-overview-schedule]').addEventListener("click", () => setView("schedule"));
@@ -767,7 +694,7 @@ function renderPatientsView() {
   root.innerHTML = `${pageHeading("Care directory", "Patients")}
     <div class="directory-toolbar"><label class="search-field">${icon("search")}<input id="patientSearch" type="search" value="${escapeHtml(state.patientQuery)}" placeholder="Search by patient name or code" aria-label="Search patients"></label><span class="soft-pill">${state.patients.length.toLocaleString("en-IN")} patients</span></div>
     <div class="table-shell"><table class="data-table"><thead><tr><th>Patient ID</th><th>Patient</th><th>Preference day</th><th>Preferred time</th><th>Status</th><th></th></tr></thead><tbody>
-      ${rows.map((item) => `<tr><td><strong>${escapeHtml(item.code)}</strong></td><td><div class="person-cell"><span class="avatar">${escapeHtml(initials(item.name === "Name not provided" ? item.code : item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${item.therapies} active therap${item.therapies === 1 ? "y" : "ies"}</small></span></div></td><td>${escapeHtml(item.preferenceDay)}</td><td>${escapeHtml(item.preferencePeriod)}</td><td><span class="status-pill ${item.active ? "status-confirmed" : "status-needs_rescheduling"}">${item.active ? "Active" : "Inactive"}</span></td><td><button class="ghost-button" type="button" data-patient-preferences="${item.id}">Edit</button></td></tr>`).join("")}
+      ${rows.map((item) => `<tr><td><strong>${escapeHtml(item.code)}</strong></td><td><div class="person-cell"><span class="avatar">${escapeHtml(initials(item.name === "Name not provided" ? item.code : item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${item.therapies} active therap${item.therapies === 1 ? "y" : "ies"}</small></span></div></td><td>${escapeHtml(item.preferenceDay)}</td><td>${escapeHtml(item.preferencePeriod)}</td><td><button class="status-pill patient-status-button ${item.active ? "status-confirmed" : "status-needs_rescheduling"}" type="button" data-patient-status="${item.id}" aria-haspopup="dialog" aria-label="${item.active ? "Active" : "Inactive"} — change scheduling status for ${escapeHtml(item.code)}">${item.active ? "Active" : "Inactive"} ${icon("chevron-right")}</button></td><td><button class="ghost-button" type="button" data-patient-preferences="${item.id}">Edit</button></td></tr>`).join("")}
     </tbody></table><div class="table-footer"><span>Showing ${state.patients.length ? start + 1 : 0}–${Math.min(start + pageSize, state.patients.length)} of ${state.patients.length.toLocaleString("en-IN")}</span><div><button class="ghost-button" id="patientPrev" ${state.patientPage === 1 ? "disabled" : ""}>Previous</button><button class="ghost-button" id="patientNext" ${state.patientPage === pages ? "disabled" : ""}>Next</button></div></div></div>`;
   let searchTimer;
   $("#patientSearch").addEventListener("input", (event) => {
@@ -776,6 +703,13 @@ function renderPatientsView() {
   });
   $("#patientPrev").addEventListener("click", () => { state.patientPage--; renderPatientsView(); });
   $("#patientNext").addEventListener("click", () => { state.patientPage++; renderPatientsView(); });
+  $$("[data-patient-status]", root).forEach(button => button.addEventListener("click", () => {
+    const patient = rows.find(item => String(item.id) === button.dataset.patientStatus);
+    openPatientStatusDialog(patient, () => {
+      renderPatientsView();
+      $(`[data-patient-status="${patient.id}"]`, root)?.focus();
+    });
+  }));
   $$('[data-patient-preferences]', root).forEach((button) => button.addEventListener("click", () => {
     const patient = state.patients.find((item) => String(item.id) === button.dataset.patientPreferences);
     if (patient) openPatientPreferences(patient);
@@ -802,12 +736,24 @@ async function openPatientPreferences(patient) {
   try {
     const payload = await api(`/api/patients/${patient.id}/preferences`);
     drawer.innerHTML = `<div class="drawer-header"><div><p class="eyebrow">Patient preferences</p><h2 id="patientPreferencesTitle">${escapeHtml(payload.patient.name)}</h2><p>${escapeHtml(payload.patient.code)}</p></div><button class="icon-button" data-close-patient-preferences aria-label="Close">${icon("close")}</button></div>
-      <form class="drawer-body preference-form" id="patientPreferencesForm"><p class="candidate-intro">The scheduler ranks the selected day and time band ahead of other available slots. This is a preference, not a restriction: it can use another time when needed to complete therapy safely.</p>
+      <div class="drawer-body">
+      <section class="patient-status-editor" aria-label="Scheduling status">
+        <div><h3>Scheduling status</h3><span id="patientCurrentStatus">${payload.patient.active ? "Active" : "Inactive"}</span></div>
+        <button class="secondary-button" id="patientStatusAction" type="button">${payload.patient.active ? "Mark inactive" : "Reactivate"}</button>
+      </section>
+      <form class="preference-form" id="patientPreferencesForm"><p class="candidate-intro">The scheduler ranks the selected day and time band ahead of other available slots. This is a preference, not a restriction: it can use another time when needed to complete therapy safely.</p>
         <label>Preferred day<select id="patientPreferenceDay"><option value="">No priority</option>${["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"].map((label, day) => `<option value="${day}" ${payload.preference.day === day ? "selected" : ""}>${label}</option>`).join("")}</select></label>
         <label>Preferred time<select id="patientPreferencePeriod"><option value="">No priority</option><option value="morning" ${payload.preference.period === "morning" ? "selected" : ""}>Morning · 09:00–12:35</option><option value="afternoon" ${payload.preference.period === "afternoon" ? "selected" : ""}>Afternoon · 13:15–16:50</option></select></label>
         <button class="primary-button" type="submit">Save preference</button>
-      </form>`;
+      </form>
+      </div>`;
     $('[data-close-patient-preferences]', drawer).addEventListener("click", closeDrawers);
+    const statusAction = $("#patientStatusAction", drawer);
+    statusAction.addEventListener("click", () => openPatientStatusDialog(payload.patient, () => {
+      $("#patientCurrentStatus", drawer).textContent = payload.patient.active ? "Active" : "Inactive";
+      statusAction.textContent = payload.patient.active ? "Mark inactive" : "Reactivate";
+      renderPatientsView();
+    }));
     $("#patientPreferencesForm", drawer).addEventListener("submit", async (event) => {
       event.preventDefault();
       const button = $('button[type="submit"]', event.currentTarget);
@@ -828,6 +774,71 @@ async function openPatientPreferences(patient) {
     drawer.innerHTML = `<div class="drawer-header"><div><p class="eyebrow">Patient preferences</p><h2 id="patientPreferencesTitle">Availability unavailable</h2></div><button class="icon-button" data-close-patient-preferences aria-label="Close">${icon("close")}</button></div><div class="drawer-body">${errorState(error.message)}</div>`;
     $('[data-close-patient-preferences]', drawer).addEventListener("click", closeDrawers);
   }
+}
+
+function openPatientStatusDialog(patient, onSaved) {
+  const active = !patient.active;
+  const dialog = document.createElement("dialog");
+  dialog.className = "patient-status-dialog";
+  dialog.setAttribute("aria-labelledby", "patientStatusTitle");
+  dialog.setAttribute("aria-describedby", "patientStatusWarning");
+  dialog.innerHTML = `
+    <form class="preference-form">
+      <h3 id="patientStatusTitle">${active ? "Reactivate this patient?" : "Mark this patient as inactive?"}</h3>
+      <p id="patientStatusWarning"><strong>${escapeHtml(patient.name)}</strong> ${active
+        ? "will be eligible for scheduling again."
+        : "will be excluded from new scheduling. Unsent offers will be withdrawn. Review any existing offers and confirmed visits separately."}</p>
+      ${active ? "" : '<label>Reason for marking inactive <textarea name="reason" rows="3" maxlength="1000" required></textarea></label>'}
+      <p class="patient-status-error" role="alert" hidden></p>
+      <div class="patient-status-actions">
+        <button type="button" class="secondary-button" data-cancel-status>Cancel</button>
+        <button type="submit" class="primary-button">${active ? "Reactivate" : "Mark inactive"}</button>
+      </div>
+    </form>`;
+  const form = $("form", dialog);
+  const reason = $("textarea", form);
+  const cancel = $("[data-cancel-status]", form);
+  const confirm = $('button[type="submit"]', form);
+  const errorNote = $(".patient-status-error", form);
+
+  cancel.addEventListener("click", () => dialog.close());
+  dialog.addEventListener("close", () => dialog.remove());
+  dialog.addEventListener("cancel", event => {
+    if (confirm.disabled) event.preventDefault();
+  });
+  reason?.addEventListener("input", () => reason.setCustomValidity(""));
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    const explanation = reason?.value.trim() ?? "";
+    if (reason && !explanation) {
+      reason.setCustomValidity("Enter a reason for marking this patient inactive.");
+      reason.reportValidity();
+      return;
+    }
+    confirm.disabled = cancel.disabled = true;
+    errorNote.hidden = true;
+    let result;
+    try {
+      result = await api(`/api/patients/${patient.id}/status`, {
+        method: "POST", body: JSON.stringify({ active, reason: explanation }),
+      });
+    } catch (error) {
+      errorNote.textContent = error.message;
+      errorNote.hidden = false;
+      confirm.disabled = cancel.disabled = false;
+      return;
+    }
+    patient.active = result.active;
+    const listedPatient = state.patients.find(item => item.id === patient.id);
+    if (listedPatient) listedPatient.active = result.active;
+    dialog.close();
+    onSaved();
+    toast(result.active ? "Patient reactivated" : "Patient marked inactive", "Scheduling status saved.");
+  });
+
+  document.body.append(dialog);
+  dialog.showModal();
+  (reason || cancel).focus();
 }
 
 async function loadTeamView() {
@@ -854,12 +865,7 @@ function bindReleasedAppointments(root, operations) {
     $$('[data-operation-appointment]', root).forEach((button) => button.addEventListener("click", async () => {
       const item = operations.needsRescheduling.find((appointment) => String(appointment.id) === button.dataset.operationAppointment);
       if (!item) return;
-      button.disabled = true;
-      try {
-        const group = await api(`/api/appointments/${item.id}/replacement-candidates`);
-        showReplacementCandidates([group]);
-      } catch (error) { toast("Couldn’t find replacements", error.message, "error"); }
-      finally { button.disabled = false; }
+      showReplacementCandidates([{...item, appointmentId: item.id, branch: item.location}]);
     }));
 }
 
@@ -891,7 +897,7 @@ async function loadOperationsView() {
     const therapists = state.schedule?.therapists || [];
     const tabs = [
       {id:"assistant", label:"Scheduling assistant", icon:"sparkles"},
-      ...(testWorkspace ? [{id:"whatsapp", label:"WhatsApp & attendance", icon:"bell"}] : []),
+      ...(workflowWorkspace ? [{id:"whatsapp", label:"WhatsApp & attendance", icon:"bell"}] : []),
       {id:"absence", label:"Record an absence", icon:"calendar"},
       {id:"rescheduling", label:"Needs rescheduling", icon:"operations"},
     ];
@@ -906,7 +912,7 @@ async function loadOperationsView() {
         <form class="assistant-form" id="assistantForm"><textarea id="assistantInput" rows="2" maxlength="1000" placeholder="Give me an overall summary for today" ${assistant.configured ? "" : "disabled"} required></textarea><button class="primary-button" type="submit" ${assistant.configured ? "" : "disabled"}>Send request</button></form>
       </section>
       </div>
-      ${testWorkspace ? '<div class="operations-tab-panel" role="tabpanel" id="operations-panel-whatsapp" aria-labelledby="operations-tab-whatsapp" tabindex="0" hidden></div>' : ""}
+      ${workflowWorkspace ? '<div class="operations-tab-panel" role="tabpanel" id="operations-panel-whatsapp" aria-labelledby="operations-tab-whatsapp" tabindex="0" hidden></div>' : ""}
       <div class="operations-tab-panel" role="tabpanel" id="operations-panel-absence" aria-labelledby="operations-tab-absence" tabindex="0" hidden>
         <div class="operations-absence-grid">
         <section class="panel"><div class="panel-header"><div><h2>Record an absence</h2><p>Affected appointments will be released for safe rescheduling.</p></div></div><form class="panel-body form-grid" id="absenceForm">
@@ -1028,7 +1034,7 @@ async function loadOperationsView() {
       input.value = command.dataset.assistantCommand;
       input.focus();
     }));
-    if (testWorkspace) window.therapyWhatsapp.mountOperations({
+    if (workflowWorkspace) window.therapyWhatsapp.mountOperations({
       root, date: isoDate(state.currentDate), api, onChanged: refreshAfterWhatsapp,
     });
     bindReleasedAppointments(root, operations);
@@ -1037,36 +1043,31 @@ async function loadOperationsView() {
 
 function loadGeneratorView() {
   const root = $("#view-generator");
-  const daily = dailyPlanning();
-  if (daily && state.latestPreview && state.latestPreview.start !== isoDate(state.currentDate)) {
+  const target = state.overview.nextPlanningDate;
+  if (state.latestPreview && state.latestPreview.start !== target) {
     state.latestPreview = null;
     state.showPreview = false;
   }
-  root.innerHTML = `${pageHeading(daily ? "One-day therapy planning" : "Rolling therapy planning", "Schedule generator")}
+  root.innerHTML = `${pageHeading("Daily therapy planning", "Schedule generator")}
     <section class="generator-hero">
-      <div><p class="eyebrow" style="color:#5ed5cd">${daily ? "One selected working day" : "Today through two future working weeks"}</p><h2>${daily ? "Plan one day around every child, therapist and room." : "Build a safe rolling schedule around every child, therapist and room."}</h2><p>${daily ? "New appointments are proposed only for the selected Monday–Saturday date. Saved visits and completed therapies across the same week count toward demand and remain fixed." : "The planner preserves saved visits, fills only the remaining working days this week, prioritizes disrupted appointments, and carries unmet demand into the next week."}</p><div class="rule-strip"><span>${icon("check")}Patient availability</span><span>${icon("check")}Therapist coverage</span><span>${icon("check")}${daily ? "Saved visits" : "Absence priority"}</span><span>${icon("check")}Weekly targets</span></div></div>
+      <div><p class="eyebrow" style="color:#5ed5cd">Daily planning</p><h2>Build a safe schedule around every child and therapist.</h2><p>Plan tomorrow’s sessions. Saved visits stay fixed and count toward weekly demand.</p><div class="rule-strip"><span>${icon("check")}Patient availability</span><span>${icon("check")}Therapist coverage</span><span>${icon("check")}Saved visits</span><span>${icon("check")}Weekly targets</span></div></div>
       <form class="generator-form" id="generatorForm">
-        <label>${daily ? "Planning date" : "Run from"}<input id="generatorStart" type="date" value="${daily ? isoDate(state.currentDate) : state.overview.today}" required></label>
+        <label>Planning date<input id="generatorStart" type="date" value="${escapeHtml(target)}" readonly></label>
         <label>Search time<select id="generatorSearchSeconds"><option value="20">Quick preview · about 20 seconds</option><option value="60">Thorough · up to 1 minute</option><option value="120">Extended · up to 2 minutes</option><option value="300">Deep search · up to 5 minutes</option></select></label>
-        <button class="primary-button" type="submit">${daily ? "Generate one-day preview" : "Generate validated preview"}</button>
-        <p class="fine-print">${daily ? "Plan one working day at a time. All selected children are considered; replacements depend on remaining demand and availability. Previewing saves nothing. Saving tomorrow’s calendar automatically queues its WhatsApp visit offers; other dates stay proposed. Tomorrow uses India time. Preview mode sends no messages." : "The planner always uses best effort: it keeps every safety rule, schedules only from the selected day forward, and reports any demand that still needs a later week. Existing active appointments remain fixed. Nothing is saved until you approve the preview."}</p>
+        <button class="primary-button" type="submit">Generate validated preview</button>
+        <p class="fine-print">Review tomorrow’s draft before saving. ${workflowWorkspace ? "Saving queues tomorrow’s WhatsApp offers." : ""}</p>
       </form>
     </section>
-    <div id="generatorResults">${state.latestPreview ? renderGeneratorResults(state.latestPreview) : `<section class="panel"><div class="panel-empty">${icon("activity")}<strong>No preview generated yet</strong><span>Choose the planning window above to see coverage and unmet demand.</span></div></section>`}</div>`;
+    <div id="generatorResults">${state.latestPreview ? renderGeneratorResults(state.latestPreview) : `<section class="panel"><div class="panel-empty">${icon("activity")}<strong>No preview generated yet</strong><span>Generate tomorrow’s draft to see proposed sessions and remaining weekly demand.</span></div></section>`}</div>`;
   $("#generatorForm").addEventListener("submit", generateSchedule);
-  if (daily) $("#generatorStart").addEventListener("change", () => {
-    state.latestPreview = null;
-    state.showPreview = false;
-    $("#generatorResults").innerHTML = '<section class="panel"><div class="panel-empty"><strong>Generate a preview for this date</strong><span>Each preview and save covers one selected day.</span></div></section>';
-  });
   bindSavePreview();
-  if (testWorkspace && !state.latestPreview) loadAutomaticTestDraft(root);
+  if (workflowWorkspace && !state.latestPreview) loadAutomaticTestDraft(root);
 }
 
 async function loadAutomaticTestDraft(root) {
   try {
     const { draft } = await api("/api/zoho/draft");
-    if (!draft || !root.isConnected || state.activeView !== "generator" || state.latestPreview) return;
+    if (!draft || draft.start !== state.overview.nextPlanningDate || !root.isConnected || state.activeView !== "generator" || state.latestPreview) return;
     state.latestPreview = draft;
     state.currentDate = parseLocalDate(draft.start);
     $("#generatorStart").value = draft.start;
@@ -1085,39 +1086,33 @@ async function generateSchedule(event) {
   const searchSeconds = Number($("#generatorSearchSeconds").value);
   const searchLabel = searchSeconds >= 60 ? `${searchSeconds / 60} minute${searchSeconds === 60 ? "" : "s"}` : `${searchSeconds} seconds`;
   button.disabled = true;
-  if (dailyPlanning()) {
-    $("#generatorStart").disabled = true;
-    $("#generatorSearchSeconds").disabled = true;
-  }
-  button.innerHTML = `<span class="spinner" style="width:16px;height:16px;border-color:rgba(255,255,255,.35);border-top-color:white"></span>${dailyPlanning() ? "Planning selected day…" : "Planning ahead…"}`;
-  $("#generatorResults").innerHTML = `<section class="panel"><div class="loading-state" style="min-height:260px"><span class="spinner"></span><strong>${dailyPlanning() ? "Balancing the selected day against weekly demand" : "Balancing remaining weekly demand and future capacity"}</strong><span>This can take up to ${searchLabel}. The result is independently validated before it can be saved.</span></div></section>`;
+  $("#generatorSearchSeconds").disabled = true;
+  button.innerHTML = `<span class="spinner" style="width:16px;height:16px;border-color:rgba(255,255,255,.35);border-top-color:white"></span>Planning tomorrow…`;
+  $("#generatorResults").innerHTML = `<section class="panel"><div class="loading-state" style="min-height:260px"><span class="spinner"></span><strong>Checking tomorrow’s slots against weekly demand</strong><span>This can take up to ${searchLabel}. The result is independently validated before it can be saved.</span></div></section>`;
   try {
-    const result = await api("/api/schedules/generate", { method: "POST", body: JSON.stringify({ start, searchSeconds }) });
+    const result = await api("/api/schedules/generate", { method: "POST", body: JSON.stringify({ start, searchSeconds, planningMode: "day" }) });
     state.latestPreview = result;
     $("#generatorResults").innerHTML = renderGeneratorResults(result);
     bindSavePreview();
-    toast("Schedule preview ready", result.planningMode === "day" ? `${result.newSessions} new sessions proposed for ${result.start}; ${result.unscheduled} weekly sessions remain unplaced.` : `${result.scheduled.toLocaleString("en-IN")} sessions placed; ${result.unscheduled.toLocaleString("en-IN")} remain unscheduled.`);
+    toast("Schedule preview ready", `${result.newSessions} new sessions proposed for ${result.start}; ${result.unscheduled} weekly sessions remain unplaced.`);
   } catch (error) {
     $("#generatorResults").innerHTML = errorState(error.message);
     toast("Scheduling didn’t complete", error.message, "error");
   } finally {
     button.disabled = false;
-    if (dailyPlanning()) {
-      $("#generatorStart").disabled = false;
-      $("#generatorSearchSeconds").disabled = false;
-    }
-    button.textContent = dailyPlanning() ? "Generate one-day preview" : "Generate validated preview";
+    const search = $("#generatorSearchSeconds");
+    if (search) search.disabled = false;
+    button.textContent = "Generate validated preview";
   }
 }
 
 function renderGeneratorResults(result) {
-  const daily = result.planningMode === "day";
   const validationTotal = Object.values(result.validation || {}).reduce((sum, value) => sum + Number(value || 0), 0);
-  return `<div class="result-banner ${result.canSave ? "" : "error"}"><div><h3>${result.canSave ? "Preview passed every validation check" : "Preview needs review before it can be saved"}</h3><p>${result.status} · ${validationTotal} validation issue${validationTotal === 1 ? "" : "s"} · New visits from ${escapeHtml(result.planningStart || result.start)} to ${escapeHtml(result.end)}</p>${daily ? `<p>${result.autoOfferOnSave ? (result.liveMessaging ? "Saving queues WhatsApp offers for tomorrow’s proposed visits. Existing offers are not resent." : "Saving queues tomorrow’s preview offers. No real messages are sent.") : "Saving this date queues no WhatsApp offers. Automatic offers apply only to tomorrow in India time."}</p>` : ""}</div><div class="heading-actions"><button class="secondary-button" id="reviewPreview">${icon("calendar")}Review calendar</button>${result.canSave ? `<button class="primary-button" id="savePreview">${savePreviewLabel(result)}</button>` : ""}</div></div>
+  return `<div class="result-banner ${result.canSave ? "" : "error"}"><div><h3>${result.canSave ? "Preview passed every validation check" : "Preview needs review before it can be saved"}</h3><p>${result.status} · ${validationTotal} validation issue${validationTotal === 1 ? "" : "s"} · New visits from ${escapeHtml(result.planningStart || result.start)} to ${escapeHtml(result.end)}</p>${workflowWorkspace ? `<p>${result.autoOfferOnSave ? (result.messagingPaused ? "Saving holds tomorrow’s WhatsApp offers while messaging is off." : result.liveMessaging ? "Saving queues WhatsApp offers for tomorrow’s proposed visits. Existing offers are not resent." : "Saving queues tomorrow’s preview offers. No real messages are sent.") : "Saving this plan queues no WhatsApp offers. Automatic offers apply only to tomorrow in India time."}</p>` : ""}</div><div class="heading-actions"><button class="secondary-button" id="reviewPreview">${icon("calendar")}Review calendar</button>${result.canSave ? `<button class="primary-button" id="savePreview">${savePreviewLabel(result)}</button>` : ""}</div></div>
     <div class="metric-grid">
-      ${metricCard(daily ? "Weekly requested" : "Requested sessions", result.requested, daily ? "Whole-week targets for the chosen roster" : "Across the rolling planning window")}
-      ${metricCard(daily ? "Sessions on selected day" : "Scheduled", daily ? result.scheduledOnSelectedDay : result.scheduled, daily ? `${result.newSessions} new proposals; includes saved visits` : `${result.requested ? Math.round(result.scheduled / result.requested * 100) : 0}% coverage`)}
-      ${metricCard(daily ? "Remaining this week" : "Unscheduled", result.unscheduled, daily ? "Demand still available for later working days" : "Never forced through a constraint", result.unscheduled ? "accent" : "")}
+      ${metricCard("Weekly requested", result.requested, "Whole-week targets for the chosen roster")}
+      ${metricCard("Sessions tomorrow", result.scheduledOnSelectedDay, `${result.newSessions} new proposals, including saved visits in the total`)}
+      ${metricCard("Remaining this week", result.unscheduled, "Demand still available for later working days", result.unscheduled ? "accent" : "")}
       ${metricCard("Solver status", 0, result.status).replace('<div class="metric-value">0</div>', `<div class="metric-value" style="font-size:1.15rem;margin-top:20px">${escapeHtml(result.status)}</div>`)}
     </div>
     <section class="panel"><div class="panel-header"><div><h2>Unmet demand</h2><p>Clear reasons for every session the planner could not place.</p></div><span class="soft-pill">${result.unmet.length.toLocaleString("en-IN")} requirements</span></div>
@@ -1130,7 +1125,7 @@ function bindSavePreview() {
   if (reviewButton && state.latestPreview) {
     reviewButton.addEventListener("click", async () => {
       state.showPreview = true;
-      state.currentDate = parseLocalDate(state.latestPreview.start);
+      state.currentDate = parseLocalDate(state.latestPreview.planningStart || state.latestPreview.start);
       setView("schedule");
       await loadSchedule();
     });
@@ -1141,7 +1136,7 @@ function bindSavePreview() {
     button.disabled = true; button.textContent = "Saving…";
     try {
       const result = await api(`/api/schedules/${state.latestPreview.previewId}/save`, { method: "POST", body: "{}" });
-      if (testWorkspace && result.offers > 0 && !state.latestPreview.liveMessaging) {
+      if (workflowWorkspace && result.offers > 0 && !state.latestPreview.liveMessaging && !state.latestPreview.messagingPaused) {
         try { await api("/api/process", {method:"POST", body:"{}"}); }
         catch (error) { toast("Preview queue needs attention", error.message, "error"); }
       }
@@ -1186,6 +1181,8 @@ function openDrawer(id) {
 }
 
 function closeDrawers() {
+  const activeDrawer = document.activeElement?.closest(".drawer.open");
+  if (activeDrawer) document.activeElement.blur();
   $$(".drawer.open").forEach((drawer) => { drawer.classList.remove("open"); drawer.setAttribute("aria-hidden", "true"); });
   $("#drawerBackdrop").hidden = true;
   document.body.style.overflow = "";
@@ -1205,8 +1202,7 @@ function ensureAppointmentDrawer() {
 
 async function openAppointment(item) {
   if (!item.preview && ["NEEDS_RESCHEDULING", "CANCELLED_PATIENT", "CANCELLED_OTHER"].includes(item.status)) {
-    try { showReplacementCandidates([await api(`/api/appointments/${item.id}/replacement-candidates`)]); }
-    catch (error) { toast("Couldn’t open replacement controls", error.message, "error"); }
+    showReplacementCandidates([{...item, appointmentId: item.id, branch: item.location}]);
     return;
   }
   const drawer = ensureAppointmentDrawer();
@@ -1244,7 +1240,7 @@ async function openAppointment(item) {
     });
   }
   openDrawer("appointmentDrawer");
-  if (testWorkspace && !item.preview) {
+  if (workflowWorkspace && !item.preview) {
     const section = document.createElement("section");
     section.className = "drawer-section";
     $(".detail-list", drawer).after(section);
@@ -1258,13 +1254,14 @@ async function openAppointment(item) {
 function showReplacementCandidates(groups) {
   if (!groups.length) return;
   const drawer = ensureAppointmentDrawer();
-  const instance = crypto.randomUUID();
+  const instance = newRequestId();
   drawer.dataset.reservationInstance = instance;
   let group = groups[0], selectedPatient = null, preview = null, requestId = null;
   const emptyBooking = Boolean(group.emptySlot);
   const bookingUrl = action => emptyBooking ? `/api/calendar/${action}` : `/api/appointments/${group.appointmentId}/${action}`;
-  let version = 0, searchTimer = null, suggestionsMode = false, saving = false, submittedMode = null;
-  const canMessage = testWorkspace && !emptyBooking;
+  let version = 0, searchTimer = null, suggestionsMode = !emptyBooking, saving = false, submittedMode = null;
+  let slotVersion = 0, contextReady = emptyBooking, choosingPatientId = null;
+  const canMessage = workflowWorkspace && !emptyBooking;
   const current = () => drawer.dataset.reservationInstance === instance && drawer.classList.contains("open") && Boolean($("#replacementConfirm",drawer));
   drawer.innerHTML = `<div class="drawer-header"><div><p class="eyebrow">${emptyBooking ? "Calendar appointment" : "Released appointment"}</p><h2 id="appointmentDrawerTitle">${emptyBooking ? "Add appointment" : "Possible replacements"}</h2></div><button class="icon-button" data-close-appointment aria-label="Close">${icon("close")}</button></div>
     <div class="drawer-body"><p class="candidate-intro">Choose a patient to reserve this opening. Scheduling mismatches are warnings; the admin may proceed after reviewing them.</p>
@@ -1272,9 +1269,9 @@ function showReplacementCandidates(groups) {
       ${groups.length > 1 ? `<label class="replacement-opening-label">Released slot<select id="replacementOpening">${groups.map((item, index) => `<option value="${index}">${escapeHtml(item.time)} · ${escapeHtml(item.therapy)}</option>`).join("")}</select></label>` : ""}
       <div id="replacementSlotSummary" class="replacement-slot-summary"></div>
       <label class="replacement-whole"><input type="checkbox" id="replacementWhole" checked><span id="replacementWholeLabel">Reserve complete visit</span></label>
-      <div class="replacement-picker-tabs"><button id="replacementAll" class="active" type="button">Choose patient</button><button id="replacementSuggested" type="button" ${emptyBooking ? "hidden" : ""}>Suggested patients</button></div>
+      <div class="replacement-picker-tabs"><button id="replacementSuggested" class="${emptyBooking ? "" : "active"}" type="button" ${emptyBooking ? "hidden" : ""}>Suggested patients</button><button id="replacementAll" class="${emptyBooking ? "active" : ""}" type="button">Choose patient</button></div>
       <input type="search" id="replacementSearch" placeholder="Search patient name or code" aria-label="Search replacement patients">
-      <div id="replacementPatientList" class="replacement-patient-list"></div>
+      <div id="replacementPatientList" class="replacement-patient-list" aria-live="polite"></div>
       <div id="replacementReview" class="replacement-review"><p class="candidate-intro">Select any patient to see warnings and confirmation options.</p></div>
       <div id="replacementError" class="replacement-error" role="alert" hidden></div>
     </div><div class="drawer-footer replacement-footer"><button class="primary-button" id="replacementConfirm" disabled>Confirm without messaging</button><button class="secondary-button" id="replacementMessage" disabled title="${canMessage ? "Queue a WhatsApp offer and wait for the parent to confirm" : "Messaging is available for released appointments in the test workspace"}">${canMessage ? "Send offer & wait for confirmation" : "Confirm with messaging"}</button><p>Without messaging confirms immediately.${canMessage ? " Sending an offer holds the slot as pending until the parent replies Yes. In preview mode, no real message is sent." : " No message is sent."}</p></div>`;
@@ -1282,21 +1279,24 @@ function showReplacementCandidates(groups) {
   openDrawer("appointmentDrawer");
 
   async function choosePatient(item) {
-    if (saving) return;
+    if (saving || !item || !contextReady || choosingPatientId === item.id) return;
     selectedPatient = item; preview = null; requestId = null; submittedMode = null;
+    choosingPatientId = item.id;
+    $$('[data-replacement-patient]', $("#replacementPatientList",drawer)).forEach(button => button.setAttribute("aria-pressed", String(button.dataset.replacementPatient === String(item.id))));
     const latest = ++version;
     $("#replacementConfirm", drawer).disabled = true;
     $("#replacementMessage", drawer).disabled = true;
     $("#replacementError", drawer).hidden = true;
     $("#replacementReview", drawer).innerHTML = `<h3>${escapeHtml(item.name)}</h3><p>Checking reservation details…</p>`;
     if(emptyBooking && !group.emptySlot.therapistId) {
+      choosingPatientId = null;
       $("#replacementReview",drawer).innerHTML='<p class="candidate-intro">Choose a doctor to review this reservation.</p>';
       return;
     }
     try {
       const data = await api(bookingUrl("reservation-preview"), {method:"POST",body:JSON.stringify({...group.emptySlot,patientId:item.id, wholeVisit:$("#replacementWhole",drawer).checked})});
       if (!current() || latest !== version) return;
-      preview = data; requestId = crypto.randomUUID();
+      preview = data; requestId = newRequestId();
       $("#replacementReview", drawer).innerHTML = `<h3>${escapeHtml(item.name)}</h3><p>${escapeHtml(item.code)} · ${data.slots.length} session(s) · ${data.slots.map(slot => escapeHtml(slot.time)).join(", ")}</p>${data.warnings.length ? `<div class="replacement-warnings" role="status"><strong>${data.warnings.length} warning(s) — admin can override</strong><ul>${data.warnings.map(warning => `<li>${escapeHtml(warning.message)}</li>`).join("")}</ul><p>Reserve anyway confirms your choice and records these warnings.</p></div>` : '<div class="replacement-match">No scheduling mismatches found.</div>'}`;
       $("#replacementConfirm", drawer).textContent = data.warnings.length ? "Reserve anyway without messaging" : "Confirm without messaging";
       $("#replacementConfirm", drawer).disabled = false;
@@ -1304,27 +1304,50 @@ function showReplacementCandidates(groups) {
       $("#replacementMessage", drawer).disabled = !canMessage;
       $("#replacementReview", drawer).scrollIntoView({behavior:"smooth",block:"nearest"});
     } catch (error) {if(current() && latest === version) {$("#replacementError",drawer).hidden=false; $("#replacementError",drawer).textContent=error.message;}}
+    finally { if (latest === version) choosingPatientId = null; }
   }
 
   let listVersion = 0;
-  async function loadPatientChoices() {
+  async function loadPatientChoices(cachedCandidates = null) {
+    if (!current()) return;
+    const useSuggestions = suggestionsMode;
+    const appointmentId = group.appointmentId;
+    const wholeVisit = $("#replacementWhole",drawer).checked;
     const query = $("#replacementSearch", drawer).value.trim();
     const latest = ++listVersion;
     const root = $("#replacementPatientList", drawer);
     $("#replacementAll",drawer).classList.toggle("active", !suggestionsMode);
     $("#replacementSuggested",drawer).classList.toggle("active", suggestionsMode);
+    root.innerHTML = '<p class="candidate-intro" role="status">Loading patients…</p>';
     try {
-      const people = suggestionsMode ? group.candidates.map(item => ({id:item.patient_id,name:item.patient_name || item.patient_code,code:item.patient_code,active:true,progress:item.weekly_progress})) : (await api(`/api/patients?q=${encodeURIComponent(query)}`)).patients;
+      const suggestion = useSuggestions ? (cachedCandidates !== null ? {candidates: cachedCandidates} : await api(`/api/appointments/${appointmentId}/replacement-candidates?wholeVisit=${wholeVisit}`)) : null;
       if (!current() || latest !== listVersion) return;
-      const filtered = people.filter(item => !query || `${item.name} ${item.code}`.toLowerCase().includes(query.toLowerCase()));
-      root.innerHTML = filtered.length ? filtered.slice(0,50).map(item => `<button class="replacement-patient" data-replacement-patient="${item.id}"><span class="avatar">${escapeHtml(initials(item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.code)}${!item.active ? " · inactive" : ""}${item.progress ? ` · ${escapeHtml(item.progress)} weekly sessions` : ""}</small></span>${icon("chevron-right")}</button>`).join("") + (filtered.length>50 ? '<p class="candidate-intro">Showing 50 matches. Refine your search to find another patient.</p>' : "") : '<p class="candidate-intro">No matching suggestions. Choose patient searches the full list, including patients with rule mismatches.</p>';
-      $$('[data-replacement-patient]',root).forEach(button => button.addEventListener("click", () => choosePatient(filtered.find(item => String(item.id) === button.dataset.replacementPatient))));
-    } catch(error) {if(current()) root.innerHTML=errorState(error.message);}
+      const people = useSuggestions ? suggestion.candidates.map(item => ({id:item.patient_id,name:item.patient_name || item.patient_code,code:item.patient_code,active:true,progress:item.weekly_progress})) : (await api(`/api/patients?q=${encodeURIComponent(query)}`)).patients;
+      if (!current() || latest !== listVersion) return;
+      const filtered = people.filter(item => item.active && (!query || `${item.name} ${item.code}`.toLowerCase().includes(query.toLowerCase())));
+      const emptyMessage = useSuggestions ? "No matching suggestions. Choose patient searches all active patients." : "No matching active patients. Try searching by name or patient ID.";
+      root.innerHTML = filtered.length ? filtered.slice(0,50).map(item => `<button class="replacement-patient" data-replacement-patient="${item.id}"><span class="avatar">${escapeHtml(initials(item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.code)}${item.progress ? ` · ${escapeHtml(item.progress)} weekly sessions` : ""}</small></span>${icon("chevron-right")}</button>`).join("") + (filtered.length>50 ? '<p class="candidate-intro">Showing 50 matches. Refine your search to find another patient.</p>' : "") : `<p class="candidate-intro">${emptyMessage}</p>`;
+      $$('[data-replacement-patient]',root).forEach(button => {
+        button.disabled = !contextReady;
+        button.setAttribute("aria-pressed", String(String(selectedPatient?.id) === button.dataset.replacementPatient));
+        button.addEventListener("click", () => choosePatient(filtered.find(item => String(item.id) === button.dataset.replacementPatient)));
+      });
+    } catch(error) {if(current() && latest === listVersion) {
+      root.innerHTML = `${errorState(error.message)}<button type="button" data-retry-patients>Retry loading patients</button>`;
+      $('[data-retry-patients]', root).addEventListener("click", () => loadPatientChoices());
+    }}
   }
 
   async function loadSlot() {
     if (saving) return;
+    const latestSlot = ++slotVersion;
+    const appointmentId = group.appointmentId;
+    clearTimeout(searchTimer); listVersion++; choosingPatientId=null;
+    contextReady=emptyBooking;
     version++; preview=null; selectedPatient=null;
+    $("#replacementError",drawer).hidden=true;
+    $("#replacementPatientList",drawer).innerHTML='<p class="candidate-intro" role="status">Loading suggestions…</p>';
+    $("#replacementWhole",drawer).disabled=true;
     $("#replacementConfirm",drawer).disabled=true;
     $("#replacementMessage",drawer).disabled=true;
     $("#replacementReview",drawer).innerHTML='<p class="candidate-intro">Select any patient to review this reservation.</p>';
@@ -1341,19 +1364,24 @@ function showReplacementCandidates(groups) {
         }
         return;
       }
-      const context = await api(`/api/appointments/${group.appointmentId}/reservation-context`);
-      if(!current() || context.appointmentId !== group.appointmentId) return;
+      const context = await api(`/api/appointments/${appointmentId}/reservation-context`);
+      if(!current() || latestSlot !== slotVersion) return;
       group=context;
+      contextReady=true;
       $("#replacementWhole",drawer).checked=true;
       $("#replacementWhole",drawer).disabled=context.visitSessions<=1;
       $("#replacementWholeLabel",drawer).textContent=context.visitSessions>1 ? `Reserve complete visit (${context.visitSessions} sessions)` : "Reserve this session";
-      await loadPatientChoices();
-    } catch(error) {if(current()) {$("#replacementError",drawer).hidden=false;$("#replacementError",drawer).textContent=error.message;}}
+      await loadPatientChoices(context.candidates);
+    } catch(error) {if(current() && latestSlot === slotVersion) {
+      $("#replacementPatientList",drawer).innerHTML='<button type="button" data-retry-opening>Retry loading this opening</button>';
+      $('[data-retry-opening]',drawer).addEventListener("click",loadSlot);
+      $("#replacementError",drawer).hidden=false;$("#replacementError",drawer).textContent=error.message;
+    }}
   }
   $("#replacementAll",drawer).addEventListener("click",()=>{suggestionsMode=false;loadPatientChoices();});
   $("#replacementSuggested",drawer).addEventListener("click",()=>{suggestionsMode=true;loadPatientChoices();});
   $("#replacementSearch",drawer).addEventListener("input",()=>{clearTimeout(searchTimer);searchTimer=setTimeout(loadPatientChoices,180);});
-  $("#replacementWhole",drawer).addEventListener("change",()=>{if(selectedPatient) choosePatient(selectedPatient);});
+  $("#replacementWhole",drawer).addEventListener("change",()=>{choosingPatientId=null;loadPatientChoices();if(selectedPatient) choosePatient(selectedPatient);});
   $("#replacementOpening",drawer)?.addEventListener("change",event=>{group=groups[Number(event.target.value)];loadSlot();});
   if (emptyBooking) {
     ["#emptySlotDoctor", "#emptySlotTherapy", "#emptySlotBranch"].forEach(selector => $(selector,drawer).addEventListener("change", () => {
@@ -1362,6 +1390,7 @@ function showReplacementCandidates(groups) {
         if(doctor) {$("#emptySlotTherapy",drawer).value=doctor.departmentId;$("#emptySlotBranch",drawer).value=doctor.locationId;}
       }
       group.emptySlot={...group.emptySlot,therapistId:Number($("#emptySlotDoctor",drawer).value),departmentId:Number($("#emptySlotTherapy",drawer).value),locationId:Number($("#emptySlotBranch",drawer).value)};
+      choosingPatientId=null;
       if(selectedPatient) choosePatient(selectedPatient);
     }));
   }
@@ -1414,3 +1443,14 @@ function showReplacementCandidates(groups) {
 }
 
 initialize();
+
+if (!workflowWorkspace) {
+  fetch('/api/workflow/status').then(response => response.ok ? response.json() : null).then(status => {
+    if (!status?.enabled) return;
+    const link = document.createElement('a');
+    link.className = 'nav-item';
+    link.href = status.path || '/';
+    link.innerHTML = `${icon('operations')}<span>Daily operations</span>`;
+    document.querySelector('[aria-label="Planning navigation"]').append(link);
+  }).catch(() => { /* The original workspace remains usable if operations are unavailable. */ });
+}

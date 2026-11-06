@@ -55,8 +55,10 @@ the original seeded fixture or greeting names. It is not an import allowlist.
   The checkpoint stays UTC and each field's query boundaries use its own zone. Incremental runs
   use a frozen half-open window and an atomic checkpoint. Old timezone checkpoints
   require one explicit full reconciliation, preserving data and history.
-- Repeated Registration IDs select the complete latest Modified Time record,
-  with Added Time breaking ties. A tie on both times across distinct latest rows
+- Repeated Registration IDs select the newest-created course by Added Time,
+  with Modified Time breaking creation-time ties. Editing an older course does
+  not replace the current course. New source IDs have separate progress;
+  same-ID edits retain progress. A tie on both times across distinct latest rows
   requires review. Older plan text is not unioned into the current plan.
 - A source row cannot silently change its Registration ID. Missing rows in a
   delta/reconciliation are not treated as deletions.

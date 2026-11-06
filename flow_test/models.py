@@ -50,6 +50,13 @@ class FlowJob(Base):
     message_id: Mapped[str | None] = mapped_column(String(200), index=True)
     delivery: Mapped[str | None] = mapped_column(String(30))
     error: Mapped[str | None] = mapped_column(Text)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime)
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime)
+    locked_by: Mapped[str | None] = mapped_column(String(64))
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime)
+    send_started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime)
+    error_code: Mapped[str | None] = mapped_column(String(30))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

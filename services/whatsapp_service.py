@@ -31,6 +31,22 @@ class WhatsAppConfigurationError(ValueError):
 class WhatsAppDeliveryError(RuntimeError):
     """Raised when Meta rejects or cannot receive an outbound request."""
 
+    def __init__(self, message: str, *, code: int | None = None,
+                 rejected: bool = False, retry_after: float = 0) -> None:
+        super().__init__(message)
+        self.code = code
+        self.rejected = rejected
+        self.retry_after = retry_after
+
+    @property
+    def retryable(self) -> bool:
+        # HTTP status alone cannot prove that Meta did not accept the message.
+        return self.rejected and self.code in {2, 4, 17, 80007, 130429, 131000, 131016, 131056}
+
+    @property
+    def configuration_failure(self) -> bool:
+        return self.rejected and self.code in {10, 190, 200, 131005, 131031, 133010, 132000, 132001, 132012, 132015, 132016}
+
 
 @dataclass(frozen=True)
 class WhatsAppWebhookSettings:
@@ -262,6 +278,7 @@ def _send_message(settings: WhatsAppSenderSettings, payload: dict[str, Any]) -> 
             response_body = response.read().decode("utf-8")
     except HTTPError as exc:
         error_suffix = ""
+        error_code = None
         try:
             error_payload = json.loads(exc.read().decode("utf-8"))
             error_details = error_payload.get("error", {})
@@ -274,8 +291,13 @@ def _send_message(settings: WhatsAppSenderSettings, payload: dict[str, Any]) -> 
                 error_suffix += ")"
         except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
             pass
+        try:
+            retry_after = max(0, float(exc.headers.get("Retry-After", "0")))
+        except (ValueError, TypeError, AttributeError):
+            retry_after = 0
         raise WhatsAppDeliveryError(
-            f"Meta rejected the WhatsApp message{error_suffix}"
+            f"Meta rejected the WhatsApp message{error_suffix}", code=error_code,
+            rejected=error_code is not None, retry_after=retry_after,
         ) from exc
     except URLError as exc:
         raise WhatsAppDeliveryError("Could not reach Meta to send the WhatsApp message") from exc
@@ -283,6 +305,9 @@ def _send_message(settings: WhatsAppSenderSettings, payload: dict[str, Any]) -> 
         result = json.loads(response_body)
     except json.JSONDecodeError as exc:
         raise WhatsAppDeliveryError("Meta returned an invalid response") from exc
-    if not isinstance(result, dict) or not result.get("messages"):
+    messages = result.get("messages") if isinstance(result, dict) else None
+    if (not isinstance(messages, list) or not messages or
+            not isinstance(messages[0], dict) or not isinstance(messages[0].get("id"), str)
+            or not messages[0]["id"]):
         raise WhatsAppDeliveryError("Meta did not confirm the WhatsApp message")
     return result

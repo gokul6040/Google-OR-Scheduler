@@ -127,6 +127,9 @@ class TreatmentRequirement(Base):
     __tablename__ = "treatment_requirements"
     id: Mapped[int] = mapped_column(primary_key=True)
     patient_id: Mapped[int] = mapped_column(ForeignKey("patients.id"), index=True)
+    # One Creator plan ID groups the therapies in a treatment course. NULL
+    # retains legacy/local records whose source course cannot be established.
+    source_plan_id: Mapped[str | None] = mapped_column(String(80), index=True)
     department_id: Mapped[int] = mapped_column(ForeignKey("departments.id"))
     assigned_therapist_id: Mapped[int] = mapped_column(ForeignKey("therapists.id"))
     location_id: Mapped[int | None] = mapped_column(ForeignKey("locations.id"), nullable=True)

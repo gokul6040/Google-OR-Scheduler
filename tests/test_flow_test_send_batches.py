@@ -72,7 +72,7 @@ def test_live_shared_number_cooldown_does_not_hold_other_parent(tmp_path, legacy
             "utcnow": staticmethod(lambda: datetime(2026, 10, 19)),
         }))
         now = [100.0]
-        monkeypatch.setattr("flow_test.service.time.monotonic", lambda: now[0])
+        monkeypatch.setattr("flow_test.service.time.time", lambda: now[0])
         assert flow.process_batch() == 2
         assert flow.process_batch() == 0
         now[0] = 106.0

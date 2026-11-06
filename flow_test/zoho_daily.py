@@ -6,6 +6,7 @@ from datetime import date, datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
@@ -15,6 +16,7 @@ from config import load_local_env_file
 from flow_test.reset_live import BASE_URL, _admin_token
 from flow_test.zoho_import import APP, OWNER, REPORTS, SOURCE_TIMEZONES, checkpoint_time, convert_reports
 from services.zoho_creator_service import get_report_records, refresh_access_token, settings_from_environment
+from services.zoho_source_mapping import REGISTRATION_REPORT
 
 
 def window_criteria(since: str | None, until: str) -> str:
@@ -34,6 +36,12 @@ def window_criteria(since: str | None, until: str) -> str:
     return f"{upper} && ({lower})"
 
 
+def snapshot_criteria(until: str) -> str:
+    """Reread source records even when Modified_Time is not exposed."""
+    end = checkpoint_time(until).astimezone(ZoneInfo(SOURCE_TIMEZONES["Added_Time"]))
+    return f"Added_Time < '{end:%d-%b-%Y %H:%M:%S}'"
+
+
 def fetch_reports(*, since: str | None = None, until: str | None = None) -> dict:
     """OAuth is shared configuration; the read target is pinned to the test app."""
     settings = settings_from_environment()
@@ -42,8 +50,16 @@ def fetch_reports(*, since: str | None = None, until: str | None = None) -> dict
                  if os.environ.get(f"FLOW_TEST_ZOHO_{field.upper()}")}
     settings = replace(settings, account_owner=OWNER, app_link_name=APP, **overrides)
     token = refresh_access_token(settings)["access_token"]
-    criteria = window_criteria(since, until) if until else None
-    return {report: get_report_records(settings, token, report, criteria=criteria) for report in REPORTS}
+    registration_report = os.getenv("FLOW_TEST_ZOHO_REGISTRATION_REPORT", "").strip()
+    if registration_report and (not re.fullmatch(r"[A-Za-z0-9_.-]+", registration_report)
+                                or registration_report in REPORTS):
+        raise ValueError("Configure a distinct, valid test registration report link name")
+    criteria = (snapshot_criteria(until) if registration_report else window_criteria(since, until)) if until else None
+    targets = {report: report for report in REPORTS}
+    if registration_report:
+        targets[REGISTRATION_REPORT] = registration_report
+    return {logical: get_report_records(settings, token, actual, criteria=criteria)
+            for logical, actual in targets.items()}
 
 
 def test_api(base_url: str, token: str, path: str, body: dict | None = None) -> dict:

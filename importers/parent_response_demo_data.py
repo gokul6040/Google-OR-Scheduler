@@ -1,5 +1,3 @@
-"""Deterministic, wholly fictional 80-patient response-demo fixture."""
-
 from datetime import date, timedelta
 import json
 

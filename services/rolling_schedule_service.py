@@ -86,9 +86,9 @@ def generate_rolling_schedule(
     for result in results:
         validation.update(result.validation)
     final_result = results[-1]
-    status = "INVALID_SOLUTION" if any(validation.values()) else (
-        "FEASIBLE" if all(result.status in ("OPTIMAL", "FEASIBLE") for result in results)
-        else final_result.status
+    status = "INVALID_SOLUTION" if any(validation.values()) else next(
+        (result.status for result in results if result.status not in ("OPTIMAL", "FEASIBLE")),
+        "FEASIBLE",
     )
     combined = ScheduleResult(
         status=status,

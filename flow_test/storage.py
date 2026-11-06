@@ -78,3 +78,7 @@ def initialize_test_tables(engine: Engine, schema: str | None = None) -> None:
             table for table in TEST_TABLES if table.metadata is Base.metadata
         ])
         FlowBase.metadata.create_all(connection)
+        from database.treatment_migrations import migrate_treatment_courses
+        migrate_treatment_courses(connection, schema)
+        from flow_test.reliability_schema import migrate_queue
+        migrate_queue(connection, schema)

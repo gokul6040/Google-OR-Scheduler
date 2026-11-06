@@ -232,6 +232,17 @@ def test_overview_sessions_offer_branch_therapist_and_patient_filters():
     assert "renderTodaySessions" in app_script
 
 
+def test_calendar_is_a_fixed_monday_through_saturday_week():
+    index = Path("web/index.html").read_text(encoding="utf-8")
+    app_script = Path("web/app.js").read_text(encoding="utf-8")
+
+    assert "data-calendar-view" not in index
+    assert "renderDayCalendar" not in app_script
+    assert "renderAgenda" not in app_script
+    assert "const days = 6;" in app_script
+    assert "direction * 7" in app_script
+
+
 def test_patient_preference_table_saves_day_level_availability(db_session, monkeypatch):
     patient = Patient(patient_code="P-PREFERENCE", name="Preference Child", active=True)
     db_session.add(patient)
@@ -259,75 +270,56 @@ def test_patient_preference_table_saves_day_level_availability(db_session, monke
     assert captured["payload"]["preference"] == {"day": 0, "period": "morning"}
 
 
-def test_generate_schedule_always_uses_best_effort_and_selected_search_time(monkeypatch):
+def test_generate_schedule_uses_tomorrow_and_one_day_slots(monkeypatch):
+    from types import SimpleNamespace
+
+    target = date(2026, 10, 1)
     captured = {}
-
-    class FakeHandler:
-        def send_json(self, payload, status=None):
-            captured["payload"] = payload
-            captured["status"] = status
-
-    result = ScheduleResult(
-        status="FEASIBLE",
-        appointments=[],
-        unmet=[],
-        requested_sessions=0,
-        scheduled_sessions=0,
-        validation={},
-        statistics={},
-    )
-    monkeypatch.setattr(web_app, "SessionLocal", lambda: nullcontext(object()))
-    monkeypatch.setattr(web_app, "serialize_preview", lambda *args: {})
-
-    def fake_generate(_session, run_date, mode, settings):
-        captured["run_date"] = run_date
-        captured["mode"] = mode
-        captured["seconds"] = settings.max_time_seconds
-        return result, web_app.monday(run_date), run_date
-
-    monkeypatch.setattr(web_app, "generate_rolling_schedule", fake_generate)
-
-    web_app.TherapySchedulerHandler.generate_schedule(
-        FakeHandler(), {"start": "2026-09-07", "searchSeconds": 120, "mode": "STRICT"}
-    )
-
-    assert captured["run_date"] == date.today()
-    assert captured["mode"] == SolverMode.BEST_EFFORT
-    assert captured["seconds"] == 120.0
-
-
-def test_generate_schedule_uses_selected_future_day_and_monday_window(monkeypatch):
-    captured = {}
-
-    class FixedDate(date):
-        @classmethod
-        def today(cls):
-            return cls(2026, 9, 30)
-
-    # Keep the selected October date in the future regardless of the test day.
-    monkeypatch.setattr(web_app, "date", FixedDate)
-
-    class FakeHandler:
-        def send_json(self, payload, status):
-            captured["status"] = status
-
+    requirement = SimpleNamespace(therapist_id=1, department_id=2, location_id=3)
+    problem = SimpleNamespace(requirements=[requirement], pinned=[])
     result = ScheduleResult(
         status="FEASIBLE", appointments=[], unmet=[], requested_sessions=0,
         scheduled_sessions=0, validation={}, statistics={},
     )
+
+    def load_problem(_session, week_start, *, planning_start_date):
+        assert week_start == date(2026, 9, 28)
+        assert planning_start_date == target
+        return problem
+
+    def solve(inputs, *, mode, settings):
+        assert inputs is problem
+        assert inputs.new_booking_slots
+        assert {slot[3] for slot in inputs.new_booking_slots} == {target}
+        assert mode == SolverMode.BEST_EFFORT
+        assert settings.max_time_seconds == 120
+        return result
+
+    monkeypatch.setattr(web_app, "next_planning_date", lambda: target)
     monkeypatch.setattr(web_app, "SessionLocal", lambda: nullcontext(object()))
-    monkeypatch.setattr(web_app, "serialize_preview", lambda *args: {})
-    def fake_generate(_session, run_date, **_kwargs):
-        captured["run_date"] = run_date
-        return result, web_app.monday(run_date), date(2026, 10, 17)
-
-    monkeypatch.setattr(web_app, "generate_rolling_schedule", fake_generate)
-
+    monkeypatch.setattr(web_app, "load_scheduling_problem", load_problem)
+    monkeypatch.setattr(web_app, "generate_weekly_schedule", solve)
+    monkeypatch.setattr(web_app, "serialize_preview", lambda _, start, end: {"start": start, "end": end})
+    monkeypatch.setattr(web_app, "PREVIEWS", {})
+    handler = SimpleNamespace(send_json=lambda payload, status: captured.update(payload, status=status))
     web_app.TherapySchedulerHandler.generate_schedule(
-        FakeHandler(), {"start": "2026-10-01", "searchSeconds": 20},
+        handler, {"start": target.isoformat(), "searchSeconds": 120, "mode": "STRICT"},
     )
 
-    assert captured["run_date"] == date(2026, 10, 1)
+    assert captured["status"] == 201
+    assert captured["start"] == captured["end"] == target
+    assert captured["planningDays"] == 1
+    assert web_app.PREVIEWS[captured["previewId"]]["horizon_days"] == 1
+
+
+@pytest.mark.parametrize("body", [
+    {"start": "2026-10-01", "planningMode": "rolling"},
+    {"start": "2026-10-02", "planningMode": "day"},
+])
+def test_standalone_generator_rejects_multiweek_and_other_dates(monkeypatch, body):
+    monkeypatch.setattr(web_app, "next_planning_date", lambda: date(2026, 10, 1))
+    with pytest.raises(web_app.ApiError):
+        web_app.TherapySchedulerHandler.generate_schedule(object(), body)
 
 
 def test_schedule_payload_contains_display_ready_appointment(db_session, monkeypatch):

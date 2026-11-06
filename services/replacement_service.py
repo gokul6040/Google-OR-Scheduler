@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 from datetime import timedelta
 
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 
 from database.models import (
     Appointment,
     AppointmentStatus,
     Patient,
+    Department,
     PatientAbsence,
     PatientAvailability,
     TherapistAbsence,
     TherapistAvailability,
     TreatmentRequirement,
     WaitlistEntry,
+)
+from database.repository import load_scheduling_problem
+from scheduling.bundle_builder import build_bundles
+from scheduling.rules import placement_rejection_reason
+from services.admin_reservation_service import (
+    RELEASED_STATUSES, is_reserved_source, reserved_source_ids,
 )
 
 
@@ -25,57 +33,72 @@ ACTIVE_REPLACEMENT_STATUSES = (
 )
 
 
-def find_replacement_candidates(session, vacant: Appointment, week_start):
-    """Return children who can use an opening without breaking continuity.
+def find_replacement_candidates(session, vacant: Appointment, week_start, *, whole_visit: bool = True):
+    """Suggest complete visits for this opening using the scheduler's rules.
 
-    A candidate must be assigned to the same therapist and need the same
-    therapy at the same branch. The list is advisory; it never books a child
-    automatically.
+    Search all patients' remaining weekly bundles, retaining saved bookings.
+    Suggestions neither move later visits nor reserve or message a patient.
     """
-    day = vacant.date.weekday()
-    requirements = list(session.scalars(select(TreatmentRequirement).where(
-        TreatmentRequirement.department_id == vacant.department_id,
-        TreatmentRequirement.assigned_therapist_id == vacant.therapist_id,
-        TreatmentRequirement.location_id == vacant.location_id,
-        TreatmentRequirement.active.is_(True),
-        TreatmentRequirement.patient_id != vacant.patient_id,
-    )))
-    week_end = week_start + timedelta(days=6)
-    progress = Counter(session.scalars(select(Appointment.treatment_requirement_id).where(
-        Appointment.date >= week_start,
-        Appointment.date <= week_end,
-        Appointment.status.in_([
-            AppointmentStatus.CONFIRMED,
-            AppointmentStatus.COMPLETED,
-            AppointmentStatus.PROPOSED,
-        ]),
-    )))
-    candidates = []
-    for requirement in requirements:
-        if progress[requirement.id] >= requirement.sessions_per_week:
-            continue
-        available = session.scalar(select(PatientAvailability.id).where(
-            PatientAvailability.patient_id == requirement.patient_id,
-            PatientAvailability.day_of_week == day,
-            PatientAvailability.slot_index == vacant.slot_index,
-            PatientAvailability.available.is_(True),
-        ))
-        clash = session.scalar(select(Appointment.id).where(
-            Appointment.patient_id == requirement.patient_id,
+    if vacant.status not in RELEASED_STATUSES or is_reserved_source(session, vacant.id):
+        return []
+    sources = [vacant]
+    if whole_visit and vacant.bundle_id:
+        sources = list(session.scalars(select(Appointment).where(
+            Appointment.patient_id == vacant.patient_id,
             Appointment.date == vacant.date,
-            Appointment.status.notin_([AppointmentStatus.CANCELLED_PATIENT, AppointmentStatus.CANCELLED_OTHER]),
-        ))
-        patient_absence = session.scalar(select(PatientAbsence.id).where(
-            PatientAbsence.patient_id == requirement.patient_id,
-            PatientAbsence.date == vacant.date,
-        ))
-        if not available or clash or patient_absence:
-            continue
-        patient = session.get(Patient, requirement.patient_id)
-        waitlist = session.scalar(select(WaitlistEntry).where(
-            WaitlistEntry.treatment_requirement_id == requirement.id,
+            Appointment.bundle_id == vacant.bundle_id,
+            Appointment.status.in_(RELEASED_STATUSES),
+            Appointment.id.notin_(reserved_source_ids()),
+        ).order_by(Appointment.slot_index)))
+    # Always account against the opening's Monday-Saturday week.
+    week_start = vacant.date - timedelta(days=vacant.date.weekday())
+    problem = load_scheduling_problem(session, week_start, planning_start_date=vacant.date)
+    progress = Counter(item.requirement_id for item in problem.pinned)
+    remaining = [replace(item, sessions_per_week=max(
+        0, item.sessions_per_week - progress[item.id],
+    )) for item in problem.requirements]
+    requirements = {item.id: item for item in problem.requirements}
+    patients = {item.id: item for item in session.scalars(select(Patient).where(Patient.active.is_(True)))}
+    departments = set(session.scalars(select(Department.id).where(Department.active.is_(True))))
+    # The retained test schema intentionally has no optional main waitlist table.
+    # Absence means ordinary priority, not a new migration or a failed search.
+    connection = session.connection()
+    schema = connection.get_execution_options().get("schema_translate_map", {}).get(WaitlistEntry.__table__.schema)
+    waitlists = {}
+    if inspect(connection).has_table(WaitlistEntry.__tablename__, schema=schema):
+        for item in session.scalars(select(WaitlistEntry).where(
             WaitlistEntry.status == "ACTIVE",
-        ))
+        ).order_by(WaitlistEntry.id)):
+            waitlists.setdefault(item.treatment_requirement_id, item)
+    booked_patients = {item.patient_id for item in problem.pinned if item.date == vacant.date}
+    therapist_usage = Counter((item.therapist_id, item.date, item.slot_index) for item in problem.pinned)
+    location_usage = Counter((item.location_id, item.date, item.slot_index) for item in problem.pinned)
+    candidates = []
+    seen = set()
+    for bundle in build_bundles(remaining):
+        patient = patients.get(bundle.patient_id)
+        if patient is None or patient.id == vacant.patient_id or patient.id in booked_patients or patient.id in seen:
+            continue
+        if len(bundle.items) != len(sources) or any(
+            (item.therapist_id, item.department_id, item.location_id) !=
+            (source.therapist_id, source.department_id, source.location_id)
+            or source.slot_index != sources[0].slot_index + offset
+            or item.department_id not in departments
+            for offset, (item, source) in enumerate(zip(bundle.items, sources))
+        ):
+            continue
+        if placement_rejection_reason(problem, bundle, (vacant.date - week_start).days, sources[0].slot_index):
+            continue
+        if any(
+            therapist_usage[(source.therapist_id, source.date, source.slot_index)]
+            or location_usage[(source.location_id, source.date, source.slot_index)] >=
+            problem.location_capacities.get(source.location_id, 0)
+            for source in sources
+        ):
+            continue
+        selected = bundle.items[next(index for index, source in enumerate(sources) if source.id == vacant.id)]
+        requirement = requirements[selected.requirement_id]
+        waitlist = waitlists.get(requirement.id)
         priority = waitlist.priority if waitlist else 0
         waiting_days = (vacant.date - waitlist.waiting_since).days if waitlist else 0
         score = 100_000 + (10_000 if waitlist else 0) + priority * 100 + max(0, waiting_days)
@@ -87,11 +110,12 @@ def find_replacement_candidates(session, vacant: Appointment, week_start):
             "weekly_progress": f"{progress[requirement.id]}/{requirement.sessions_per_week}",
             "reason": (
                 "Needs this therapy with the same therapist at the same branch "
-                f"and is available at slot {vacant.slot_index}."
+                f"and can complete the released visit at slot {sources[0].slot_index}."
             ),
             "priority": priority,
             "score": score,
         })
+        seen.add(patient.id)
     return sorted(candidates, key=lambda item: (-item["score"], item["patient_code"]))
 
 

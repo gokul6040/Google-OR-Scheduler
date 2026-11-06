@@ -8,19 +8,20 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import base64
 from dataclasses import asdict, replace
-from datetime import date, datetime, timedelta
+from functools import cached_property
+from datetime import date, datetime, timedelta, timezone
+from datetime import datetime as DateTime
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import secrets
-import threading
 import time
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import delete, select
+from sqlalchemy import case, delete, or_, select, update
 from sqlalchemy.sql.ddl import sort_tables
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -29,7 +30,8 @@ from database.models import (
     AdminBookingDecision, Appointment, AppointmentStatus, AuditLog, Department, Location, Patient,
     PatientAvailability, Therapist, TherapistAvailability, TreatmentRequirement,
 )
-from database.repository import load_scheduling_problem, save_proposed_schedule
+from database.repository import limit_new_bookings_to_day, load_scheduling_problem, save_proposed_schedule
+from database.workflow_lock import WorkflowLock, workflow_locks
 from scheduling.cp_sat_scheduler import generate_weekly_schedule
 from scheduling.slot_config import SLOTS, slot_label
 from scheduling.types import ScheduledAppointment, ScheduleResult, SchedulingProblem
@@ -39,11 +41,17 @@ from services.parent_response_service import (
 )
 from services.whatsapp_service import (
     send_reply_buttons, send_template_message, send_text_message,
-    sender_settings_from_environment,
+    sender_settings_from_environment, WhatsAppConfigurationError,
+)
+from services.therapy_schedule_template import (
+    PARAMETERS as THERAPY_TEMPLATE_PARAMETERS, PROFILE as THERAPY_TEMPLATE_PROFILE,
+    prepare_template_job, queue_daily_reminders, schedule_initial_job,
+    template_fields, uses_daily_template,
 )
 
 from flow_test.models import FlowContactWindow, FlowInbox, FlowJob, FlowOffer, FlowSetting
 from flow_test.storage import TEST_TABLES, create_test_engine, initialize_test_tables
+from flow_test.reliability import Reliability, PAUSE_KEY
 
 
 ROOT = Path(__file__).resolve().parent
@@ -111,8 +119,9 @@ def format_offer_message(fields: dict[str, str]) -> str:
     day = fields.get("date_display", fields.get("date", "the scheduled date"))
     schedule = fields.get("schedule", fields["visit_details"])
     reference = fields.get("reference", "")
+    heading = "TEST ONLY — fictional appointment" if fields.get("test_only", True) else "Your therapy appointment"
     message = (
-        f"TEST ONLY — fictional appointment\n\nHi {name},\n"
+        f"{heading}\n\nHi {name},\n"
         f"You have {therapy} scheduled on {day} at {fields['centre']}.\n\n"
         f"{schedule}\n\nCan you attend? Cannot attend means unavailable for the whole day."
         + (f"\nReference: {reference}" if reference else "")
@@ -122,7 +131,7 @@ def format_offer_message(fields: dict[str, str]) -> str:
     # Avoid repeating every therapy in the introduction. Keep the complete
     # visit, identity, branch, times and action meaning within Meta's body limit.
     return (
-        f"TEST ONLY · {fields.get('patient_code', name)}\n"
+        f"{'TEST ONLY' if fields.get('test_only', True) else 'Appointment'} · {fields.get('patient_code', name)}\n"
         f"{fields.get('date', day)} · IST\n{fields['centre']}\n\n"
         f"{fields.get('compact_schedule', schedule)}\n\n"
         "Yes: confirm visit. Cannot attend: unavailable for the whole day. Help: ask staff."
@@ -133,24 +142,37 @@ def format_offer_message(fields: dict[str, str]) -> str:
 class TestTransport:
     """Explicit live transport; preview mode makes no HTTP requests."""
 
-    def __init__(self, live: bool, recipients: dict[str, str]):
+    def __init__(self, live: bool, recipients: dict[str, str], *, env_prefix: str = "FLOW_TEST"):
         self.live = live
         self.allowed = set(recipients.values())
         self.sender = sender_settings_from_environment() if live else None
-        self.mode = os.getenv("FLOW_TEST_MESSAGE_MODE", "session").strip().lower()
+        self.mode = os.getenv(f"{env_prefix}_MESSAGE_MODE", "session").strip().lower()
         if self.mode not in {"session", "template"}:
             raise ValueError("FLOW_TEST_MESSAGE_MODE must be session or template")
-        self.template = os.getenv("FLOW_TEST_TEMPLATE_NAME", "").strip()
-        self.language = os.getenv("FLOW_TEST_TEMPLATE_LANGUAGE", "en_US")
-        self.parameters = [] if self.mode == "session" else json.loads(os.getenv(
-            "FLOW_TEST_TEMPLATE_PARAMETERS", '["{patient}", "{visit_details}"]',
-        ))
+        self.profile = os.getenv(f"{env_prefix}_TEMPLATE_PROFILE", "legacy").strip()
+        if self.profile not in {"legacy", THERAPY_TEMPLATE_PROFILE}:
+            raise ValueError("Unknown WhatsApp template profile")
+        self.timed_schedule = os.getenv(f"{env_prefix}_TIMED_TEMPLATE_ENABLED", "false").lower() == "true"
+        if self.timed_schedule and (self.mode != "template" or self.profile != THERAPY_TEMPLATE_PROFILE):
+            raise ValueError("Timed offers require template mode and the therapy_schedule_v1 profile")
+        self.template = os.getenv(f"{env_prefix}_TEMPLATE_NAME", "").strip()
+        self.language = os.getenv(f"{env_prefix}_TEMPLATE_LANGUAGE",
+                                 "" if self.profile == THERAPY_TEMPLATE_PROFILE else "en_US").strip()
+        if self.mode == "session":
+            self.parameters = []
+        elif self.profile == THERAPY_TEMPLATE_PROFILE:
+            self.parameters = list(THERAPY_TEMPLATE_PARAMETERS)
+        else:
+            self.parameters = json.loads(os.getenv(
+                f"{env_prefix}_TEMPLATE_PARAMETERS", '["{patient}", "{visit_details}"]',
+            ))
         if self.mode == "template" and (not isinstance(self.parameters, list) or not self.parameters or not all(
             isinstance(value, str) for value in self.parameters
         )):
             raise ValueError("Template parameters must be a nonempty JSON string array")
         sample = dict.fromkeys(("patient", "visit_details", "reference", "centre", "date", "time",
-                                "greeting_name", "therapy", "date_display", "schedule"), "TEST")
+                                "greeting_name", "therapy", "date_display", "schedule",
+                                "session_details", "therapy_count", "message_context"), "TEST")
         try:
             for value in self.parameters:
                 value.format_map(sample)
@@ -158,6 +180,8 @@ class TestTransport:
             raise ValueError("Invalid template parameter placeholder") from exc
         if live and self.mode == "template" and not self.template:
             raise ValueError("Template mode needs FLOW_TEST_TEMPLATE_NAME")
+        if live and self.mode == "template" and not self.language:
+            raise ValueError("Set the exact approved template language before enabling messages")
 
     def send(self, kind: str, payload: dict[str, Any]) -> str:
         """Return the provider message ID without logging contacts or credentials."""
@@ -167,6 +191,10 @@ class TestTransport:
         if not self.live:
             return f"preview-{secrets.token_hex(8)}"
         if kind == "OFFER":
+            marked = payload.get("template_profile") == THERAPY_TEMPLATE_PROFILE
+            configured = self.mode == "template" and self.profile == THERAPY_TEMPLATE_PROFILE
+            if marked != configured:
+                raise WhatsAppConfigurationError("Offer and configured template profile do not match; review the queue")
             if self.mode == "session":
                 if payload.get("session_expires_at", 0) <= time.time():
                     raise ValueError("Coworker must message first to open a 24-hour window")
@@ -174,7 +202,7 @@ class TestTransport:
                 result = send_reply_buttons(
                     self.sender, recipient,
                     format_offer_message(fields),
-                    tuple((f"ft:{payload['token']}:{action}", title) for action, title in (
+                    tuple((f"{payload.get('button_prefix', 'ft')}:{payload['token']}:{action}", title) for action, title in (
                         ("YES", "Yes"), ("NO", "Cannot attend"), ("HELP", "Help"),
                     )),
                 )
@@ -182,15 +210,21 @@ class TestTransport:
                 values = tuple(value.format_map(payload["fields"]) for value in self.parameters)
                 result = send_template_message(
                     self.sender, recipient, self.template, self.language, values,
-                    tuple(f"ft:{payload['token']}:{action}" for action in ("YES", "NO", "HELP")),
+                    tuple(f"{payload.get('button_prefix', 'ft')}:{payload['token']}:{action}"
+                          for action in (("YES", "NO") if configured else ("YES", "NO", "HELP"))),
                 )
         else:
             result = send_text_message(self.sender, recipient, payload["text"])
         return str(result["messages"][0]["id"])
 
 
-class FlowTest:
+class FlowTest(Reliability):
     """Serialize local test mutations and persist offers, jobs and audit records."""
+
+    is_test = True
+    solver_settings = SETTINGS
+    message_prefix = "TEST ONLY: "
+    button_prefix = "ft"
 
     def __init__(
         self, database_url: str | None = None, *, live: bool = False,
@@ -201,15 +235,14 @@ class FlowTest:
         scenario: dict | None = None,
     ):
         self.live = live
+        self.configure_reliability()
         self.message_mode = os.getenv("FLOW_TEST_MESSAGE_MODE", "session").strip().lower()
         if self.message_mode not in {"session", "template"}:
             raise ValueError("FLOW_TEST_MESSAGE_MODE must be session or template")
         self.recipients = recipients or {}
         self.recipient_names = recipient_names or {}
-        self.lock = threading.RLock()
         # Inbound callbacks must be persisted while a send is waiting on HTTP.
         # Imports/resets take both locks, always in workflow-then-inbound order.
-        self.inbound_lock = threading.RLock()
         self.scenario = (json.loads(json_text(scenario)) if scenario is not None else
                          json.loads((ROOT / "scenario.json").read_text(encoding="utf-8")))
         self.offer_minutes = int(os.getenv("FLOW_TEST_OFFER_MINUTES", "600"))
@@ -218,7 +251,6 @@ class FlowTest:
         self.send_batch_size = int(os.getenv("FLOW_TEST_SEND_BATCH_SIZE", "5"))
         if not 1 <= self.send_batch_size <= 20:
             raise ValueError("Send batch size must be between 1 and 20")
-        self._recipient_send_after = {}
         # Validate transport before creating any database records.
         self.transport = None if send else TestTransport(live, self.recipients)
         self.send = send or self.transport.send
@@ -228,13 +260,15 @@ class FlowTest:
             database_url = f"sqlite:///{(ROOT / 'data' / name).as_posix()}"
         self.database_schema = database_schema
         self.engine = create_test_engine(database_url, database_schema)
+        self.lock, self.inbound_lock = workflow_locks(self.engine, database_schema)
         try:
-            initialize_test_tables(self.engine, database_schema)
+            with self.lock, self.inbound_lock:
+                initialize_test_tables(self.engine, database_schema)
         except Exception:
             self.engine.dispose()
             raise
         self.sessions = sessionmaker(bind=self.engine, expire_on_commit=False)
-        with self.sessions.begin() as session:
+        with self.lock, self.inbound_lock, self.sessions.begin() as session:
             imported = session.get(FlowSetting, "zoho_test_scenario")
             if imported is not None:
                 self.scenario = json.loads(imported.value)
@@ -255,12 +289,7 @@ class FlowTest:
                 session.add(FlowSetting(key="mode", value=expected_mode))
             elif marker.value != scenario_version:
                 self._expand_scenario(session, marker, scenario_version)
-            # A process may have died after Meta accepted an outgoing send.
-            for job in session.scalars(select(FlowJob).where(FlowJob.status == "PROCESSING")):
-                job.status = "QUEUED" if job.kind in {"INBOUND", "STATUS"} else "UNKNOWN"
-                job.error = "Restart during processing; outgoing acceptance may be unknown"
-                if job.status == "UNKNOWN":
-                    self._send_failure_inbox(session, job)
+            self._recover_processing(session)
         if self.transport:
             self.transport.allowed = self.contact_numbers()
         self.expire_offers()
@@ -270,7 +299,10 @@ class FlowTest:
         if session is None:
             with self.inbound_lock, self.sessions() as session:
                 return self.contact_numbers(session)
-        return set(self.recipients.values()) | set(session.scalars(select(FlowOffer.recipient).where(
+        source = session.get(FlowSetting, "zoho_test_scenario")
+        contacts = ({item["phone"] for item in json.loads(source.value)["patients"] if item.get("phone")}
+                    if source else set(self.recipients.values()))
+        return contacts | set(session.scalars(select(FlowOffer.recipient).where(
             ~FlowOffer.recipient.startswith("preview:"),
         )))
 
@@ -385,7 +417,7 @@ class FlowTest:
         if self.live and (self.database_schema != "flow_test"
                           or self.engine.dialect.name != "postgresql"):
             raise ValueError("Live reset is restricted to the isolated PostgreSQL flow_test schema")
-        with self.lock, self.inbound_lock, self.sessions.begin() as session:
+        with self.sender_lock, self.ack_sender_lock, self.lock, self.inbound_lock, self.sessions.begin() as session:
             mode = session.get(FlowSetting, "mode")
             marker = session.get(FlowSetting, "scenario")
             if (mode is None or mode.value != ("live" if self.live else "preview")
@@ -425,6 +457,8 @@ class FlowTest:
         job = session.scalar(select(FlowJob).where(FlowJob.event_key == digest))
         if job is None:
             job = FlowJob(event_key=digest, kind=kind, payload=json_text(payload))
+            if kind == "TEXT" and payload.get("send_before"):
+                job.deadline_at = DateTime.utcfromtimestamp(payload["send_before"])
             session.add(job)
             session.flush()
         return job
@@ -462,24 +496,25 @@ class FlowTest:
         """Bound new slots to one day, retaining the full week's fixed demand."""
         if target.weekday() == 6:
             raise ValueError("Choose Monday through Saturday")
+        source = session.get(FlowSetting, "zoho_test_scenario")
+        if source:
+            self.use_source_contacts(json.loads(source.value))
         if patient_codes is None:
             patient_codes = [p["code"] for p in self.scenario["patients"] if p["initial_roster"]]
-        known = {p["code"] for p in self.scenario["patients"]}
-        if not patient_codes or not set(patient_codes) <= known:
+        elif not patient_codes or not set(patient_codes) <= {p["code"] for p in self.scenario["patients"]}:
             raise ValueError("Select known fictional patients for the draft")
         start = target - timedelta(days=target.weekday())
         problem = load_scheduling_problem(session, start, planning_start_date=target)
         input_fingerprint = self._planning_fingerprint(session, problem)
-        selected_ids = set(session.scalars(select(Patient.id).where(Patient.patient_code.in_(patient_codes))))
+        selected_ids = set(session.scalars(select(Patient.id).where(
+            Patient.patient_code.in_(patient_codes), Patient.active.is_(True),
+        )))
         pinned_counts = Counter(a.requirement_id for a in problem.pinned)
         problem.requirements = [
             r if r.patient_id in selected_ids else replace(r, sessions_per_week=pinned_counts[r.id])
             for r in problem.requirements
         ]
-        problem.new_booking_slots = {
-            (r.therapist_id, r.department_id, r.location_id, target, slot.slot_index)
-            for r in problem.requirements for slot in SLOTS
-        }
+        limit_new_bookings_to_day(problem, target)
         result = generate_weekly_schedule(problem, settings=settings)
         result.statistics["input_fingerprint"] = input_fingerprint
         if result.status not in {"FEASIBLE", "OPTIMAL"} or any(result.validation.values()):
@@ -506,17 +541,17 @@ class FlowTest:
 
     def preview_daily(
         self, target: date, patient_codes: list[str] | None = None,
-        *, settings: SolverSettings = SETTINGS,
+        *, settings: SolverSettings | None = None,
     ) -> tuple[ScheduleResult, tuple[ScheduledAppointment, ...]]:
         """Return an unsaved daily plan and the fixed visits counted in its week."""
         with self.lock, self.sessions() as session:
-            problem, result = self._daily_result(session, target, patient_codes, settings)
+            problem, result = self._daily_result(session, target, patient_codes, settings or self.solver_settings)
             return result, tuple(problem.pinned)
 
     def generate(self, target: date, patient_codes: list[str] | None = None) -> dict:
         """Save a daily draft while counting all saved bookings in that week."""
         with self.lock, self.sessions.begin() as session:
-            problem, result = self._daily_result(session, target, patient_codes, SETTINGS)
+            problem, result = self._daily_result(session, target, patient_codes, self.solver_settings)
             added = 0
             for item in result.appointments:
                 if item in problem.pinned:
@@ -606,8 +641,19 @@ class FlowTest:
 
     def _publish(self, session, target: date, appointment_id: int | None = None) -> int:
         """Queue offers using the caller's transaction, without sending."""
-        query = select(Appointment).where(
+        from flow_test.zoho_import import require_reconciled_source
+
+        require_reconciled_source(session)
+        if uses_daily_template(self) and target.weekday() == 6:
+            raise ValueError("Sunday is a holiday; no therapy-template offers may target Sunday")
+        source = session.get(FlowSetting, "zoho_test_scenario")
+        if source:
+            # Another replica may have imported new contacts since this process
+            # started. Publishing must use the committed source, not its cache.
+            self.use_source_contacts(json.loads(source.value))
+        query = select(Appointment).join(Patient).where(
             Appointment.date == target, Appointment.status == AppointmentStatus.PROPOSED,
+            Patient.active.is_(True),
         ).order_by(Appointment.id)
         drafts = list(session.scalars(query))
         if appointment_id is not None:
@@ -628,6 +674,7 @@ class FlowTest:
             token = secrets.token_hex(10)
             recipient = self.recipients.get(patient.patient_code, f"preview:{patient.patient_code}")
             offer = FlowOffer(
+                created_at=datetime.utcnow(),
                 token=token, patient_code=patient.patient_code, recipient=recipient,
                 appointment_ids=json_text([a.id for a in items]), snapshot=self._snapshot(items),
             )
@@ -647,7 +694,8 @@ class FlowTest:
                 for a in sorted(items, key=lambda a: a.slot_index)
             )
             fields = {
-                "patient": f"TEST ONLY — {patient.name}", "reference": token,
+                "patient": f"TEST ONLY — {patient.name}" if self.is_test else patient.name,
+                "test_only": self.is_test, "reference": token,
                 "patient_code": patient.patient_code,
                 "greeting_name": self.recipient_names.get(patient.patient_code) or patient.name or patient.patient_code,
                 "therapy": " and ".join(therapy_names), "schedule": schedule,
@@ -658,13 +706,24 @@ class FlowTest:
                 "date_display": target.strftime("%A, %d %B %Y"),
                 "centre": session.get(Location, items[0].location_id).name, "date": target.isoformat(),
                 "time": slot_label(min(a.slot_index for a in items)),
-                "visit_details": f"TEST ONLY | {target.isoformat()} IST | {details} | Ref {token}",
+                "visit_details": f"{'TEST ONLY | ' if self.is_test else ''}{target.isoformat()} IST | {details} | Ref {token}",
             }
+            if uses_daily_template(self):
+                fields.update(template_fields(
+                    (session.get(Department, a.department_id).name,
+                     SLOTS[a.slot_index].start_time, SLOTS[a.slot_index].end_time)
+                    for a in sorted(items, key=lambda a: a.slot_index)
+                ))
             if self.message_mode == "session" and len(format_offer_message(fields)) > 1024:
                 raise ValueError(f"The WhatsApp offer for {patient.patient_code} is too long. Review therapy labels before publishing.")
             outgoing = self._job(session, f"offer:{token}", "OFFER", {
-                "token": token, "recipient": recipient, "fields": fields,
+                "token": token, "recipient": recipient, "fields": fields, "button_prefix": self.button_prefix,
             })
+            if uses_daily_template(self):
+                schedule_initial_job(self, outgoing, json.loads(outgoing.payload), target)
+            if self.live:
+                outgoing.deadline_at = min(DateTime.combine(a.date, SLOTS[a.slot_index].start_time,
+                    tzinfo=ZoneInfo("Asia/Kolkata")).astimezone(timezone.utc).replace(tzinfo=None) for a in items)
             if self.live and self.message_mode == "session" and self._session_deadline(session, recipient) <= time.time():
                 outgoing.status = "WAITING_FOR_CONTACT"
                 outgoing.error = "Parent must message first; no send was attempted"
@@ -690,7 +749,7 @@ class FlowTest:
                 request_id=request_id, preview_token=preview_token,
                 whole_visit=whole_visit, override_warnings=override_warnings,
                 mode="with_messaging", allow_pending_offer=True,
-                admin_user="flow_test_admin",
+                admin_user=getattr(self, "admin_id", "flow_test_admin"),
             )
             ids = result["appointment_ids"]
             appointment = session.get(Appointment, ids[0])
@@ -788,7 +847,7 @@ class FlowTest:
             self._audit(session, "flow_coworker_ready", "contact_window")
             return
         button = message.get("button", {}).get("payload") or message.get("interactive", {}).get("button_reply", {}).get("id")
-        match = re.fullmatch(r"ft:([a-f0-9]{20}):(YES|NO|VISIT|DAY|HELP|RESCHEDULE)", str(button or ""))
+        match = re.fullmatch(re.escape(self.button_prefix) + r":([a-f0-9]{20}):(YES|NO|VISIT|DAY|HELP|RESCHEDULE)", str(button or ""))
         action, token = "", ""
         if match:
             token, action = match.groups()
@@ -825,7 +884,8 @@ class FlowTest:
             self._job(session, f"help:{job.event_key}", "TEXT", {
                 "recipient": offer.recipient, "token": token, "expected_state": offer.state,
                 "send_before": int(message["timestamp"]) + 86400,
-                "text": "TEST ONLY: Your request is in the test admin inbox. Your current booking is unchanged.",
+                "text": self.message_prefix + ("Your request is in the test admin inbox. Your current booking is unchanged."
+                         if self.is_test else "Your request is in the staff inbox. Your current booking is unchanged."),
             })
         elif action in {"YES", "NO", "VISIT", "DAY"}:
             whole_day = action in {"NO", "DAY"}
@@ -862,7 +922,7 @@ class FlowTest:
                 bind=session.connection(), join_transaction_mode="create_savepoint",
                 expire_on_commit=False,
             )() as repair_session:
-                process_daily_responses(repair_session, items[0].date, settings=SETTINGS)
+                process_daily_responses(repair_session, items[0].date, settings=self.solver_settings)
             session.expire_all()
             offer = session.get(FlowOffer, token)
             if whole_day:
@@ -887,17 +947,72 @@ class FlowTest:
             self._job(session, f"ack:{job.event_key}", "TEXT", {
                 "recipient": offer.recipient, "token": token, "expected_state": offer.state,
                 "send_before": int(message["timestamp"]) + 86400,
-                "text": ("TEST ONLY: Visit confirmed." if action == "YES" else
-                         f"TEST ONLY: Unavailable for the whole day on {items[0].date.isoformat()}. Your bookings on that date have been released; remaining weekly therapy needs are retained." if whole_day else
-                         "TEST ONLY: Visit decline recorded. Your remaining weekly therapy needs are retained."),
+                "text": self.message_prefix + ("Visit confirmed." if action == "YES" else
+                         f"Unavailable for the whole day on {items[0].date.isoformat()}. Your bookings on that date have been released; remaining weekly therapy needs are retained." if whole_day else
+                         "Visit decline recorded. Your remaining weekly therapy needs are retained."),
             })
+
+    def review_inactive_patient_offers(self, session, patient: Patient, today: date) -> None:
+        """Withdraw unsent offers and route offers that may have reached a family to staff."""
+        offers = session.scalars(select(FlowOffer).where(
+            FlowOffer.patient_code == patient.patient_code, FlowOffer.state.in_(("PENDING", "EXPIRED")),
+        ))
+        for offer in offers:
+            items = list(session.scalars(select(Appointment).where(
+                Appointment.id.in_(json.loads(offer.appointment_ids)),
+                Appointment.date >= today, Appointment.status == AppointmentStatus.PENDING_CONFIRMATION,
+            )))
+            if not items:
+                continue
+            key = hashlib.sha256(f"offer:{offer.token}".encode()).hexdigest()
+            job = session.scalar(select(FlowJob).where(FlowJob.event_key == key))
+            if job and job.status in {
+                "QUEUED", "RETRY_WAIT", "WAITING_FOR_CONTACT", "WAITING_FOR_SYNC", "WAITING_FOR_ENABLE", "BLOCKED",
+            }:
+                job.status, job.error = "OBSOLETE", "Patient marked inactive before this offer was sent."
+                offer.state, offer.expires_at = "CLOSED", None
+                for item in items:
+                    item.status = AppointmentStatus.CANCELLED_OTHER
+                continue
+            review_key = f"inactive:{offer.token}"
+            if not session.scalar(select(FlowInbox.id).where(FlowInbox.event_key == review_key)):
+                session.add(FlowInbox(
+                    event_key=review_key, patient_code=patient.patient_code,
+                    reason="Inactive patient — review existing offer",
+                    text=f"Review the {items[0].date.isoformat()} visit and any parent reply before finalising.",
+                ))
 
     def _prepare_send(self, session, job, payload: dict) -> bool:
         """Validate a claimed outbound job before any network request."""
+        from flow_test.zoho_import import reconciliation_required
+
         offer = session.get(FlowOffer, payload["token"])
         if offer is None:
             raise ValueError("Offer no longer exists")
         items = self._offer_items(session, offer)
+        if job.kind == "OFFER" and not session.scalar(select(Patient.active).where(
+            Patient.patient_code == offer.patient_code,
+        )):
+            job.status, job.error = "OBSOLETE", "Patient is inactive."
+            return False
+        if session.get(FlowSetting, PAUSE_KEY):
+            job.status = "QUEUED"
+            return False
+        if job.attempts > self.max_send_attempts:
+            self._terminal(session, job, "Retry limit reached. Contact the parent by phone.")
+            return False
+        if self.live:
+            # Session-window expiry is handled below by waiting for contact.
+            # The durable final send cutoff is the visit's first start time.
+            deadlines = [DateTime.combine(a.date, SLOTS[a.slot_index].start_time,
+                         tzinfo=ZoneInfo("Asia/Kolkata")).astimezone(timezone.utc).replace(tzinfo=None)
+                         for a in items]
+            if job.kind == "TEXT":
+                deadlines = [datetime.utcfromtimestamp(payload.get("send_before", 0))]
+            job.deadline_at = min(deadlines) if deadlines else datetime.utcnow()
+            if job.deadline_at <= datetime.utcnow():
+                self._terminal(session, job, "Sending deadline reached. Contact the parent by phone.")
+                return False
         if job.kind == "OFFER" and (offer.state != "PENDING" or any(
                 a.status != AppointmentStatus.PENDING_CONFIRMATION for a in items)):
             job.status = "OBSOLETE"
@@ -906,9 +1021,15 @@ class FlowTest:
                 or time.time() >= payload.get("send_before", 0)):
             job.status = "OBSOLETE"
             return False
+        if job.kind == "OFFER" and reconciliation_required(session):
+            job.status = "WAITING_FOR_SYNC"
+            job.error = "No send was attempted. Reconcile the Zoho source with --apply --reconcile."
+            return False
         if job.kind == "OFFER" and self.live and any(
                 a.date < datetime.now(ZoneInfo("Asia/Kolkata")).date() for a in items):
             raise ValueError("Live offers cannot use a past appointment date")
+        if job.kind == "OFFER" and not prepare_template_job(self, session, job, payload):
+            return False
         if job.kind == "OFFER" and self.live and self.message_mode == "session":
             deadline = self._session_deadline(session, payload["recipient"])
             if deadline <= time.time():
@@ -916,122 +1037,318 @@ class FlowTest:
                 job.error = "Coworker must send START; no send was attempted"
                 return False
             payload["session_expires_at"] = deadline
+        if self.transport:
+            self.transport.allowed = self.contact_numbers(session)
         return True
+
+    @staticmethod
+    def _pacing_key(recipient: str) -> str:
+        return "send_after:" + hashlib.sha256(recipient.encode()).hexdigest()
+
+    def _recipient_ready(self, session, recipient: str) -> bool:
+        if not self.live:
+            return True
+        saved = session.get(FlowSetting, self._pacing_key(recipient))
+        return (saved is None or float(saved.value) <= time.time())
+
+    def _pace_recipient(self, session, payload: dict) -> None:
+        if self.live:
+            key = self._pacing_key(payload["recipient"])
+            saved = session.get(FlowSetting, key)
+            if saved is None:
+                session.add(FlowSetting(key=key, value=str(time.time() + 6)))
+            else:
+                saved.value = str(time.time() + 6)
+
+    def _recover_processing(self, session) -> None:
+        """Recover only after proving no sender owns this queue.
+
+        Nonblocking acquisition is essential: callers already hold the workflow
+        lock, whereas a sender takes sender-then-workflow. Never invert that order.
+        """
+        if not self.sender_lock.acquire(blocking=False):
+            self._maintain_delivery(session)
+            return
+        try:
+            if self.ack_sender_lock.acquire(blocking=False):
+                try:
+                    self._recover_abandoned(session)
+                finally:
+                    self.ack_sender_lock.release()
+            else:
+                self._maintain_delivery(session)
+        finally:
+            self.sender_lock.release()
+
+    def _recover_abandoned(self, session) -> None:
+        for job in session.scalars(select(FlowJob).where(FlowJob.status == "PROCESSING")):
+            safe = job.kind in {"INBOUND", "STATUS"} or (job.locked_by and job.send_started_at is None)
+            job.status = "QUEUED" if safe else "UNKNOWN"
+            job.locked_by, job.locked_until = None, None
+            job.error = "Interrupted processing; queued again before sending" if safe else "Interrupted processing; check delivery before any resend"
+            if job.status == "UNKNOWN":
+                self._send_failure_inbox(session, job)
+        self._maintain_delivery(session)
+
+    @cached_property
+    def sender_lock(self):
+        return WorkflowLock(self.engine, "sender", self.database_schema)
+
+    @cached_property
+    def ack_sender_lock(self):
+        return WorkflowLock(self.engine, "ack_sender", self.database_schema)
+
+    @cached_property
+    def dispatch_control(self):
+        from services.whatsapp_dispatch import DispatchControl
+        control = DispatchControl(self.engine)
+        control.check()
+        return control
+
+    def _business_number(self) -> str:
+        if self.transport and self.transport.live:
+            return self.transport.sender.phone_number_id
+        return os.getenv("WHATSAPP_PHONE_NUMBER_ID", "injected-test-transport")
+
+    def _claim_job(self, session, job_id: int) -> bool:
+        """Claim durably only if another worker has not already taken the job."""
+        result = session.execute(update(FlowJob).where(
+            FlowJob.id == job_id, FlowJob.status == "QUEUED",
+        ).values(status="PROCESSING", attempts=FlowJob.attempts + 1,
+                 locked_by=self.worker_id, locked_until=datetime.utcnow() + timedelta(minutes=2),
+                 send_started_at=None, next_attempt_at=None))
+        return result.rowcount == 1
 
     def _sent(self, job_id: int, kind: str, payload: dict, provider_id: str) -> None:
         with self.sessions.begin() as session:
             job = session.get(FlowJob, job_id)
             job.message_id = provider_id
             job.status = "SENT" if self.live else "SIMULATED"
-            if kind == "OFFER":
-                session.get(FlowOffer, payload["token"]).expires_at = datetime.utcnow() + timedelta(minutes=self.offer_minutes)
+            job.accepted_at = datetime.utcnow()
+            job.error, job.error_code, job.locked_by, job.locked_until = None, None, None, None
+            self._pace_recipient(session, payload)
+            if kind == "OFFER" and not payload.get("reminder"):
+                offer = session.get(FlowOffer, payload["token"])
+                if offer and offer.state == "PENDING":
+                    offer.expires_at = datetime.utcnow() + timedelta(minutes=self.offer_minutes)
 
     def _failed_job(self, job_id: int, kind: str, exc: Exception) -> None:
         with self.sessions.begin() as session:
             job = session.get(FlowJob, job_id)
-            job.status = "UNKNOWN" if kind in {"OFFER", "TEXT"} else "FAILED"
-            job.error = f"{type(exc).__name__}: review this job; no automatic resend"
             if kind in {"OFFER", "TEXT"}:
-                self._send_failure_inbox(session, job)
+                self._record_send_failure(session, job, exc)
+                self._pace_recipient(session, json.loads(job.payload))
+            else:
+                job.status = "FAILED"
+                job.error = f"{type(exc).__name__}: review this job"
 
     def _send_failure_inbox(self, session, job: FlowJob) -> None:
+        key = f"unknown:{job.event_key}"
+        if session.scalar(select(FlowInbox.id).where(FlowInbox.event_key == key)):
+            return
         payload = json.loads(job.payload)
-        offer = session.get(FlowOffer, payload.get("token"))
-        self._inbox(session, job, "WhatsApp send needs staff review",
-                    "The provider may have accepted this message. Check delivery before taking action; "
-                    "it will not be resent automatically.", offer.patient_code if offer else None)
+        offer = session.get(FlowOffer, payload["token"]) if payload.get("token") else None
+        session.add(FlowInbox(event_key=key, patient_code=offer.patient_code if offer else None,
+                    reason="WhatsApp send needs staff review",
+                    text="Delivery unknown. The provider may have accepted this message. Check delivery before taking action; it will not be resent automatically. Booking unchanged."))
 
-    def process_batch(self) -> int:
-        """Send different recipients concurrently; serialize mutations and resets.
+    def _delivery_failure(self, session, original: FlowJob, status: dict) -> None:
+        """Surface provider-confirmed failures without copying message bodies."""
+        errors = status.get("errors", [])
+        codes = sorted({str(error.get("code")) for error in errors
+                        if isinstance(error, dict) and str(error.get("code", "")).isdigit()}) if isinstance(errors, list) else []
+        code_text = f" Meta code(s): {', '.join(codes[:5])}." if codes else ""
+        original.error = "Meta reported a delivery failure." + code_text
+        key = f"delivery:{original.event_key}"
+        if session.scalar(select(FlowInbox.id).where(FlowInbox.event_key == key)) is None:
+            offer = session.get(FlowOffer, json.loads(original.payload).get("token"))
+            session.add(FlowInbox(
+                event_key=key, patient_code=offer.patient_code if offer else None,
+                reason="WhatsApp delivery failed — staff review",
+                text="Meta reported a delivery failure." + code_text +
+                     " Review delivery and contact the family before taking action. "
+                     "The message will not be resent automatically; the booking is unchanged.",
+            ))
 
-        Only HTTP sends run in threads. The owner holds the workflow lock and
-        commits results itself, retaining the existing reset/offer guarantees.
-        Each batch contains at most one message per number.
-        """
+    @staticmethod
+    def _queue_order():
+        return case((FlowJob.kind == "INBOUND", 0), (FlowJob.kind == "STATUS", 1),
+                    (FlowJob.kind == "TEXT", 2), else_=3), FlowJob.id
+
+    def process_events(self, limit: int = 20) -> int:
+        """Apply replies/receipts independently of the outbound sender mutex."""
+        count = 0
         with self.lock:
-            with self.sessions() as session:
-                jobs = list(session.scalars(select(FlowJob).where(
-                    FlowJob.status == "QUEUED").order_by(FlowJob.id)))
-            if not jobs:
-                return 0
-            if jobs[0].kind not in {"OFFER", "TEXT"}:
-                return int(self.process_one())
-            selected, recipients, count = [], set(), 0
-            for job in jobs:
-                if job.kind not in {"OFFER", "TEXT"}:
-                    # Do not hold replies behind a long outbound queue.
-                    if not selected:
-                        return int(self.process_one(job_id=job.id))
+            for _ in range(limit):
+                with self.sessions() as session:
+                    job_id = session.scalar(select(FlowJob.id).where(
+                        FlowJob.status == "QUEUED", FlowJob.kind.in_(("INBOUND", "STATUS")),
+                        or_(FlowJob.next_attempt_at.is_(None), FlowJob.next_attempt_at <= datetime.utcnow())
+                    ).order_by(*self._queue_order()).limit(1))
+                if job_id is None:
                     break
-                payload = json.loads(job.payload)
-                recipient = payload["recipient"]
-                if recipient in recipients or (self.live and time.monotonic() < self._recipient_send_after.get(recipient, 0)):
-                    continue
-                recipients.add(recipient)
-                with self.sessions.begin() as session:
-                    claimed = session.get(FlowJob, job.id)
-                    claimed.status = "PROCESSING"
-                    claimed.attempts += 1
-                count += 1
-                try:
-                    with self.sessions.begin() as session:
-                        ready = self._prepare_send(session, session.get(FlowJob, job.id), payload)
-                    if ready:
-                        selected.append((job.id, job.kind, payload))
-                except Exception as exc:
-                    self._failed_job(job.id, job.kind, exc)
-                if len(recipients) >= self.send_batch_size:
-                    break
-            if selected:
-                with ThreadPoolExecutor(max_workers=self.send_batch_size) as pool:
-                    pending = {pool.submit(self.send, kind, payload): (job_id, kind, payload)
-                               for job_id, kind, payload in selected}
-                    for future in as_completed(pending):
-                        job_id, kind, payload = pending[future]
-                        try:
-                            self._sent(job_id, kind, payload, future.result())
-                        except Exception as exc:
-                            self._failed_job(job_id, kind, exc)
-                        # Pace repeated sends to a shared phone without delaying
-                        # other families. Preview draining remains deterministic.
-                        self._recipient_send_after[payload["recipient"]] = time.monotonic() + 6
-            return count
+                count += int(self._process_event(job_id))
+        return count
 
-    def process_one(self, *, job_id: int | None = None) -> bool:
-        """Claim one durable job. External sends have no blind automatic retries."""
+    def _process_event(self, job_id: int) -> bool:
         with self.lock:
             with self.sessions.begin() as session:
-                query = select(FlowJob).where(FlowJob.status == "QUEUED")
-                if job_id is not None:
-                    query = query.where(FlowJob.id == job_id)
-                job = session.scalar(query.order_by(FlowJob.id).with_for_update(skip_locked=True).limit(1))
-                if job is None:
+                job = session.get(FlowJob, job_id)
+                if not job or job.kind not in {"INBOUND", "STATUS"} or not self._claim_job(session, job_id):
                     return False
-                job.status = "PROCESSING"
-                job.attempts += 1
-                job_id, kind, payload = job.id, job.kind, json.loads(job.payload)
+                kind, payload = job.kind, json.loads(job.payload)
             try:
-                if kind in {"OFFER", "TEXT"}:
-                    with self.sessions.begin() as session:
-                        if not self._prepare_send(session, session.get(FlowJob, job_id), payload):
-                            return True
-                    provider_id = self.send(kind, payload)
-                    self._sent(job_id, kind, payload, provider_id)
-                else:
-                    with self.sessions.begin() as session:
-                        job = session.get(FlowJob, job_id)
-                        if kind == "INBOUND":
-                            self._inbound(session, job)
-                        elif kind == "STATUS":
-                            original = session.scalar(select(FlowJob).where(FlowJob.message_id == payload["id"]))
-                            if original and json.loads(original.payload).get("recipient") == payload.get("recipient_id"):
-                                ranks = {None: 0, "sent": 1, "delivered": 2, "read": 3, "failed": 4}
-                                if ranks[payload["status"]] >= ranks.get(original.delivery, 0):
-                                    original.delivery = payload["status"]
-                        job.status = "DONE"
+                with self.sessions.begin() as session:
+                    job = session.get(FlowJob, job_id)
+                    if kind == "INBOUND":
+                        self._inbound(session, job)
+                    elif kind == "STATUS":
+                        original = session.scalar(select(FlowJob).where(FlowJob.message_id == payload["id"]))
+                        if original is None:
+                            # A webhook can arrive before the HTTP response is
+                            # saved. Retain it while a send to this parent is active.
+                            active = list(session.scalars(select(FlowJob).where(
+                                FlowJob.status == "PROCESSING", FlowJob.kind.in_(("OFFER", "TEXT")))))
+                            if any(json.loads(item.payload).get("recipient") == payload.get("recipient_id") for item in active):
+                                job.status = "QUEUED"
+                                job.next_attempt_at = datetime.utcnow() + timedelta(seconds=1)
+                                return True
+                        if original and json.loads(original.payload).get("recipient") == payload.get("recipient_id"):
+                            ranks = {None: 0, "sent": 1, "delivered": 2, "read": 3, "failed": 4}
+                            if ranks[payload["status"]] >= ranks.get(original.delivery, 0):
+                                original.delivery = payload["status"]
+                                if payload["status"] == "failed":
+                                    self._delivery_failure(session, original, payload)
+                                if payload["status"] in {"delivered", "read", "failed"}:
+                                    key = f"attention:{original.event_key}:WhatsApp delivery overdue"
+                                    for warning in session.scalars(select(FlowInbox).where(FlowInbox.event_key == key)):
+                                        warning.resolved = 1
+                    job.status = "DONE"
             except Exception as exc:
                 self._failed_job(job_id, kind, exc)
             return True
+
+    def process_batch(self) -> int:
+        """Prioritize replies, then bounded acknowledgment/offer dispatch."""
+        events = self.process_events()
+        return events if events else self._dispatch_batch(self.send_batch_size)
+
+    def queue_template_reminders(self) -> int:
+        """Queue due reminders; sending remains the existing worker's job."""
+        return queue_daily_reminders(self)
+
+    def _dispatch_batch(self, size: int, job_id: int | None = None,
+                        *, kinds: tuple = ("OFFER", "TEXT"), acknowledgments: bool = False) -> int:
+        # Only this mutex spans network I/O. Calendar/read/reply operations use
+        # the short workflow mutex instead; reset explicitly takes both.
+        with (self.ack_sender_lock if acknowledgments else self.sender_lock):
+            with self.lock, self.sessions.begin() as session:
+                self._recover_processing(session)
+            selected, recipients, count = [], set(), 0
+            cursor = None
+            while len(recipients) < size:
+                with self.lock, self.sessions() as session:
+                    query = select(FlowJob).where(FlowJob.status == "QUEUED",
+                                                  FlowJob.kind.in_(kinds))
+                    if session.get(FlowSetting, PAUSE_KEY):
+                        break
+                    if job_id is not None:
+                        query = query.where(FlowJob.id == job_id)
+                    # Keyset pagination preserves TEXT priority without loading
+                    # the entire queue, including when many parents are cooling.
+                    priority = case((FlowJob.kind == "TEXT", 0), else_=1)
+                    if cursor is not None:
+                        query = query.where((priority > cursor[0]) |
+                                            ((priority == cursor[0]) & (FlowJob.id > cursor[1])))
+                    jobs = list(session.scalars(query.order_by(priority, FlowJob.id).limit(100)))
+                if not jobs:
+                    break
+                for candidate in jobs:
+                    cursor = (0 if candidate.kind == "TEXT" else 1, candidate.id)
+                    with self.lock, self.sessions.begin() as session:
+                        job = session.get(FlowJob, candidate.id)
+                        payload = json.loads(job.payload)
+                        recipient = payload["recipient"]
+                        if recipient in recipients or not self._recipient_ready(session, recipient):
+                            continue
+                        # Validate before consuming a global slot or attempting
+                        # HTTP. Claims/preparation/start marker are committed
+                        # before the workflow lock is released.
+                        if not self._claim_job(session, job.id):
+                            continue
+                        try:
+                            ready = self._prepare_send(session, job, payload)
+                        except Exception as exc:
+                            self._record_send_failure(session, job, exc)
+                            count += 1
+                            continue
+                        if not ready:
+                            count += 1
+                            continue
+                        try:
+                            ticket = None
+                            if self.live:
+                                ticket = self.dispatch_control.reserve(self._business_number(), recipient,
+                                                                       f"{self.worker_id}:{job.id}",
+                                                                       priority=job.kind == "TEXT")
+                                if ticket is None:
+                                    job.status = "QUEUED"
+                                    job.attempts -= 1
+                                    job.locked_by, job.locked_until = None, None
+                                    continue
+                            job.send_started_at = datetime.utcnow()
+                            job.locked_until = datetime.utcnow() + timedelta(minutes=2)
+                            selected.append((job.id, job.kind, payload, ticket))
+                            recipients.add(recipient)
+                            count += 1
+                        except Exception:
+                            # Control storage errors are pre-send failures: hold
+                            # safely for the next cycle, never bypass the limiter.
+                            job.status, job.error = "QUEUED", "Dispatch preparation unavailable; no send attempted"
+                            job.attempts -= 1
+                            job.locked_by, job.locked_until = None, None
+                    if len(recipients) >= size:
+                        break
+            if selected:
+                with ThreadPoolExecutor(max_workers=size) as pool:
+                    pending = {pool.submit(self.send, kind, payload): (ident, kind, payload, ticket)
+                               for ident, kind, payload, ticket in selected}
+                    for future in as_completed(pending):
+                        ident, kind, payload, ticket = pending[future]
+                        error = None
+                        try:
+                            provider_id = future.result()
+                        except Exception as exc:
+                            error = exc
+                        with self.lock:
+                            if error is None:
+                                self._sent(ident, kind, payload, provider_id)
+                            else:
+                                self._failed_job(ident, kind, error)
+                        if ticket is not None:
+                            # A failure writing control telemetry must not turn
+                            # an already-saved accepted message into UNKNOWN.
+                            try:
+                                self.dispatch_control.outcome(self._business_number(), payload["recipient"], ticket, error)
+                            except Exception as exc:
+                                print(f"WhatsApp control update error type={type(exc).__name__}")
+            return count
+
+    def process_one(self, *, job_id: int | None = None) -> bool:
+        """Process one job using the same priorities and shared dispatch controls."""
+        with self.lock, self.sessions() as session:
+            query = select(FlowJob).where(FlowJob.status == "QUEUED",
+                or_(FlowJob.next_attempt_at.is_(None), FlowJob.next_attempt_at <= datetime.utcnow()))
+            if job_id is not None:
+                query = query.where(FlowJob.id == job_id)
+            job = session.scalar(query.order_by(*self._queue_order()).limit(1))
+            if job and job.kind in {"INBOUND", "STATUS"}:
+                event_id = job.id
+            else:
+                event_id = None
+        if event_id is not None:
+            return self._process_event(event_id)
+        return bool(self._dispatch_batch(1, job_id))
 
     def drain(self, limit: int = 100) -> int:
         """Process a bounded batch, useful for the preview UI and deterministic tests."""
@@ -1094,11 +1411,17 @@ class FlowTest:
     def state(self, target: date) -> dict:
         """Return the admin's test state with masked coworker contacts."""
         with self.lock, self.sessions() as session:
+            source = session.get(FlowSetting, "zoho_test_scenario")
+            if source:
+                self.use_source_contacts(json.loads(source.value))
             patients = {p.id: p for p in session.scalars(select(Patient))}
             departments = {d.id: d.name for d in session.scalars(select(Department))}
             therapists = {t.id: t.name for t in session.scalars(select(Therapist))}
+            requirements = {r.id: r for r in session.scalars(select(TreatmentRequirement))}
             appointments = [{
                 "id": a.id, "patient": patients[a.patient_id].patient_code,
+                "requirement_id": a.treatment_requirement_id,
+                "source_plan_id": requirements[a.treatment_requirement_id].source_plan_id,
                 "therapy": departments[a.department_id], "therapist": therapists[a.therapist_id],
                 "date": a.date.isoformat(), "time": slot_label(a.slot_index), "status": a.status.value,
             } for a in session.scalars(select(Appointment).where(Appointment.date == target).order_by(Appointment.slot_index, Appointment.id))]
@@ -1123,16 +1446,21 @@ class FlowTest:
             by_entity = {f"offer:{offer['token']}": offer for offer in offers}
             for audit in session.scalars(select(AuditLog).where(
                 AuditLog.entity.in_(by_entity), AuditLog.action.in_(
-                    f"flow_reply_{action}" for action in ("yes", "no", "visit", "day", "help", "reschedule")
+                    [f"flow_reply_{action}" for action in ("yes", "no", "visit", "day", "help", "reschedule")]
+                    + ["flow_assumed_yes"]
                 ),
             ).order_by(AuditLog.id.desc())):
                 offer = by_entity[audit.entity]
+                if audit.action == "flow_assumed_yes":
+                    offer["assumed_accepted"] = True
+                    continue
                 if "last_reply" not in offer:
                     offer["last_reply"] = audit.action.removeprefix("flow_reply_").upper()
                     offer["replied_at"] = f"{audit.timestamp.isoformat()}Z"
-            requirements = {r.id: r for r in session.scalars(select(TreatmentRequirement))}
             progress = [{
                 "patient": patients[p.patient_id].patient_code,
+                "requirement_id": p.requirement_id,
+                "source_plan_id": requirements[p.requirement_id].source_plan_id,
                 "therapy": departments[requirements[p.requirement_id].department_id],
                 "target": p.required, "completed": p.completed,
                 "booked": p.booked, "remaining": p.remaining,
@@ -1149,8 +1477,13 @@ class FlowTest:
                 "appointments": appointments, "offers": offers, "progress": progress,
                 "jobs": [{"id": j.id, "kind": j.kind, "status": j.status,
                           "offer_token": json.loads(j.payload).get("token"),
-                          "delivery": j.delivery, "attempts": j.attempts, "error": j.error}
+                          "delivery": j.delivery, "attempts": j.attempts, "error": j.error,
+                          "next_attempt_at": f"{j.next_attempt_at.isoformat()}Z" if j.next_attempt_at else None,
+                          "accepted_at": f"{j.accepted_at.isoformat()}Z" if j.accepted_at else None,
+                          "deadline_at": f"{j.deadline_at.isoformat()}Z" if j.deadline_at else None,
+                          "error_code": j.error_code}
                          for j in session.scalars(select(FlowJob).order_by(FlowJob.id.desc()).limit(100))],
+                "sending_paused": bool(session.get(FlowSetting, PAUSE_KEY)),
                 "inbox": [{"id": i.id, "patient": i.patient_code, "reason": i.reason,
                            "text": i.text, "resolved": bool(i.resolved)}
                           for i in session.scalars(select(FlowInbox).order_by(FlowInbox.id.desc()).limit(100))],

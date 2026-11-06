@@ -11,6 +11,31 @@ from scheduling.types import RequirementInput, SchedulingProblem
 
 
 @pytest.fixture
+def workflow_clock(monkeypatch):
+    """Freeze service, retry watchdog and webhook epochs to the same instant."""
+    from datetime import datetime, time, timezone
+    from zoneinfo import ZoneInfo
+
+    def freeze(day, hour=8, minute=0, second=0):
+        instant = datetime.combine(day, time(hour, minute, second), tzinfo=ZoneInfo("Asia/Kolkata"))
+        stamp = instant.timestamp()
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls.fromtimestamp(stamp, tz)
+
+            @classmethod
+            def utcnow(cls):
+                return cls.fromtimestamp(stamp, timezone.utc).replace(tzinfo=None)
+
+        monkeypatch.setattr("flow_test.service.datetime", Clock)
+        monkeypatch.setattr("flow_test.reliability.datetime", Clock)
+        monkeypatch.setattr("time.time", lambda: stamp)
+    return freeze
+
+
+@pytest.fixture
 def legacy_flow_scenario():
     """Keep the original four-child regression cases independent of newer demos."""
     path = Path(__file__).parent / "fixtures" / "flow_scenario_v1.json"

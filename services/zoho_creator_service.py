@@ -7,6 +7,7 @@ written to the database, source tree, audit log, or HTTP responses.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from http.client import HTTPException
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,8 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import ProxyHandler, Request, build_opener
+
+from services.zoho_retry import retry_read
 
 
 DEFAULT_SCOPES = (
@@ -136,7 +139,7 @@ def exchange_authorization_code(
         except json.JSONDecodeError:
             message = detail
         raise ValueError(f"Zoho authorization failed: {message or 'unknown error'}") from exc
-    except URLError as exc:
+    except (URLError, TimeoutError, ConnectionError, HTTPException) as exc:
         raise ValueError("Zoho authorization service could not be reached") from exc
     if not payload.get("access_token"):
         message = payload.get("error") or payload.get("message") or "no access token returned"
@@ -158,9 +161,12 @@ def refresh_access_token(settings: ZohoCreatorSettings) -> dict[str, Any]:
         }).encode("utf-8"),
         method="POST",
     )
-    try:
+    def fetch_token():
         with open_zoho_request(request, timeout=20) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            return json.loads(response.read().decode("utf-8"))
+
+    try:
+        payload = retry_read(fetch_token)
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         try:
@@ -168,7 +174,7 @@ def refresh_access_token(settings: ZohoCreatorSettings) -> dict[str, Any]:
         except json.JSONDecodeError:
             message = detail
         raise ValueError(f"Zoho automatic reconnection failed: {message or 'unknown error'}") from exc
-    except URLError as exc:
+    except (URLError, TimeoutError, ConnectionError, HTTPException) as exc:
         raise ValueError("Zoho authorization service could not be reached") from exc
     if not payload.get("access_token"):
         message = payload.get("error") or payload.get("message") or "no access token returned"
@@ -327,10 +333,12 @@ def get_report_records(
             method="GET",
             headers=headers,
         )
-        try:
+        def fetch_page():
             with open_zoho_request(request, timeout=60) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-                next_cursor = response.headers.get("record_cursor")
+                return json.loads(response.read().decode("utf-8")), response.headers.get("record_cursor")
+
+        try:
+            payload, next_cursor = retry_read(fetch_page)
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             try:
@@ -341,8 +349,10 @@ def get_report_records(
             except json.JSONDecodeError:
                 message = detail
             raise ValueError(f"Zoho rejected the report read: {message}") from exc
-        except URLError as exc:
+        except (URLError, TimeoutError, ConnectionError, HTTPException) as exc:
             raise ValueError("Zoho Creator could not be reached for the report read") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("Zoho returned an invalid report response")
         if criteria and payload.get("code") in (3100, 9280) and not cursor:
             return []
         if payload.get("code") not in (None, 3000):
@@ -350,7 +360,7 @@ def get_report_records(
             if not message:
                 message = f"Creator error code {payload.get('code', 'unknown')}"
             raise ValueError(f"Zoho rejected the report read: {message}")
-        data = payload.get("data") or []
+        data = payload.get("data")
         if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
             raise ValueError("Zoho returned an invalid report response")
         records.extend(data)

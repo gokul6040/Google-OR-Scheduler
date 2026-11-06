@@ -136,7 +136,9 @@ the old completed checkpoint intact. There are no automatic background retries.
 
 Local test reset does not delete Zoho rows. It creates a fresh export namespace
 for later appointments; old remote history requires a separate deliberate cleanup.
-Current single-process/replica ownership remains required.
+Local batch mutations now use shared workflow coordination. Keep current deployed
+replica settings until the rollout and preview-routing requirements in
+`../CONCURRENCY.md` are satisfied. This does not schedule or parallelize exports.
 
 ## Verification
 
@@ -160,3 +162,18 @@ authentication, destination restrictions and test-only credential persistence.
 No live export, application deployment, OAuth consent or Zoho schema edit has been
 performed by the agent. The user must complete the two fields and consent before
 the first live push can be verified.
+
+
+### Recovery after an uncertain response
+
+The exporter now immediately re-reads Scheduler_Report after a rejected, timed-out
+or malformed write response. If exactly one Scheduler_Key matches every expected
+field, it saves that record ID and continues without issuing another write. If
+verification fails, the batch remains open and the last completed push time stays
+unchanged. Rerun the same date to reconcile and resume; do not delete the open batch
+or change its key namespace. An enforced unique Scheduler_Key is required and is
+checked before finalisation. No database migration is needed for this change.
+
+Read-only preflight/report calls and OAuth refresh use four bounded attempts for
+transport failures and temporary HTTP errors, respecting Retry-After. Writes are
+never retried blindly. See `ZOHO_RECOVERY.md` for verification and limits.

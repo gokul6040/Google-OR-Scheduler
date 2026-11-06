@@ -158,7 +158,7 @@ def test_new_plan_row_uses_latest_update_without_creating_another_patient(flow, 
 
 
 @pytest.mark.parametrize("reverse", [False, True])
-def test_edit_to_older_row_wins_over_newer_created_plan(reports, reverse):
+def test_edit_to_older_course_does_not_replace_newer_created_plan(reports, reverse):
     edited = reports["Plan_Report"][0]
     edited.update(Modified_Time="22-Oct-2026 11:30:00", PatientName="Latest Name",
                   Parent_No="918888888888")
@@ -168,11 +168,12 @@ def test_edit_to_older_row_wins_over_newer_created_plan(reports, reverse):
                          Parent_No="919999999999", Schedule="IEP Session, 1, 3, TEST CONSULTANT I")
     reports["Plan_Report"] = [edited, newer_created][::(-1 if reverse else 1)]
     patient = convert_reports(reports, START)["patients"][0]
-    assert patient["name"] == "Latest Name" and patient["phone"] == "918888888888"
-    assert [r["therapy"] for r in patient["requirements"]] == ["Psychology Therapy Session"]
+    assert patient["name"] == "Older Name" and patient["phone"] == "919999999999"
+    assert [r["therapy"] for r in patient["requirements"]] == ["IEP Session"]
+    assert patient["source_plan_id"] == "900003"
 
 
-def test_modified_time_tie_uses_added_time_and_latest_schedule_is_complete(reports):
+def test_newest_course_uses_complete_schedule_when_modified_times_tie(reports):
     old = reports["Plan_Report"][0]
     old["Modified_Time"] = "22-Oct-2026 11:30:00"
     newer = deepcopy(old)
@@ -208,7 +209,7 @@ def test_tied_obsolete_plans_do_not_block_distinct_latest_plan(reports):
 
 
 @pytest.mark.parametrize("new_source_row", [False, True])
-def test_latest_plan_adds_y_and_preserves_completed_x(flow, reports, new_source_row):
+def test_plan_edit_keeps_progress_but_distinct_course_keeps_separate_history(flow, reports, new_source_row):
     initial(flow, reports)
     target = date(2026, 10, 23)
     flow.generate(target)
@@ -236,10 +237,10 @@ def test_latest_plan_adds_y_and_preserves_completed_x(flow, reports, new_source_
         assert appointment.patient_id == patient_id
         assert appointment.treatment_requirement_id == requirement_id
         assert appointment.status.value == "COMPLETED"
-        assert session.get(TreatmentRequirement, requirement_id).active
+        assert session.get(TreatmentRequirement, requirement_id).active is (not new_source_row)
     progress = {item["therapy"]: item for item in flow.state(target)["progress"] if item["patient"] == "TEST-B"}
-    assert progress["Psychology Therapy Session"]["completed"] == 1
-    assert progress["Psychology Therapy Session"]["remaining"] == 1
+    assert progress["Psychology Therapy Session"]["completed"] == (0 if new_source_row else 1)
+    assert progress["Psychology Therapy Session"]["remaining"] == (2 if new_source_row else 1)
     assert progress["IEP Session"]["completed"] == 0
     assert progress["IEP Session"]["remaining"] == 2
 
@@ -441,3 +442,36 @@ def test_utc_cache_migration_retains_missing_rows_dates_and_bookings(flow, repor
         assert json.loads(session.get(FlowSetting, TIMEZONE_KEY).value) == SOURCE_TIMEZONES
     assert not json.loads(request("/test/api/zoho/status")[1])["reconciliationRequired"]
     assert not apply_reports(flow, delta(), window={"from": SECOND, "to": THIRD})["changed"]
+
+
+@pytest.mark.parametrize("field,value,reason", [
+    ("Schedule", "Psychology Therapy Session, 1, 3, Missing Doctor", "consultant match"),
+    ("Parent_No", "bad-phone", "international parent phone"),
+    ("Added_Time", "invalid-time", "Added_Time/Modified_Time"),
+    ("ID", "", "source record ID"),
+])
+def test_invalid_source_record_is_durably_flagged_without_partial_import(flow, reports, field, value, reason):
+    from flow_test.models import FlowInbox
+
+    initial(flow, reports)
+    flow.generate(START)
+    before = flow.state(START)["appointments"]
+    with flow.sessions() as session:
+        cached = session.get(FlowSetting, "zoho_test_source").value
+    incoming = new_records(reports)
+    incoming["Plan_Report"][0][field] = value
+    for _ in range(2):
+        with pytest.raises(ValueError, match=reason):
+            apply_reports(flow, incoming, START, window={"from": FIRST, "to": SECOND})
+    assert checkpoint(flow) == FIRST
+    assert flow.state(START)["appointments"] == before
+    with flow.sessions() as session:
+        issues = list(session.scalars(select(FlowInbox).where(FlowInbox.event_key.like("zoho-invalid:%"))))
+        assert len(issues) == 1 and issues[0].resolved == 0
+        assert "Plan_Report" in issues[0].text and reason in issues[0].text
+        assert "rerun the import" in issues[0].text
+        assert session.get(FlowSetting, "zoho_test_source").value == cached
+        assert session.scalar(select(func.count(Patient.id))) == 8
+    # Correcting Zoho and replaying the original window imports the record.
+    apply_reports(flow, new_records(reports), START, window={"from": FIRST, "to": SECOND})
+    assert checkpoint(flow) == SECOND

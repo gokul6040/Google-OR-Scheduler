@@ -6,7 +6,9 @@ import json
 from uuid import uuid4
 
 from flow_test.models import FlowSetting
-from flow_test.zoho_import import CHECKPOINT_KEY, SOURCE_TIMEZONES, TIMEZONE_KEY, apply_reports, put_setting
+from flow_test.zoho_import import (
+    CHECKPOINT_KEY, SOURCE_TIMEZONES, apply_reports, put_setting, reconciliation_required,
+)
 
 
 def daily_draft(instance, target: date) -> dict:
@@ -24,7 +26,8 @@ def daily_draft(instance, target: date) -> dict:
                     "planningMode": "day", "planningDays": 1,
                     "newSessions": sum(item not in pinned for item in result.appointments),
                     "scheduledOnSelectedDay": len(result.appointments),
-                    "autoOfferOnSave": offer_on_save, "liveMessaging": instance.flow.live})
+                    "autoOfferOnSave": offer_on_save, "liveMessaging": getattr(instance.flow, "messaging_enabled", instance.flow.live),
+                    "messagingPaused": instance.flow.live and not getattr(instance.flow, "messaging_enabled", instance.flow.live)})
     return payload
 
 
@@ -36,15 +39,12 @@ def dispatch_zoho(request, instance, path: str) -> None:
         with flow.sessions() as session:
             item = session.get(FlowSetting, "zoho_test_sync")
             checkpoint = session.get(FlowSetting, CHECKPOINT_KEY)
-            source_zone = session.get(FlowSetting, TIMEZONE_KEY)
-            source_cache = session.get(FlowSetting, "zoho_test_source")
-            request.send_json({"source": "nidhin.kumar_turnb/test-gokul",
+            request.send_json({"source": getattr(flow, "source_name", "nidhin.kumar_turnb/test-gokul"),
                                "sync": json.loads(item.value) if item else None,
                                "checkpoint": json.loads(checkpoint.value) if checkpoint else None,
                                "planStartSource": "Added_Time",
                                "sourceTimezones": SOURCE_TIMEZONES,
-                               "reconciliationRequired": (checkpoint is not None or source_cache is not None) and (
-                                   source_zone is None or json.loads(source_zone.value) != SOURCE_TIMEZONES)})
+                               "reconciliationRequired": reconciliation_required(session)})
         return
     if path == "/api/zoho/draft":
         with flow.sessions() as session:

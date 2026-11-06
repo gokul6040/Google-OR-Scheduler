@@ -12,6 +12,12 @@ python -m pytest -q
 python app.py
 ```
 
+Live WhatsApp sending now runs separately from the website. Provision the shared
+dispatch controls and start `python -m services.whatsapp_worker --workspace main`
+with the selected live workflow configuration. See [WHATSAPP_WORKER.md](WHATSAPP_WORKER.md)
+for setup, container services and safe rollout; starting the web app alone queues
+messages without starting the live sender.
+
 Open `http://127.0.0.1:8765` and use **Schedule generator**. By default, the app uses the local
 `eic_scheduler_sanitized.db`. The workbook is first copied into the visible `plan_detail`,
 `therapist_master`, and `specialty_master` source tables. The scheduler builds its planning data
@@ -24,7 +30,16 @@ before the manager can persist new `PROPOSED` appointments.
 
 ## Prototype boundaries
 
-Operations uses tabs with **Scheduling assistant** selected first. In `/test`,
+The main app contains the complete daily Zoho/WhatsApp workflow at its normal `/`
+page. Run `python app.py --test-data` to use the existing test database and Azure
+test WhatsApp sender, preserving records without migration or seeding. Use
+`--pause-messaging` to hold new outgoing offers.
+See [main_workflow/README.md](main_workflow/README.md) for launch, source sync and
+export commands, and [MAIN_APP_HANDOVER_2026-10-26.md](MAIN_APP_HANDOVER_2026-10-26.md)
+for verification and remaining rollout work. The established OR rules are unchanged.
+
+Operations uses tabs with **Scheduling assistant** selected first. In the full
+main workflow/test-data mode and `/test`,
 **WhatsApp & attendance**, **Record an absence**, and **Needs rescheduling** each
 have their own tab. Recent absences is alongside the absence form. Switching
 tabs preserves entered form values; arrow keys, Home and End navigate the tabs.
@@ -108,6 +123,12 @@ overwrites an existing schedule database.
 
 ## Docker
 
+For the existing Azure main app, use [DEPLOY_MAIN.md](DEPLOY_MAIN.md). The image
+contains runtime code/assets only. The deployment script runs the main `/` UI
+against the existing test database (`flow_test`), preserving its messaging mode.
+Local workbooks, credentials, databases, test suites and diagnostic output are
+excluded from its build context.
+
 Build the image from the repository root. Secrets are deliberately excluded from
 the image, so pass the ignored local `.env` file only when running the container.
 
@@ -117,8 +138,8 @@ docker run --rm -p 8765:8765 --env-file .env therapy-scheduler:latest
 ```
 
 This uses `THERAPY_SCHEDULER_DATABASE_URL` from `.env`, which is suitable for
-the configured Azure PostgreSQL database. To use a persistent local SQLite
-database instead, override that variable and mount a Docker-managed volume:
+the configured Azure PostgreSQL database. To use an already initialized local
+SQLite database instead, place it in a Docker-managed volume and mount that volume:
 
 ```powershell
 docker run --rm -p 8765:8765 --env-file .env `
@@ -126,8 +147,8 @@ docker run --rm -p 8765:8765 --env-file .env `
   -v therapy_scheduler_data:/app/data therapy-scheduler:latest
 ```
 
-Open `http://127.0.0.1:8765`. The container listens on all interfaces internally;
-the published port remains local to the Docker host unless you change the command.
+Open `http://127.0.0.1:8765`. The container listens on all interfaces internally.
+For a local-only preview, publish with `-p 127.0.0.1:8765:8765`.
 
 ## WhatsApp webhook and template test
 
@@ -259,7 +280,7 @@ time. The scheduling service deduplicates events and rejects conflicting or stal
 replies before changing appointments. It records absences and audit events, preserves
 continuous visits, and counts completed and reserved therapy separately against each
 weekly target. It adds appointments only in the selected day's released openings;
-the existing browser generator's rolling mode is unchanged. The core service is
+the browser generator offers a draft for tomorrow only. The core service is
 `services/parent_response_service.py`; callers stage replies with
 `record_parent_response`, commit the input batch, then call `process_daily_responses`.
 

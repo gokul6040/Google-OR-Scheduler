@@ -39,43 +39,6 @@ REASON_PRIORITY = (
     "SOLVER_SEARCH_LIMIT",
 )
 
-# A full week has 60 possible single-session starts.  Keeping every one for
-# every visit creates an impractically large model at production scale.  Two
-# rotated starts per valid day retain weekday choice and spread patients across
-# all daily slots, while keeping the CP-SAT model tractable.
-MAX_CANDIDATE_STARTS_PER_DAY = 2
-
-
-def _diverse_daily_candidates(
-    problem: SchedulingProblem,
-    bundle: TherapyBundle,
-    candidates: list[tuple[int, int, tuple[int, ...]]],
-) -> list[tuple[int, int, tuple[int, ...]]]:
-    """Retain a small candidate set while preserving preferred time bands."""
-    by_day: dict[int, dict[int, list[tuple[int, int, tuple[int, ...]]]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
-    for day, start_slot, therapist_ids in candidates:
-        by_day[day][start_slot].append((day, start_slot, therapist_ids))
-
-    selected = []
-    seed = bundle.patient_id + bundle.occurrence_index * 7 + bundle.items[0].requirement_id
-    for day, by_start_slot in sorted(by_day.items()):
-        starts = sorted(by_start_slot)
-        rotation = (seed + day * 3) % len(starts)
-        ordered_starts = starts[rotation:] + starts[:rotation]
-        weekday = (problem.week_start + timedelta(days=day)).weekday()
-        ordered_starts.sort(
-            key=lambda start_slot: -sum(
-                problem.patient_preferences.get((bundle.patient_id, weekday, start_slot + offset), 0)
-                for offset in range(len(bundle.items))
-            )
-        )
-        for start_slot in ordered_starts[:MAX_CANDIDATE_STARTS_PER_DAY]:
-            selected.extend(by_start_slot[start_slot])
-    return selected
-
-
 def _candidate_placements(problem, bundles):
     candidates = defaultdict(list)
     rejected = defaultdict(Counter)
@@ -114,10 +77,6 @@ def _candidate_placements(problem, bundles):
                     continue
                 preferred = tuple(options[0] for options in therapist_options)
                 candidates[bundle.id].append((day, start_slot, preferred))
-        # A bounded daily/replacement run already limits the search space.
-        # Retain all valid starts so ID rotation cannot hide available slots.
-        if problem.new_booking_slots is None:
-            candidates[bundle.id] = _diverse_daily_candidates(problem, bundle, candidates[bundle.id])
     return candidates, rejected
 
 

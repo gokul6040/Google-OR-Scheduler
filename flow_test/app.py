@@ -7,6 +7,7 @@ import shutil
 import threading
 import webbrowser
 
+from services.whatsapp_worker import embedded_worker_enabled
 from config import load_local_env_file
 from flow_test.service import FlowTest, ROOT, load_recipient_names, load_recipients
 from flow_test.web_app import WEBHOOK_PATH, create_server
@@ -63,7 +64,8 @@ def main() -> None:
                 print("Test worker paused one cycle after a database error")
 
     thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
+    if not args.live or embedded_worker_enabled():
+        thread.start()
     url = f"http://127.0.0.1:{server.server_port}/#token={token}"
     print(f"Mode: {'LIVE coworker messages' if args.live else 'PREVIEW (no network sends)'}")
     print(f"Admin URL (private): {url}")
@@ -78,7 +80,8 @@ def main() -> None:
     finally:
         stop.set()
         server.server_close()
-        thread.join(timeout=25)
+        if thread.ident is not None:
+            thread.join(timeout=25)
         flow.engine.dispose()
 
 

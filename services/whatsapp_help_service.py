@@ -91,7 +91,7 @@ def queue_help_replies(
 
 
 def deliver_next_help_reply(
-    session_factory: Callable[[], Session], now: datetime | None = None
+    session_factory: Callable[[], Session], now: datetime | None = None, *, control=None
 ) -> str | None:
     """Claim one pending reply atomically; never resend an ambiguous send attempt."""
     now = now or datetime.now(timezone.utc).replace(tzinfo=None)
@@ -102,24 +102,39 @@ def deliver_next_help_reply(
         if reply is None:
             return None
         event_key, recipient = reply.event_key, reply.recipient
+        expired = reply.received_at <= now - SERVICE_WINDOW
+        ticket, settings = None, None
+        if control is not None and not expired:
+            settings = sender_settings_from_environment()
+            ticket = control.reserve(settings.phone_number_id, recipient or "", event_key, priority=True)
+            if ticket is None:
+                return None
         claimed = session.execute(update(WhatsAppHelpReply).where(
             WhatsAppHelpReply.event_key == event_key,
             WhatsAppHelpReply.state == "pending",
         ).values(state="sending"))
         if claimed.rowcount != 1:
             session.rollback()
+            if ticket:
+                control.outcome(settings.phone_number_id, recipient or "", ticket, None)
             return None
         session.commit()
-        expired = reply.received_at <= now - SERVICE_WINDOW
 
     state = "expired" if expired else "accepted"
     if not expired:
+        error = None
         try:
-            send_text_message(sender_settings_from_environment(), recipient or "", HELP_REPLY_TEXT)
-        except (WhatsAppConfigurationError, WhatsAppDeliveryError, TimeoutError, OSError):
+            send_text_message(settings or sender_settings_from_environment(), recipient or "", HELP_REPLY_TEXT)
+        except (WhatsAppConfigurationError, WhatsAppDeliveryError, TimeoutError, OSError) as exc:
             # A network timeout may have occurred after Meta accepted the request.
             # Keep the event claimed instead of risking a duplicate reply.
             state = "unconfirmed"
+            error = exc
+        if ticket:
+            try:
+                control.outcome(settings.phone_number_id, recipient or "", ticket, error)
+            except Exception as exc:
+                print(f"WhatsApp Help control error type={type(exc).__name__}")
     with session_factory() as session:
         session.execute(update(WhatsAppHelpReply).where(
             WhatsAppHelpReply.event_key == event_key

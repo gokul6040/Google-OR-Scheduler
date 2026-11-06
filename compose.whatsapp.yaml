@@ -1,0 +1,24 @@
+# Configure .env for the chosen EXISTING workflow store and live messaging first.
+# Provision shared controls before starting either service; see WHATSAPP_WORKER.md.
+services:
+  web:
+    build: .
+    image: therapy-scheduler:local
+    env_file: .env
+    environment:
+      WHATSAPP_WORKER_MODE: external
+    ports:
+      - "127.0.0.1:8765:8765"
+    restart: unless-stopped
+    stop_grace_period: 60s
+  whatsapp-worker:
+    build: .
+    image: therapy-scheduler:local
+    env_file: .env
+    environment:
+      WHATSAPP_WORKER_MODE: external
+    command: ["python", "-m", "services.whatsapp_worker", "--workspace", "main"]
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+    stop_grace_period: 60s

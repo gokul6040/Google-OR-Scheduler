@@ -8,10 +8,14 @@ from sqlalchemy import select
 from database.models import Appointment, AppointmentStatus, AuditLog
 from scheduling.schedule_validator import validate_schedule
 from scheduling.types import ScheduledAppointment
+from services.patient_status_service import lock_patient
 
 
 def move_appointment(session, problem, existing, appointment: Appointment, new_date, new_slot):
     """Move one appointment or its entire consecutive bundle as a manual change."""
+    patient = lock_patient(session, appointment.patient_id)
+    if patient is None or not patient.active:
+        return False, ["Reactivate the patient before moving an appointment to a new slot."]
     group = [appointment]
     if appointment.bundle_id:
         group = list(session.scalars(select(Appointment).where(

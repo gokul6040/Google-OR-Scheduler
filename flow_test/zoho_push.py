@@ -3,6 +3,7 @@
 import argparse
 from dataclasses import replace
 from datetime import date
+from http.client import HTTPException
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ from flow_test.zoho_import import APP, OWNER
 from services.zoho_creator_service import (
     ZohoCreatorSettings, get_report_records, open_zoho_request, refresh_access_token, settings_from_environment,
 )
+from services.zoho_retry import retry_read
 
 
 FORM = "Scheduler"
@@ -46,15 +48,16 @@ def verify_target(settings: ZohoCreatorSettings) -> None:
         raise ValueError("Schedule exports are restricted to the authorized test-gokul Scheduler form")
 
 
-def write_record(settings: ZohoCreatorSettings, access_token: str, fields: dict, record_id: str | None) -> str:
+def write_record(settings: ZohoCreatorSettings, access_token: str, fields: dict, record_id: str | None,
+                 *, verify: Callable = verify_target, key_prefix: str = "test-") -> str:
     """POST a new unique key or PATCH the same owned row; never disable workflows."""
-    verify_target(settings)
-    if set(fields) != REQUIRED_FIELDS or not fields["Scheduler_Key"].startswith("test-"):
+    verify(settings)
+    if set(fields) != REQUIRED_FIELDS or not fields["Scheduler_Key"].startswith(key_prefix):
         raise ValueError("Unexpected Scheduler payload")
     if record_id is not None and not record_id.isdigit():
         raise ValueError("Invalid Scheduler record ID")
-    suffix = f"report/{REPORT}/{record_id}" if record_id else f"form/{FORM}"
-    request = Request(f"{settings.api_url}/creator/v2.1/data/{OWNER}/{APP}/{suffix}",
+    suffix = f"report/{settings.report_link_name}/{record_id}" if record_id else f"form/{settings.form_link_name}"
+    request = Request(f"{settings.api_url}/creator/v2.1/data/{settings.account_owner}/{settings.app_link_name}/{suffix}",
                       data=json.dumps({"data": fields}).encode(), method="PATCH" if record_id else "POST",
                       headers={"Authorization": f"Zoho-oauthtoken {access_token}", "Content-Type": "application/json"})
     try:
@@ -66,28 +69,35 @@ def write_record(settings: ZohoCreatorSettings, access_token: str, fields: dict,
         except (ValueError, AttributeError):
             code = exc.code
         raise ValueError(f"Scheduler write rejected (code {code}); batch retained for review/retry") from None
-    except (URLError, TimeoutError, OSError):
+    except (URLError, TimeoutError, OSError, ValueError, HTTPException):
         raise ValueError("Scheduler write outcome is uncertain; batch retained. Rerun to reconcile by Scheduler Key") from None
+    if not isinstance(payload, dict):
+        raise ValueError("Scheduler returned an invalid response; batch retained for reconciliation")
     result = payload.get("result", payload)
     if isinstance(result, list):
         result = result[0] if len(result) == 1 else {}
-    identifier = (result.get("data") or {}).get("ID")
+    if not isinstance(result, dict) or not isinstance(result.get("data"), dict):
+        raise ValueError("Scheduler did not confirm the record; batch retained for reconciliation")
+    identifier = result["data"].get("ID")
     if payload.get("code") != 3000 or result.get("code", 3000) != 3000 or not str(identifier or "").isdigit():
         raise ValueError("Scheduler did not confirm the record; batch retained for reconciliation")
     return str(identifier)
 
 
-def validate_schema(settings: ZohoCreatorSettings, access_token: str) -> None:
+def validate_schema(settings: ZohoCreatorSettings, access_token: str, *, verify: Callable = verify_target) -> None:
     """Verify the real field names and uniqueness even when the report is empty."""
-    verify_target(settings)
-    request = Request(f"{settings.api_url}/creator/v2.1/meta/{OWNER}/{APP}/form/{FORM}/fields",
+    verify(settings)
+    request = Request(f"{settings.api_url}/creator/v2.1/meta/{settings.account_owner}/{settings.app_link_name}/form/{settings.form_link_name}/fields",
                       headers={"Authorization": f"Zoho-oauthtoken {access_token}"})
-    try:
+    def fetch_fields():
         with open_zoho_request(request, timeout=30) as response:
-            payload = json.load(response)
+            return json.load(response)
+
+    try:
+        payload = retry_read(fetch_fields)
     except HTTPError:
         raise ValueError("Cannot read Scheduler field definitions. Run python -m flow_test.zoho_authorize once") from None
-    except (URLError, OSError):
+    except (URLError, OSError, HTTPException):
         raise ValueError("Scheduler field definitions could not be reached; no finalisation or push was attempted") from None
     fields = {field["link_name"]: field for field in payload.get("fields", []) if "link_name" in field}
     if payload.get("code") != 3000 or REQUIRED_FIELDS - fields.keys():
@@ -100,14 +110,15 @@ def validate_schema(settings: ZohoCreatorSettings, access_token: str) -> None:
 
 
 def run_push(settings: ZohoCreatorSettings, access_token: str, base_url: str, admin_token: str, target: date, *, apply: bool,
-             exchange: Callable[[str, dict], dict] | None = None) -> dict:
+             exchange: Callable[[str, dict], dict] | None = None,
+             verify: Callable = verify_target, key_prefix: str = "test-") -> dict:
     """Share the export protocol between the CLI and the calendar's local adapter."""
     if exchange is None:
         exchange = lambda operation, body: test_api(base_url, admin_token, f"export/{operation}", body)
-    verify_target(settings)
-    validate_schema(settings, access_token)
+    verify(settings)
+    validate_schema(settings, access_token, verify=verify)
     try:
-        existing = get_report_records(settings, access_token, REPORT, criteria="ID != 0")
+        existing = get_report_records(settings, access_token, settings.report_link_name, criteria="ID != 0")
     except (ValueError, OSError):
         raise ValueError("Could not read Scheduler_Report. Check Zoho access and retry; no new batch was prepared.") from None
     preview = exchange("preview", {"date": target.isoformat()})
@@ -133,11 +144,29 @@ def run_push(settings: ZohoCreatorSettings, access_token: str, base_url: str, ad
             record_id = str(found["ID"])
             recovered += 1
         else:
-            record_id = write_record(settings, access_token, fields, str(found["ID"]) if found else None)
-            if found:
-                updated += 1
+            try:
+                record_id = write_record(settings, access_token, fields, str(found["ID"]) if found else None,
+                                         verify=verify, key_prefix=key_prefix)
+            except (ValueError, OSError):
+                # A timeout, gateway error or duplicate-key rejection can follow a
+                # committed write. Re-read before considering another write. If
+                # the outcome remains uncertain, retain the batch and stop.
+                matches = [row for row in get_report_records(
+                    settings, access_token, settings.report_link_name, criteria="ID != 0")
+                    if row.get("Scheduler_Key") == fields["Scheduler_Key"]]
+                if len(matches) != 1 or not all(
+                        str(matches[0].get(k, "")) == str(v) for k, v in fields.items()):
+                    raise ValueError("Scheduler write could not be reconciled; batch retained. "
+                                     "Retry to check the same Scheduler Key before writing again") from None
+                record_id = str(matches[0].get("ID", ""))
+                if not record_id.isdigit():
+                    raise ValueError("Scheduler reconciliation returned an invalid record ID; batch retained")
+                recovered += 1
             else:
-                created += 1
+                if found:
+                    updated += 1
+                else:
+                    created += 1
         exchange("ack", {
             "batchId": batch["id"], "appointmentId": appointment_id,
             "fingerprint": change["fingerprint"], "recordId": record_id,
@@ -147,7 +176,8 @@ def run_push(settings: ZohoCreatorSettings, access_token: str, base_url: str, ad
                "assumedAcceptedVisits": batch["assumedAcceptedVisits"], "mode": "APPLIED"}
     if batch.get("resumed"):
         # Finish the frozen attempt, then catch changes received since its cutoff.
-        current = run_push(settings, access_token, base_url, admin_token, target, apply=True, exchange=exchange)
+        current = run_push(settings, access_token, base_url, admin_token, target, apply=True, exchange=exchange,
+                           verify=verify, key_prefix=key_prefix)
         for field in ("created", "updated", "reconciled", "assumedAcceptedVisits", "pushed"):
             current[field] += summary[field]
         current["resumedBatch"] = batch["id"]

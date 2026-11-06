@@ -1,5 +1,11 @@
 # EIC branches: isolated daily WhatsApp flow test
 
+The main application now contains these features directly at `/`. Run
+`python app.py --test-data` to use the existing test database without reset or
+seeding, with its existing Azure sender enabled. See [../main_workflow/README.md](../main_workflow/README.md)
+for the main-app launch and source/export commands. This document retains the
+standalone test workspace's instructions.
+
 This is a coworker test using fictional children, not a clinical deployment.
 The test reuses the real OR-Tools scheduler, independent validation and parent
 response repair. The optional read-only Zoho importer is pinned to the authorized
@@ -50,8 +56,9 @@ the cached source by Creator ID, then the complete current dataset is converted.
 The checkpoint commits in the SAME transaction as source and scheduler updates.
 Failures preserve it; concurrent stale runs are rejected and can retry.
 
-On 23 October the user confirmed only Added Time had changed to IST; Modified
-Time remains UTC. The earlier implementation interpreted both as UTC. Deploy the
+An earlier 23 October snapshot treated Added Time as IST and Modified Time as UTC.
+The user subsequently confirmed **both are IST**; the current code supersedes that
+mixed interpretation. Deploy the
 app first, then reread both reports once to migrate the saved source contract
 and recover changes without resetting data:
 
@@ -66,6 +73,13 @@ converted from their previous zones before merging; this preserves their origina
 instants and India treatment dates. It never deletes missing rows. A pre-fix
 checkpoint/cache requires this one-time reconciliation before incremental runs.
 Old job clients without the per-field contract are rejected before any import/checkpoint update.
+Pending source reconciliation also blocks new offers and export finalisation.
+Existing unsent queue jobs enter WAITING_FOR_SYNC without a provider call; a
+successful reconciliation updates their contact binding and resumes them once,
+or waits for the new number's contact window. Failed imports leave them paused.
+Sent and uncertain offers retain their original recipient and are never resent.
+Provider-confirmed delivery failures create one staff warning with safe numeric
+Meta codes; they do not cancel, confirm or automatically resend an appointment.
 After reconciliation, rerun `deploy_zoho_job.ps1` to update the existing job to
 the fixed app image and verify a manual execution. Leave the trigger Manual until requested.
 
@@ -209,7 +223,8 @@ admin key, `FLOW_TEST_LIVE=true`, the existing restricted PostgreSQL test settin
 and valid parent numbers in the Zoho test source (or optional seeded-fixture contacts).
 Deploy these code changes to the existing
 container app to make `/test` available at its public URL; no new app is required.
-Keep a single running replica while using this single-process test worker.
+Keep the deployed replica setting until all writers run the shared coordination
+protocol and staging checks pass; see `../CONCURRENCY.md`.
 
 In mounted live mode the existing, signature-verified `/webhooks/whatsapp` routes
 events for imported parent numbers/existing offer recipients and business phone ID to test storage.
@@ -514,8 +529,11 @@ review under the unchanged shared response-service validation.
   messages, run `python -m flow_test.app --live --init-db`.
 - Without an explicit test schema, PostgreSQL still requires an empty dedicated
   database ending in `_flow_test`. Unmarked populated namespaces are refused.
-- Use **one server process** per test database/schema.
-  Restart recovery assumes this single-process ownership.
+- Workers now coordinate through shared PostgreSQL advisory locks (SQLite previews
+  use local OS file locks). Dispatch remains serialized across worker processes;
+  recovery cannot claim another worker's active send. See `../CONCURRENCY.md`.
+  Keep the current replica setting until every writer runs the new protocol and
+  the staging deployment and preview-routing checks pass.
 - Publishing and saving its outgoing jobs is atomic. Response processing and its
   follow-up jobs are atomic too. Callback IDs are deduplicated across restarts.
 - Offer reply deadline defaults to 600 minutes / 10 hours **after sending**; change
@@ -523,9 +541,11 @@ review under the unchanged shared response-service validation.
   an admin task appears. A late YES is rejected. **Admin release** explicitly
   releases the booking; run the daily generator to fill it afterward. This test
   setting is not an approved production no-response/cancellation policy.
-- Outgoing sends that fail or are interrupted become `UNKNOWN`; they are never
-  blindly retried, because Meta may have accepted them. Review delivery externally,
-  then explicitly release/re-offer if appropriate. This test has no manual retry UI.
+- Uncertain outgoing sends become `UNKNOWN` and are never blindly retried.
+  Explicit temporary Meta rejections receive bounded durable retries; configuration
+  failures pause outbound sending for staff correction. Operations shows due times
+  and a configuration-resume action. See `../WHATSAPP_RELIABILITY.md` for migration,
+  deadlines, stuck-job recovery, delivery alerts and safe rollout.
 - Live workers send up to five different numbers concurrently. Set
   `FLOW_TEST_SEND_BATCH_SIZE` between 1 and 20 to change the batch size. Messages
   sharing one phone remain ordered and are paced six seconds apart. All A–H

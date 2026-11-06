@@ -49,14 +49,8 @@ def test_save_rejects_changed_inputs_without_partial_offers(flow, change):
     assert not state["offers"] and not state["jobs"]
 
 
-def test_one_closed_window_does_not_block_other_parents(flow, monkeypatch):
-    class AppointmentDayClock(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return cls(2026, 10, 22, 12, tzinfo=tz)
-
-    # Keep the live past-date guard meaningful after the fixture date passes.
-    monkeypatch.setattr("flow_test.service.datetime", AppointmentDayClock)
+def test_one_closed_window_does_not_block_other_parents(flow, monkeypatch, workflow_clock):
+    workflow_clock(DAY)
     calls = []
     flow.live = True
     flow.recipients = {code: f"91999999999{i}" for i, code in enumerate(("TEST-A", "TEST-B", "TEST-C"))}

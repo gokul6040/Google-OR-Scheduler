@@ -1,0 +1,5 @@
+simulation: whatsapp-reliability
+routing: path
+mocks:
+  - routeKey: whatsapp
+    path: ../mocks/whatsapp-reliability/config.yaml

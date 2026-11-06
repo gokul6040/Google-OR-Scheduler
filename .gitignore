@@ -10,6 +10,7 @@ credentials.json
 *.key
 *.p12
 *.pfx
+*.token
 
 # Python environments, build, and test artifacts
 .venv/
@@ -35,6 +36,8 @@ dist/
 
 # Application-generated data and exports (may contain sensitive information)
 outputs/
+.playwright-cli/
+output/
 *.db
 *.db-*
 *.sqlite
@@ -58,7 +61,8 @@ outputs/
 *.tmp
 *.temp
 
-# Local reference document; maintain project documentation in Markdown
+# Local documentation
+*.md
 /Therapy_Scheduler_OR_Tools_Management_Overview.docx
 
 # Editor and operating-system files
@@ -76,6 +80,7 @@ Desktop.ini
 .codex_tmp/
 .codex/
 .agents/
+/skills-lock.json
 .impeccable/
 .deepeval/
 .pytest-codex-run/
@@ -89,3 +94,18 @@ flow_test/data/
 /zoho_records.json
 /examples/zoho_records.json
 /examples/records.json
+
+# Other common local SQLite companions and credential stores
+*.sqlite-*
+*.workflow.lock
+*.inbound.lock
+*.sender.lock
+*.ack_sender.lock
+*.control.lock
+.azure/
+.aws/
+.docker/
+node_modules/
+*.zip
+*.tar
+*.gz

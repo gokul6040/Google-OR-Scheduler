@@ -115,6 +115,35 @@ def test_expired_pending_reply_does_not_send(session_factory, monkeypatch):
     assert help_service.deliver_next_help_reply(session_factory, NOW + timedelta(days=2)) == "expired"
 
 
+def test_standalone_help_worker_obeys_shared_dispatch_limit(session_factory, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from services.whatsapp_dispatch import DispatchControl
+
+    monkeypatch.setenv("WHATSAPP_DISPATCH_DATABASE_URL", f"sqlite:///{tmp_path / 'controls.sqlite'}")
+    monkeypatch.setenv("WHATSAPP_SENDS_PER_SECOND", "1")
+    with session_factory() as session:
+        engine = session.get_bind()
+        help_service.queue_help_replies(session, help_event(), "1265029893366600", NOW)
+    control = DispatchControl(engine)
+    clock, calls = [100.0], []
+    monkeypatch.setattr("services.whatsapp_dispatch.time.time", lambda: clock[0])
+    monkeypatch.setattr(help_service, "sender_settings_from_environment",
+                        lambda: SimpleNamespace(phone_number_id="1265029893366600"))
+    monkeypatch.setattr(help_service, "send_text_message", lambda *args: calls.append(args))
+    try:
+        assert control.reserve("1265029893366600", "another-parent", "other-job")
+        assert help_service.deliver_next_help_reply(session_factory, NOW, control=control) is None
+        with session_factory() as session:
+            assert session.scalar(select(WhatsAppHelpReply)).state == "pending"
+        assert not calls
+        clock[0] += 1.1
+        assert help_service.deliver_next_help_reply(session_factory, NOW, control=control) == "accepted"
+        assert help_service.deliver_next_help_reply(session_factory, NOW, control=control) is None
+        assert len(calls) == 1
+    finally:
+        control.engine.dispose()
+
+
 def test_ambiguous_send_failure_is_not_retried(session_factory, monkeypatch):
     attempts = []
     monkeypatch.setattr(help_service, "sender_settings_from_environment", lambda: "settings")

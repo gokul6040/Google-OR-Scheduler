@@ -1,5 +1,45 @@
 # Thanal EIC scheduling and WhatsApp test — continuation handover
 
+## Update — 27 October 2026
+
+The user enabled real test WhatsApp messaging by default. The local
+`python app.py --test-data` now queues live offers for the existing Azure test
+worker; the local process does not start another sender. Source imports pass
+through the remote worker to keep its contacts current. Use `--pause-messaging`
+to hold new outgoing jobs. The original 26 October OFF descriptions below are
+historical. See `main_workflow/README.md` for the current commands.
+
+## Current result — full main app uses existing test data, 26 October 2026
+
+The user clarified that the test features belong in the actual main workflow.
+They are now served at `/` and ordinary `/api/` routes. Launch with
+`python app.py --test-data` to open the configured existing test schema with
+messaging forced OFF, no startup migration/seed and retained history. `/workflow`
+is only a compatibility alias. See
+[MAIN_APP_HANDOVER_2026-10-26.md](MAIN_APP_HANDOVER_2026-10-26.md) for the current
+implementation, tests, live-read evidence and commands. The adapter-only description
+below is historical and superseded by this direct main-app integration.
+
+## Current work — main workflow prepared and OFF, 26 October 2026
+
+The user explicitly chose to prepare the normal application while keeping the
+feature OFF. The adapter, separate configuration, explicit additive migration,
+main UI mount and local verification are described in
+[WORKFLOW_HANDOVER_2026-10-26.md](WORKFLOW_HANDOVER_2026-10-26.md) and
+[main_workflow/README.md](main_workflow/README.md). No main database migration,
+deployment, live message, live Zoho write or timer was performed during this work.
+The existing OR files and protected repository/response logic remain unchanged.
+Final local regression: **422 tests passed**. The main HTTP/CLI workflow passed
+against temporary SQLite and local fictional Postman targets; it is not verified
+against the real main Zoho app or Azure PostgreSQL.
+
+The older sections below are historical, including their test counts and pending
+setup. Source Added_Time and Modified_Time now both follow the confirmed IST
+contract, with UTC checkpoints. Retained imports with an old timestamp marker
+must reconcile successfully before new offers or staff cutoff can proceed.
+Production main report contracts and consultant identity mapping still need
+verification; do not assume the legacy flat forms match the new adapter.
+
 ## Setup update — Scheduler fields added, 23 October 2026
 
 The user confirmed adding `Scheduler_Key` and `Status`. A fresh read-only check

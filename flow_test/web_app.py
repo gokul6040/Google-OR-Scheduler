@@ -123,6 +123,8 @@ def handler_for(flow, admin_token: str):
                 elif path == "/api/resolve":
                     flow.resolve(int(payload["id"]))
                     result = {"saved": True}
+                elif path == "/api/resume-sending":
+                    result = flow.resume_sending()
                 elif path == "/api/process" and not flow.live:
                     result = {"processed": flow.drain()}
                 else:

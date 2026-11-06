@@ -7,8 +7,33 @@ import pytest
 
 from config import SolverSettings
 from scheduling.cp_sat_scheduler import generate_weekly_schedule
+from scheduling.cp_sat_scheduler import _candidate_placements
+from scheduling.bundle_builder import build_bundles
 from scheduling.slot_config import SLOTS
 from scheduling.types import RequirementInput, SchedulingProblem
+
+
+def test_unbounded_weekly_search_keeps_every_valid_start(base_problem):
+    problem = base_problem([RequirementInput(1, 1, 1, 1, 1, 1, 0)])
+    bundles = build_bundles(problem.requirements)
+    candidates, _ = _candidate_placements(problem, bundles)
+    assert {(day, slot) for day, slot, _ in candidates[bundles[0].id]} == {
+        (day, slot.slot_index) for day in range(6) for slot in SLOTS
+    }
+
+
+def test_weekly_search_can_place_three_patients_when_old_two_start_shortcut_collided():
+    ids = (1, 11, 21)
+    problem = SchedulingProblem(week_start=date(2026, 10, 19),
+        requirements=[RequirementInput(i, i, 1, 1, 1, 1, 0) for i in ids],
+        therapist_availability={(1, 0, slot.slot_index) for slot in SLOTS},
+        patient_availability={(patient, 0, slot.slot_index) for patient in ids for slot in SLOTS},
+        active_therapists={1}, location_capacities={1: 1})
+    result = generate_weekly_schedule(problem, settings=SolverSettings(max_time_seconds=20))
+    assert result.status in {"FEASIBLE", "OPTIMAL"}
+    assert len(result.appointments) == 3 and not result.unmet
+    assert len({item.slot_index for item in result.appointments}) == 3
+    assert not any(result.validation.values())
 
 
 @pytest.mark.parametrize("seconds,blocked,expected", [(5, False, 100), (5, True, 99), (21, False, 100)])

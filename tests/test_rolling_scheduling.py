@@ -16,6 +16,23 @@ from scheduling.types import ScheduleResult, ScheduledAppointment
 from services.rolling_schedule_service import generate_rolling_schedule
 
 
+def test_rolling_plan_does_not_hide_a_failed_week(monkeypatch):
+    from types import SimpleNamespace
+    import services.rolling_schedule_service as rolling
+
+    class EmptySession:
+        def scalars(self, _query):
+            return []
+
+    statuses = iter(["UNKNOWN", "FEASIBLE", "FEASIBLE"])
+    monkeypatch.setattr(rolling, "load_scheduling_problem", lambda *_args, **_kwargs: SimpleNamespace(requirements=[]))
+    monkeypatch.setattr(rolling, "generate_weekly_schedule", lambda *_args, **_kwargs: ScheduleResult(
+        status=next(statuses), appointments=[], unmet=[], requested_sessions=0,
+        scheduled_sessions=0, validation={}, statistics={}))
+    result, _, _ = rolling.generate_rolling_schedule(EmptySession(), date(2026, 10, 22))
+    assert result.status == "UNKNOWN"
+
+
 def test_rolling_scheduler_carries_unmet_friday_demand_into_next_week(db_session):
     department = Department(name="Speech")
     location = Location(name="Clinic", capacity=1)

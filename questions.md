@@ -8,10 +8,6 @@ This file contains only decisions that still need management confirmation. When 
 
 2. **Confirmed appointment changes:** May the system move a confirmed appointment automatically when filling a cancellation, or must it always ask an administrator/family first? Recommended: always require approval.
 
-3. **Cancellation chain:** After moving a proposed appointment from day 8 into an opening on day 7, should the system continue by moving another appointment into the new day-8 opening? Recommended: show the complete proposed chain and require one approval before saving it.
-
-4. **Cancellation search distance:** Should the system search only the next three days, or every remaining day in the current Monday–Saturday schedule? Recommended: search the remaining week, nearest date first.
-
 ## Absence and manual-change decisions
 
 13. **Manual lock duration:** Should an administrator's manual change remain locked until explicitly unlocked? Recommended: yes.
@@ -27,3 +23,11 @@ This file contains only decisions that still need management confirmation. When 
     a patient or plan has stopped, and what should staff do with existing future
     bookings? Missing rows in an incremental pull are not deletions. Do not infer
     cancellation or erase completed progress from a missing source record.
+
+16. **Main source adoption:** Confirm the actual production report/form link names,
+    Schedule/registration Phone scalar or nested API shape, both source time zones, and
+    the stable mapping between existing main consultant IDs and Creator IDs. The
+    opt-in main adapter blocks a duplicate-name/different-ID consultant import;
+    adopting those identities requires a reviewed data migration, not a therapist
+    reassignment or relaxed scheduling constraint. The legacy flat forms are not
+    assumed to match the newer Scheduler export contract.

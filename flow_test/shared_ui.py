@@ -1,5 +1,6 @@
 """Run the existing UI handlers against the selected isolated test session."""
 
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime
 import re
@@ -7,9 +8,6 @@ import secrets
 from urllib.parse import urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
-
-from flow_test.service import SETTINGS
-
 
 GET_ROUTES = (
     r"/api/(overview|schedule|patients|therapists|operations|health)",
@@ -23,6 +21,7 @@ POST_ROUTES = (
     r"/api/zoho/export/(preview|prepare|ack|finish|push)",
     r"/api/absences",
     r"/api/patients/\d+/preferences",
+    r"/api/patients/\d+/status",
     r"/api/appointments/\d+/(cancel|move|reservation-preview|reserve)",
     r"/api/calendar/(reservation-preview|reserve)",
     r"/api/schedules/generate",
@@ -37,9 +36,11 @@ def generate_daily_preview(request, instance) -> None:
     body = request.read_json()
     target = web_app.parse_date(body.get("start"), "start")
     seconds = web_app.parse_search_seconds(body.get("searchSeconds"))
+    if body.get("planningMode", "day") != "day":
+        raise web_app.ApiError(400, "This workflow plans one selected day at a time")
     try:
         result, pinned = instance.flow.preview_daily(
-            target, body.get("patients"), settings=replace(SETTINGS, max_time_seconds=seconds),
+            target, body.get("patients"), settings=replace(instance.flow.solver_settings, max_time_seconds=seconds),
         )
     except ValueError as exc:
         raise web_app.ApiError(400, str(exc)) from exc
@@ -60,7 +61,8 @@ def generate_daily_preview(request, instance) -> None:
         "previewId": preview_id, "planningStart": target.isoformat(),
         "planningMode": "day", "planningDays": 1,
         "newSessions": new_count, "scheduledOnSelectedDay": len(day_result.appointments),
-        "autoOfferOnSave": offer_on_save, "liveMessaging": instance.flow.live,
+        "autoOfferOnSave": offer_on_save, "liveMessaging": getattr(instance.flow, "messaging_enabled", instance.flow.live),
+        "messagingPaused": instance.flow.live and not getattr(instance.flow, "messaging_enabled", instance.flow.live),
     })
     request.send_json(payload, 201)
 
@@ -87,9 +89,9 @@ def save_daily_preview(request, instance, preview_id: str) -> None:
     request.send_json(response)
 
 
-def dispatch_shared_api(request, instance) -> bool:
+def dispatch_shared_api(request, instance, *, prefix: str = "/test") -> bool:
     """Allow local UI workflows with a request-scoped session and previews."""
-    path = urlsplit(request.path).path.removeprefix("/test")
+    path = urlsplit(request.path).path.removeprefix(prefix)
     patterns = GET_ROUTES if request.command == "GET" else POST_ROUTES
     local_route = any(re.fullmatch(pattern, path) for pattern in patterns)
     assistant_status = path == "/api/assistant/status" and request.command == "GET"
@@ -104,22 +106,36 @@ def dispatch_shared_api(request, instance) -> bool:
         return True
     import web_app
 
+    if path == "/api/zoho/import" and getattr(instance.flow, "remote_worker", False):
+        from flow_test.zoho_routes import dispatch_zoho
+
+        # The remote worker uses the same database mutex. Holding it while
+        # waiting for that worker's HTTP response would deadlock the import.
+        # Its import transaction takes the shared lock; local refresh takes its
+        # own lock only after the remote request has finished.
+        getattr(instance, "zoho_dispatch", dispatch_zoho)(request, instance, path)
+        return True
+
     if path == "/api/zoho/export/push":
         from flow_test.zoho_calendar import dispatch_calendar_push
         # State helpers take their own locks. External HTTP must not block
         # incoming replies or other calendar reads through the workflow lock.
-        dispatch_calendar_push(request, instance)
+        getattr(instance, "calendar_push", dispatch_calendar_push)(request, instance)
         return True
 
-    with instance.flow.lock:
+    status_change = request.command == "POST" and re.fullmatch(r"/api/patients/\d+/status", path)
+    # Match the worker's lock order so a send is settled before deciding how to handle its offer.
+    with (instance.flow.sender_lock if status_change else nullcontext()), instance.flow.lock:
         if not hasattr(instance, "previews"):
             instance.previews = {}
         context = web_app.WORKSPACE_CONTEXT.set({
             "sessions": instance.flow.sessions, "previews": instance.previews,
+            "admin_user": getattr(instance.flow, "admin_id", "scheduler_manager"),
+            "flow": instance.flow,
         })
         adapter = web_app.TherapySchedulerHandler.__new__(web_app.TherapySchedulerHandler)
         adapter.__dict__.update(request.__dict__)
-        adapter.path = request.path.removeprefix("/test")
+        adapter.path = request.path.removeprefix(prefix)
         adapter._headers_buffer = []
         try:
             save = re.fullmatch(r"/api/schedules/([0-9a-f-]+)/save", path)
@@ -129,7 +145,7 @@ def dispatch_shared_api(request, instance) -> bool:
                 dispatch_export(adapter, instance, path.rsplit("/", 1)[-1])
             elif path in {"/api/zoho/import", "/api/zoho/status", "/api/zoho/draft"}:
                 from flow_test.zoho_routes import dispatch_zoho
-                dispatch_zoho(adapter, instance, path)
+                getattr(instance, "zoho_dispatch", dispatch_zoho)(adapter, instance, path)
             elif request.command == "POST" and path == "/api/reset":
                 body = adapter.read_json()
                 try:

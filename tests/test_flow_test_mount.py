@@ -155,7 +155,7 @@ def test_shared_preview_save_is_isolated_from_main_preview_store(mounted, monkey
         pytest.fail("A test UI handler opened the production database")
 
     monkeypatch.setattr(web_app, "ProductionSessionLocal", forbidden)
-    monkeypatch.setattr(web_app, "generate_rolling_schedule", forbidden)
+    monkeypatch.setattr(web_app, "generate_weekly_schedule", forbidden)
     monkeypatch.setattr(web_app, "PREVIEWS", {})
     target = date.today()
     if target.weekday() == 6:

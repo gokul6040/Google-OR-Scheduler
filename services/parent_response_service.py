@@ -91,7 +91,9 @@ def record_parent_response(
     return response
 
 
-def weekly_progress(session: Session, target_date: date) -> list[WeeklyProgress]:
+def weekly_progress(
+    session: Session, target_date: date, *, source_plan_id: str | None = None,
+) -> list[WeeklyProgress]:
     """Count delivered sessions separately from reserved sessions for this week."""
     start = target_date - timedelta(days=target_date.weekday())
     end = start + timedelta(days=5)
@@ -118,7 +120,8 @@ def weekly_progress(session: Session, target_date: date) -> list[WeeklyProgress]
             ),
         )
         for item in session.scalars(select(TreatmentRequirement).where(
-            TreatmentRequirement.active.is_(True),
+            TreatmentRequirement.source_plan_id == source_plan_id
+            if source_plan_id is not None else TreatmentRequirement.active.is_(True),
         ).order_by(TreatmentRequirement.id))
     ]
 

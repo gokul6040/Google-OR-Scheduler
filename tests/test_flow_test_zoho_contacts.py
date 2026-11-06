@@ -1,7 +1,7 @@
 """Source parent phones work through import, transport, callbacks and restart."""
 
 from copy import deepcopy
-from datetime import date
+from datetime import date, datetime
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,7 +20,9 @@ PARENT = "918888888888"
 
 
 @pytest.fixture
-def source_contacts(tmp_path, monkeypatch):
+def source_contacts(tmp_path, monkeypatch, workflow_clock):
+    # Exercise contacts before the visit begins, with one consistent UTC/IST clock.
+    workflow_clock(TARGET)
     reports = json.loads((Path(__file__).parent / "fixtures/zoho_test_reports.json").read_text(encoding="utf-8"))
     reports["Plan_Report"][0]["Parent_No"] = PARENT
     calls = []
@@ -32,7 +34,7 @@ def source_contacts(tmp_path, monkeypatch):
     monkeypatch.setenv("WHATSAPP_PHONE_NUMBER_ID", BUSINESS)
     monkeypatch.setenv("FLOW_TEST_LIVE", "true")
     monkeypatch.setenv("FLOW_TEST_MESSAGE_MODE", "session")
-    monkeypatch.setattr("flow_test.service.sender_settings_from_environment", lambda: object())
+    monkeypatch.setattr("flow_test.service.sender_settings_from_environment", lambda: SimpleNamespace(phone_number_id=BUSINESS))
     monkeypatch.setattr("flow_test.service.send_reply_buttons", capture)
     monkeypatch.setattr("flow_test.service.send_text_message", capture)
     flow = FlowTest(f"sqlite:///{(tmp_path / 'contacts.sqlite').as_posix()}", live=True, recipients={})

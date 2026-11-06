@@ -24,6 +24,10 @@ def init_db() -> None:
     from database.whatsapp_migrations import migrate_whatsapp_button_times
 
     migrate_whatsapp_button_times(engine)
+    from database.treatment_migrations import migrate_treatment_courses
+
+    with engine.begin() as connection:
+        migrate_treatment_courses(connection)
 
 
 def init_admin_booking_tables() -> None:
