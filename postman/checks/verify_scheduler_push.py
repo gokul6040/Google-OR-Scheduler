@@ -126,12 +126,18 @@ def main():
             preview = push(apply=False)
             assert preview["wouldAssumeAcceptedVisits"] == 3
             assert {o["state"] for o in flow.state(target)["offers"]} == {"PENDING"}
-            call("http://127.0.0.1:4913/zoho/__test__/fail-next-scheduler-create", {})
+            call("http://127.0.0.1:4913/zoho/__test__/fault", {
+                "path": "form/Scheduler", "count": 1, "status": 503,
+            })
             assert "batch retained" in push(success=False)
-            assert export_preview(flow, target)["lastPush"] is None
-            # Resume via the calendar's server-side route after a CLI failure.
+            pending = export_preview(flow, target)
+            assert pending["lastPush"] is None and pending["openBatch"]
+            # Resume via the calendar after a failed write, then lose the response
+            # to a committed write. The running export must reconcile that key.
+            call("http://127.0.0.1:4913/zoho/__test__/fail-next-scheduler-create", {})
             result = api("zoho/export/push", {"date":target.isoformat()})
             assert result["pushed"] == 4 and result["reconciled"] == 1
+            assert result["resumedBatch"] == pending["openBatch"]["id"]
             own = owned()
             assert len(own) == len({r["Scheduler_Key"] for r in own}) == 4
             assert {r["Status"] for r in own} == {"ASSUMED_CONFIRMED"}

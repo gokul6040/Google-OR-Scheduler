@@ -32,6 +32,19 @@ class SourceRecordError(ValueError):
 
 
 @contextmanager
+def patient_record(row: dict, rejected: list | None):
+    """Quarantine an identified patient error without discarding good patients."""
+    try:
+        with source_record("Plan_Report", row):
+            yield
+    except SourceRecordError as exc:
+        if rejected is None:
+            raise
+        rejected.append({"code": clean_text(row.get("RegistrationID")),
+                         "id": clean_text(row.get("ID")), "reason": str(exc)})
+
+
+@contextmanager
 def source_record(report: str, row: dict) -> Iterator[None]:
     try:
         yield
@@ -165,9 +178,33 @@ def rebase_cached_times(reports: dict, previous_zones: dict[str, str] | str | No
 
 
 def phone_number(value: str) -> str:
-    number = re.sub(r"[\s+()-]", "", clean_text(value))
-    if not re.fullmatch(r"[1-9]\d{7,14}", number):
-        raise ValueError("Use an international parent phone number")
+    """Store every parent number as 91 + a 10-digit Indian mobile, the format WhatsApp uses.
+
+    Accepts 9876543210, 09876543210, +91 98765 43210, 0091 9876543210 and 919876543210.
+    Anything else (wrong length, landlines, foreign numbers) is never guessed: it raises,
+    so the patient is set aside for staff to correct in Zoho.
+    """
+    raw = clean_text(value)
+    number = re.sub(r"[\s().\-]", "", raw)
+    if not number:
+        raise ValueError("Missing parent phone number")
+    # An explicit "+" or "00" means the number already carries its country code.
+    # Keep that fact: a foreign code must never be turned into an Indian number.
+    international = number.startswith("+") or number.startswith("00")
+    number = number[1:] if number.startswith("+") else number[2:] if number.startswith("00") else number
+    if not number.isdigit():
+        raise ValueError("Parent phone number contains letters or symbols; correct it in Zoho")
+    if international:
+        if not number.startswith("91"):
+            raise ValueError("Parent phone number has a foreign country code; foreign numbers need staff review")
+    else:
+        if len(number) == 11 and number.startswith("0"):
+            number = number[1:]
+        if len(number) == 10:
+            number = "91" + number
+    if not re.fullmatch(r"91[6-9]\d{9}", number):
+        raise ValueError("Parent phone number is not a valid Indian mobile number (10 digits starting 6-9); "
+                         "foreign or landline numbers need staff review")
     return number
 
 
@@ -239,7 +276,7 @@ def merge_reports(previous: dict | None, incoming: dict, window: dict | None,
 
 
 def convert_reports(reports: dict, plan_start: date | None = None, *, fictional: bool = True,
-                    source: str = f"{OWNER}/{APP}") -> dict:
+                    source: str = f"{OWNER}/{APP}", rejected: list | None = None) -> dict:
     """Convert source branches and each latest plan's Added Time to OR inputs.
 
     The optional old plan_start argument is accepted for existing job clients;
@@ -292,7 +329,7 @@ def convert_reports(reports: dict, plan_start: date | None = None, *, fictional:
         latest[code] = winners[0]
     seen = set()
     for row in sorted(latest.values(), key=lambda item: clean_text(item.get("RegistrationID"))):
-        with source_record("Plan_Report", row):
+        with patient_record(row, rejected):
             code = clean_text(row.get("RegistrationID"))
             source_id = clean_text(row.get("ID"))
             name = clean_text(row.get("PatientName"))
@@ -378,7 +415,7 @@ def apply_reports(flow, reports: dict, plan_start: date | None = None, *, window
     with flow.lock, flow.inbound_lock:
         try:
             result = _apply_reports_locked(flow, reports, plan_start, window=window, full_snapshot=full_snapshot)
-        except SourceRecordError as exc:
+        except ValueError as exc:
             # The import transaction has rolled back. Persist only the review
             # item separately; clinical data, cache and checkpoint stay intact.
             message = str(exc)
@@ -421,8 +458,24 @@ def _apply_reports_locked(flow, reports: dict, plan_start: date | None, *, windo
                                 full_snapshot=full_snapshot,
                                 timezone_migration=bool(full_snapshot and timezone_migration))
         is_test = getattr(flow, "is_test", True)
+        rejected = []
         scenario = convert_reports(reports, plan_start, fictional=is_test,
-                                   source=getattr(flow, "source_name", f"{OWNER}/{APP}"))
+                                   source=getattr(flow, "source_name", f"{OWNER}/{APP}"), rejected=rejected)
+        quarantined = [row["code"] for row in rejected]
+        put_setting(session, "zoho_quarantined_patients", quarantined)
+        corrected_codes = {row["code"] for row in scenario["patients"]}
+        for issue in session.scalars(select(FlowInbox).where(FlowInbox.event_key.like("zoho-quarantine:%"))):
+            if issue.patient_code in corrected_codes:
+                issue.resolved = 1
+        for row in rejected:
+            key = "zoho-quarantine:" + hashlib.sha256(row["id"].encode()).hexdigest()
+            issue = session.scalar(select(FlowInbox).where(FlowInbox.event_key == key))
+            if issue is None:
+                session.add(FlowInbox(event_key=key, patient_code=row["code"],
+                    reason="Zoho patient record needs correction",
+                    text=row["reason"] + ". Valid patients were imported. This patient has no new offers; correct Zoho and retry. The checkpoint has not advanced."))
+            else:
+                issue.resolved = 0
         digest = hashlib.sha256(json.dumps(scenario, sort_keys=True).encode()).hexdigest()
         marker = session.get(FlowSetting, "scenario")
         if marker is None or marker.value != scenario["version"]:
@@ -470,7 +523,10 @@ def _apply_reports_locked(flow, reports: dict, plan_start: date | None, *, windo
                 raise ValueError("Consultant capability changes require staff review")
             if therapist.active != row["active"] and session.scalar(select(Appointment.id).where(
                     Appointment.therapist_id == therapist.id).limit(1)) is not None:
-                raise ValueError("Consultant status change affects saved appointments; staff review required")
+                key = f"zoho-consultant-status:{therapist.id}:{row['active']}"
+                if session.scalar(select(FlowInbox.id).where(FlowInbox.event_key == key)) is None:
+                    session.add(FlowInbox(event_key=key, reason="Consultant status changed — review bookings",
+                        text="Consultant status was updated. Saved history and appointments were retained; review future visits. Inactive staff receive no new generated bookings."))
             therapist.name, therapist.active = row["name"], row["active"]
         for code, therapist in therapists.items():
             if is_test and code not in source_codes:
@@ -635,10 +691,18 @@ def _apply_reports_locked(flow, reports: dict, plan_start: date | None, *, windo
             flow._audit(session, "flow_offer_recipient_updated" if changed_recipient else
                         "flow_offer_sync_resumed", f"offer:{offer.token}")
         put_setting(session, SCENARIO_KEY, scenario)
+        # Same transaction as the roster: readers cache parent numbers by this version.
+        from flow_test.performance_schema import SOURCE_VERSION_KEY, source_version_for
+        source_version = source_version_for(scenario)
+        version_row = session.get(FlowSetting, SOURCE_VERSION_KEY)  # Stored raw, not JSON-encoded.
+        if version_row is None:
+            session.add(FlowSetting(key=SOURCE_VERSION_KEY, value=source_version))
+        else:
+            version_row.value = source_version
         put_setting(session, "zoho_test_source", reports)
         put_setting(session, "zoho_test_fingerprint", digest)
         put_setting(session, TIMEZONE_KEY, SOURCE_TIMEZONES)
-        if window is not None:
+        if window is not None and not rejected:
             put_setting(session, CHECKPOINT_KEY, window["to"])
         result = {"patients": len(scenario["patients"]), "consultants": len(scenario["therapists"]), "requirements": sum(
             len(item["requirements"]) for item in scenario["patients"]),
@@ -647,9 +711,11 @@ def _apply_reports_locked(flow, reports: dict, plan_start: date | None, *, windo
                   "branches": len(scenario["locations"]),
                   "warnings": warnings,
                   "synced_at": datetime.utcnow().isoformat() + "Z",
-                  "checkpoint": window["to"] if window else current}
+                  "checkpoint": window["to"] if window and not rejected else current,
+                  "partial": bool(rejected), "quarantined": quarantined}
         put_setting(session, "zoho_test_sync", result)
         if changed:
             flow._audit(session, "flow_zoho_imported", scenario["source"])
     flow.use_source_contacts(scenario)
+    flow._synced_source_version = source_version
     return result

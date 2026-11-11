@@ -54,6 +54,10 @@ def test_branch_surrounding_whitespace_is_ignored(reports, report, source_flow):
 def test_missing_branch_fails_with_record_context(reports, report, source_flow):
     reports[report][0]["Branch"] = "\t "
     expected = "Patient 'TEST-H'.*Branch" if report == "Plan_Report" else "Consultant .*Branch"
+    if report == "Plan_Report":
+        result = apply_reports(source_flow, reports, date(2026, 10, 22))
+        assert result["partial"] and result["quarantined"] == ["TEST-H"]
+        return
     with pytest.raises(ValueError, match=expected):
         apply_reports(source_flow, reports, date(2026, 10, 22))
     assert source_flow.scenario.get("source") is None
@@ -73,6 +77,11 @@ def test_invalid_snapshot_rejected_before_any_changes(reports, source_flow, chan
         reports["Plan_Report"][0]["Parent_No"] = "invalid"
     else:
         reports["Plan_Report"][0]["Modified_Time"] = "invalid"
+    if change in {"malformed", "branch", "phone"}:
+        result = apply_reports(source_flow, reports, date(2026, 10, 22))
+        assert result["partial"] and result["patients"] == 7
+        assert result["quarantined"]
+        return
     with pytest.raises(ValueError):
         apply_reports(source_flow, reports, date(2026, 10, 22))
     assert source_flow.scenario.get("source") is None
@@ -177,11 +186,10 @@ def test_consultant_deactivation_with_bookings_needs_review(reports, source_flow
     apply_reports(source_flow, reports, date(2026, 10, 22))
     source_flow.generate(date(2026, 10, 23))
     reports["All_Consultants"][0]["Status"] = "Inactive"
-    with pytest.raises(ValueError, match="status change"):
-        apply_reports(source_flow, reports, date(2026, 10, 22))
+    apply_reports(source_flow, reports, date(2026, 10, 22))
     with source_flow.sessions() as session:
         assert session.scalar(select(func.count(Therapist.id)).where(
-            Therapist.therapist_code.like("ZC-%"), Therapist.active.is_(True))) == 2
+            Therapist.therapist_code.like("ZC-%"), Therapist.active.is_(True))) == 1
 
 
 def test_sunday_draft_target_is_skipped(reports, source_flow, monkeypatch):

@@ -263,6 +263,7 @@ def test_control_unavailable_holds_unsent_job_without_attempt(tmp_path, legacy_f
         def unavailable(*args, **kwargs):
             raise OSError("fictional control outage")
         monkeypatch.setattr(flow.dispatch_control, "reserve", unavailable)
+        monkeypatch.setattr(flow.dispatch_control, "reserve_with_reason", unavailable)
         assert flow.process_batch() == 0
         assert not calls
         with flow.sessions() as session:

@@ -124,6 +124,16 @@ def test_bad_mapping_rolls_back_contacts_cache_checkpoint_and_bookings(joined_re
         broken["Plan_Report"][0].pop("Schedule")
     else:
         row["Registration Id"] = {"ID": "123", "display_value": "TEST-H"}
+    if failure in {"missing_match", "missing_phone", "bad_phone", "missing_plan_field"}:
+        result = apply_reports(source_flow, broken, window={"from": FIRST, "to": SECOND})
+        assert result["partial"] and result["quarantined"]
+        assert source_flow.recipients == {code: phone for code, phone in before.items()
+                                          if code not in result["quarantined"]}
+        with source_flow.sessions() as session:
+            assert json.loads(session.get(FlowSetting, CHECKPOINT_KEY).value) == FIRST
+            assert [(a.id, a.status) for a in session.scalars(select(Appointment))] == bookings
+            assert session.scalar(select(FlowInbox.id).where(FlowInbox.event_key.like("zoho-quarantine:%")))
+        return
     with pytest.raises(ValueError):
         apply_reports(source_flow, broken, window={"from": FIRST, "to": SECOND})
     assert source_flow.recipients == before

@@ -2,6 +2,8 @@
 
 from copy import deepcopy
 from datetime import date
+import hashlib
+import hmac
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +31,14 @@ KEY = "dummy-main-admin-key-at-least-32-characters"
 
 @pytest.fixture
 def main_operations(tmp_path, monkeypatch):
+    # These tests verify production routing/state, not five minutes of search.
+    # Budget allocation itself is exercised without a test cap in test_centre_planning.
+    from scheduling import cp_sat_scheduler as planner
+    solve = planner.cp_model.CpSolver.Solve
+    def bounded_search(solver, model):
+        solver.parameters.max_time_in_seconds = min(1.0, solver.parameters.max_time_in_seconds)
+        return solve(solver, model)
+    monkeypatch.setattr(planner.cp_model.CpSolver, "Solve", bounded_search)
     engine = create_engine(f"sqlite:///{(tmp_path / 'normal.sqlite').as_posix()}")
     Base.metadata.create_all(engine)
     with sessionmaker(bind=engine).begin() as session:
@@ -37,7 +47,8 @@ def main_operations(tmp_path, monkeypatch):
                             "All_Consultants", "Scheduler", "Scheduler_Report")
     before = set(inspect(engine).get_table_names())
     migration = prepare_storage(engine, config.source_name)
-    assert len(migration["tablesAdded"]) == 5
+    # Five queue tables, plus export tracking, shared previews and offer links (performance pass).
+    assert len(migration["tablesAdded"]) == 8
     assert set(inspect(engine).get_table_names()) == before | set(migration["tablesAdded"])
     calls = []
     flow = MainWorkflow(engine, config, send=lambda kind, payload: calls.append((kind, deepcopy(payload))) or f"dummy-{len(calls)}")
@@ -50,6 +61,9 @@ def main_operations(tmp_path, monkeypatch):
     monkeypatch.setattr(mount, "runtime", lambda: instance)
     reports = json.loads((Path(__file__).parent / "fixtures/zoho_test_reports.json").read_text())
     yield instance, reports, calls
+    if hasattr(instance, "planning_runner"):
+        instance.planning_runner.thread.join(timeout=10)
+        assert not instance.planning_runner.thread.is_alive()
     engine.dispose()
 
 
@@ -57,6 +71,16 @@ def import_source(instance, reports):
     return request("/workflow/api/zoho/import", {"source": instance.config.source_name,
                    "sourceTimezones": {"Added_Time": "Asia/Kolkata", "Modified_Time": "Asia/Kolkata"},
                    "syncWindow": {"from": None, "to": "2026-10-24T00:00:00Z"}, "reports": reports}, token=KEY)
+
+
+def generated_preview(instance, code, raw):
+    assert code == 202, raw
+    ident = json.loads(raw)["jobId"]
+    instance.planning_runner.thread.join(timeout=10)
+    code, raw = request(f"/workflow/api/schedules/jobs/{ident}", token=KEY)
+    result = json.loads(raw)
+    assert code == 200 and result["status"] == "DONE", raw
+    return result["preview"]
 
 
 def test_main_workflow_is_off_by_default_and_does_not_open_a_database(monkeypatch):
@@ -126,9 +150,24 @@ def test_main_auth_and_reset_simulation_boundaries(main_operations):
     assert calls == []
 
 
-def test_main_import_review_save_reply_attendance_and_export_reuse(main_operations):
+def test_real_main_opens_directly_when_access_screen_is_disabled(main_operations, monkeypatch):
+    _instance, _reports, calls = main_operations
+    monkeypatch.setenv("MAIN_WORKFLOW_DATA_SOURCE", "main")
+    monkeypatch.setenv("MAIN_WORKFLOW_REQUIRE_ACCESS_KEY", "false")
+
+    assert request("/api/patients", token="")[0] == 200
+    assert request("/api/patients", token=KEY)[0] == 200
+    assert b'"requiresAccessKey": false' in request("/main-workflow-config.js")[1]
+    assert request("/workflow", token="")[0] == 302
+    assert request("/workflow/api/patients", token="")[0] == 401
+    assert calls == []
+
+
+@pytest.mark.parametrize("action", ["YES", "NO"])
+def test_main_import_review_save_template_reply_and_attendance_or_replacement(main_operations, monkeypatch, action):
+    import web_app
     from flow_test.service import format_offer_message
-    from flow_test.zoho_export import prepare_export
+    from flow_test.zoho_export import export_preview, finalise_unanswered, prepare_export
 
     instance, reports, calls = main_operations
     status, raw = import_source(instance, reports)
@@ -140,8 +179,7 @@ def test_main_import_review_save_reply_attendance_and_export_reuse(main_operatio
         assert not list(session.scalars(select(Appointment)))
     assert calls == []
     code, raw = request("/workflow/api/schedules/generate", {"start": DAY.isoformat(), "patients": ["TEST-H"]}, token=KEY)
-    assert code == 201, raw
-    preview = json.loads(raw)
+    preview = generated_preview(instance, code, raw)
     code, raw = request(f"/workflow/api/schedules/{preview['previewId']}/save", {}, token=KEY)
     assert code == 200, raw
     assert json.loads(raw)["offers"] == 1
@@ -150,10 +188,45 @@ def test_main_import_review_save_reply_attendance_and_export_reuse(main_operatio
     assert calls[0][1]["button_prefix"] == "mw"
     assert "TEST ONLY" not in format_offer_message(calls[0][1]["fields"])
     assert "FICTIONAL TEST" not in calls[0][1]["fields"]["centre"]
+    assert instance.flow.state(DAY)["offers"][0]["send_status"] == "SIMULATED"
+    assert export_preview(instance.flow, DAY)["wouldAssumeAcceptedVisits"] == 0
     with instance.flow.sessions.begin() as session:
+        assert finalise_unanswered(instance.flow, session, DAY) == 0
+    assert instance.flow.state(DAY)["appointments"][0]["status"] == "PENDING_CONFIRMATION"
+    with instance.flow.sessions() as session:
         offer = session.scalar(select(FlowOffer))
-        instance.flow._job(session, "main-yes", "INBOUND", {"from": offer.recipient,
-                           "timestamp": str(int(time.time())), "button": {"payload": f"mw:{offer.token}:YES"}})
+        message = {"id": "fictional-template-reply", "from": offer.recipient, "type": "button",
+                   "timestamp": str(int(time.time())),
+                   "button": {"text": action.title(), "payload": f"mw:{offer.token}:{action}"}}
+    original = instance.flow.state(DAY)["appointments"][0]
+    raw = json.dumps({"object": "whatsapp_business_account", "entry": [{"changes": [{"value": {
+        "metadata": {"phone_number_id": "fictional-main-sender"}, "messages": [message],
+    }}]}]}).encode()
+    secret = "fictional-main-webhook-secret"
+    monkeypatch.setenv("WHATSAPP_PHONE_NUMBER_ID", "fictional-main-sender")
+    monkeypatch.setattr(web_app, "webhook_settings_from_environment", lambda: SimpleNamespace(app_secret=secret))
+    handler = web_app.TherapySchedulerHandler.__new__(web_app.TherapySchedulerHandler)
+    handler.read_raw_body = lambda: raw
+    handler.headers = {"X-Hub-Signature-256": "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()}
+    replies = []
+    handler.send_json = replies.append
+    with monkeypatch.context() as live_callback:
+        live_callback.setattr(instance.flow, "live", True)
+        handler.handle_whatsapp_webhook()
+        handler.handle_whatsapp_webhook()
+    assert replies == [{"ok": True}, {"ok": True}]
+    assert instance.flow.process_events() == 1
+
+    if action == "NO":
+        # The visit is released for staff to fill from the ranked list; nothing fills itself.
+        assert not instance.flow.process_repairs()
+        state = instance.flow.state(DAY)
+        released = next(item for item in state["appointments"] if item["id"] == original["id"])
+        assert released["status"] == "NEEDS_RESCHEDULING"
+        assert not any(item["status"] == "PROPOSED" for item in state["appointments"])
+        assert len(state["offers"]) == len(calls) == 1
+        return
+
     instance.flow.drain()
     appointment = instance.flow.state(DAY)["appointments"][0]
     assert appointment["status"] == "CONFIRMED"
@@ -191,23 +264,33 @@ def test_main_daily_planning_uses_normal_solver_settings(main_operations, monkey
     instance, reports, _calls = main_operations
     assert import_source(instance, reports)[0] == 200
     seen = []
-    original = instance.flow._daily_result
+    if hasattr(instance, "planning_runner"):
+        instance.planning_runner.thread.join(timeout=10)
+    original = instance.flow._solve_daily_inputs
 
-    def capture(session, target, patients, settings):
+    def capture(session, target, problem, fingerprint, settings):
         seen.append(settings)
-        return original(session, target, patients, settings)
+        return original(session, target, problem, fingerprint, settings)
 
-    monkeypatch.setattr(instance.flow, "_daily_result", capture)
+    monkeypatch.setattr(instance.flow, "_solve_daily_inputs", capture)
     result, _pinned = instance.flow.preview_daily(DAY, ["TEST-H"])
     assert seen == [SOLVER_SETTINGS]
     assert result.status in {"FEASIBLE", "OPTIMAL"} and not any(result.validation.values())
 
 
-def test_main_shell_reuses_the_ui_but_has_its_own_login(main_operations):
+def test_explicitly_keyed_admin_shell_remains_available(main_operations, monkeypatch):
+    monkeypatch.setenv("MAIN_WORKFLOW_REQUIRE_ACCESS_KEY", "true")
     code, html = request("/workflow")
     assert code == 200 and b"/workflow/workspace.js" in html
     assert b"/test/workspace.js" not in html
     assert b"mainWorkflowAdminToken" in request("/workflow/workspace.js")[1]
+
+
+def test_normal_app_defaults_to_no_access_screen(main_operations, monkeypatch):
+    monkeypatch.delenv("MAIN_WORKFLOW_REQUIRE_ACCESS_KEY", raising=False)
+    assert request("/api/patients", token="")[0] == 200
+    assert b'"requiresAccessKey": false' in request("/main-workflow-config.js")[1]
+    assert request("/workflow", token="")[0] == 302
 
 
 def test_main_import_blocks_duplicate_existing_consultant_identity_atomically(main_operations):
@@ -226,7 +309,7 @@ def test_main_import_blocks_duplicate_existing_consultant_identity_atomically(ma
         assert list(session.scalars(select(Patient.patient_code))) == ["EXISTING"]
 
 
-def test_main_missing_contact_cannot_save_even_in_preview(main_operations):
+def test_main_missing_contact_is_held_without_blocking_calendar_save(main_operations):
     instance, reports, calls = main_operations
     assert import_source(instance, reports)[0] == 200
     with instance.flow.sessions.begin() as session:
@@ -236,12 +319,13 @@ def test_main_missing_contact_cannot_save_even_in_preview(main_operations):
                     location_id=doctor.location_id, assigned_therapist_id=doctor.id, sessions_per_week=1,
                     sequence_order=0, active=True))
     code, raw = request("/workflow/api/schedules/generate", {"start": DAY.isoformat(), "patients": ["EXISTING"]}, token=KEY)
-    assert code == 201, raw
-    preview = json.loads(raw)
+    preview = generated_preview(instance, code, raw)
     assert preview["appointments"]
     code, raw = request(f"/workflow/api/schedules/{preview['previewId']}/save", {}, token=KEY)
-    assert code == 409 and b"verified parent contacts" in raw
-    assert not instance.flow.state(DAY)["appointments"]
+    assert code == 200, raw
+    assert instance.flow.state(DAY)["appointments"]
+    assert not instance.flow.state(DAY)["offers"]
+    assert any("corrected contact" in item["reason"] for item in instance.flow.state(DAY)["inbox"])
     assert calls == []
 
 

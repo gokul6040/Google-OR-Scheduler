@@ -27,6 +27,9 @@ def check_storage(engine: Engine) -> None:
     from flow_test.reliability_schema import missing_columns
     if missing_columns(engine):
         raise ValueError("Upgrade the WhatsApp queue with python -m main_workflow.migrate --apply before starting workers")
+    from flow_test.performance_schema import missing_performance_storage
+    if missing_performance_storage(engine):
+        raise ValueError("Upgrade workflow storage with python -m main_workflow.migrate --apply before starting")
 
 
 def prepare_storage(engine: Engine, source_name: str) -> dict:
@@ -39,7 +42,7 @@ def prepare_storage(engine: Engine, source_name: str) -> dict:
 
 
 def _prepare_storage(engine: Engine, source_name: str) -> dict:
-    """Create five additive workflow tables, preserving all domain tables/rows."""
+    """Create the additive workflow tables (eight), preserving all domain tables/rows."""
     names = set(inspect(engine).get_table_names())
     domain = {table.name for table in TEST_TABLES if table.metadata is Base.metadata}
     if not domain <= names:
@@ -58,6 +61,8 @@ def _prepare_storage(engine: Engine, source_name: str) -> dict:
         WorkflowBase.metadata.create_all(connection)
         from flow_test.reliability_schema import migrate_queue
         migrate_queue(connection)
+        from flow_test.performance_schema import migrate_performance
+        migrate_performance(connection)
         with sessionmaker(bind=connection, join_transaction_mode="rollback_only").begin() as session:
             for key, value in (("scenario", MARKER), ("main_workflow_source", source_name)):
                 if session.get(FlowSetting, key) is None:

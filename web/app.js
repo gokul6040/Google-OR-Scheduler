@@ -778,21 +778,24 @@ async function openPatientPreferences(patient) {
 
 function openPatientStatusDialog(patient, onSaved) {
   const active = !patient.active;
+  let saving = false;
+  let canActivate = !active;
   const dialog = document.createElement("dialog");
   dialog.className = "patient-status-dialog";
   dialog.setAttribute("aria-labelledby", "patientStatusTitle");
   dialog.setAttribute("aria-describedby", "patientStatusWarning");
   dialog.innerHTML = `
     <form class="preference-form">
-      <h3 id="patientStatusTitle">${active ? "Reactivate this patient?" : "Mark this patient as inactive?"}</h3>
+      <h3 id="patientStatusTitle">${active ? "Mark this patient active?" : "Mark this patient as inactive?"}</h3>
       <p id="patientStatusWarning"><strong>${escapeHtml(patient.name)}</strong> ${active
-        ? "will be eligible for scheduling again."
+        ? "can be marked active once their details are complete."
         : "will be excluded from new scheduling. Unsent offers will be withdrawn. Review any existing offers and confirmed visits separately."}</p>
       ${active ? "" : '<label>Reason for marking inactive <textarea name="reason" rows="3" maxlength="1000" required></textarea></label>'}
+      ${active ? '<section class="patient-activation-check" aria-live="polite" aria-busy="true"><p>Checking patient details…</p></section><button type="button" class="secondary-button" data-recheck-activation hidden>Check again</button>' : ''}
       <p class="patient-status-error" role="alert" hidden></p>
       <div class="patient-status-actions">
         <button type="button" class="secondary-button" data-cancel-status>Cancel</button>
-        <button type="submit" class="primary-button">${active ? "Reactivate" : "Mark inactive"}</button>
+        <button type="submit" class="primary-button" ${active ? 'disabled' : ''}>${active ? "Mark active" : "Mark inactive"}</button>
       </div>
     </form>`;
   const form = $("form", dialog);
@@ -800,15 +803,42 @@ function openPatientStatusDialog(patient, onSaved) {
   const cancel = $("[data-cancel-status]", form);
   const confirm = $('button[type="submit"]', form);
   const errorNote = $(".patient-status-error", form);
+  const check = $(".patient-activation-check", form);
+  const recheck = $("[data-recheck-activation]", form);
+  async function checkActivation() {
+    canActivate = false;
+    confirm.disabled = true;
+    recheck.disabled = true;
+    check.setAttribute("aria-busy", "true");
+    check.innerHTML = '<p>Checking patient details…</p>';
+    try {
+      const review = await api(`/api/patients/${patient.id}/activation`);
+      if (!dialog.isConnected) return;
+      canActivate = review.canActivate;
+      check.innerHTML = review.canActivate
+        ? '<p>Patient details are complete. You can mark this patient active.</p>'
+        : `<strong>Cannot mark active yet</strong><ul>${review.issues.map(issue => `<li>${escapeHtml(issue)}</li>`).join('')}</ul><p>${escapeHtml(review.nextStep || 'Run the Zoho sync, then check again.')}</p>`;
+      if (review.checkedAt) check.insertAdjacentHTML('beforeend', `<p class="activation-check-date">Checked from the latest Zoho sync: ${escapeHtml(new Date(review.checkedAt).toLocaleString('en-IN'))}</p>`);
+      confirm.disabled = !canActivate;
+    } catch (error) {
+      check.textContent = 'Patient details could not be checked. Check again before marking active.';
+    } finally {
+      check.setAttribute("aria-busy", "false");
+      recheck.hidden = false;
+      recheck.disabled = false;
+    }
+  }
+  recheck?.addEventListener("click", checkActivation);
 
   cancel.addEventListener("click", () => dialog.close());
   dialog.addEventListener("close", () => dialog.remove());
   dialog.addEventListener("cancel", event => {
-    if (confirm.disabled) event.preventDefault();
+    if (saving) event.preventDefault();
   });
   reason?.addEventListener("input", () => reason.setCustomValidity(""));
   form.addEventListener("submit", async event => {
     event.preventDefault();
+    if (saving || (active && !canActivate)) return;
     const explanation = reason?.value.trim() ?? "";
     if (reason && !explanation) {
       reason.setCustomValidity("Enter a reason for marking this patient inactive.");
@@ -816,6 +846,7 @@ function openPatientStatusDialog(patient, onSaved) {
       return;
     }
     confirm.disabled = cancel.disabled = true;
+    saving = true;
     errorNote.hidden = true;
     let result;
     try {
@@ -825,7 +856,10 @@ function openPatientStatusDialog(patient, onSaved) {
     } catch (error) {
       errorNote.textContent = error.message;
       errorNote.hidden = false;
-      confirm.disabled = cancel.disabled = false;
+      saving = false;
+      cancel.disabled = false;
+      if (active) await checkActivation();
+      else confirm.disabled = false;
       return;
     }
     patient.active = result.active;
@@ -839,6 +873,7 @@ function openPatientStatusDialog(patient, onSaved) {
   document.body.append(dialog);
   dialog.showModal();
   (reason || cancel).focus();
+  if (active) checkActivation();
 }
 
 async function loadTeamView() {
@@ -1053,7 +1088,7 @@ function loadGeneratorView() {
       <div><p class="eyebrow" style="color:#5ed5cd">Daily planning</p><h2>Build a safe schedule around every child and therapist.</h2><p>Plan tomorrow’s sessions. Saved visits stay fixed and count toward weekly demand.</p><div class="rule-strip"><span>${icon("check")}Patient availability</span><span>${icon("check")}Therapist coverage</span><span>${icon("check")}Saved visits</span><span>${icon("check")}Weekly targets</span></div></div>
       <form class="generator-form" id="generatorForm">
         <label>Planning date<input id="generatorStart" type="date" value="${escapeHtml(target)}" readonly></label>
-        <label>Search time<select id="generatorSearchSeconds"><option value="20">Quick preview · about 20 seconds</option><option value="60">Thorough · up to 1 minute</option><option value="120">Extended · up to 2 minutes</option><option value="300">Deep search · up to 5 minutes</option></select></label>
+        <label>Search time per centre<select id="generatorSearchSeconds">${workflowWorkspace ? '<option value="300">Up to 5 minutes per centre</option>' : '<option value="20">Up to 20 seconds per centre</option><option value="60">Up to 1 minute per centre</option><option value="120">Up to 2 minutes per centre</option><option value="300" selected>Up to 5 minutes per centre</option>'}</select></label>
         <button class="primary-button" type="submit">Generate validated preview</button>
         <p class="fine-print">Review tomorrow’s draft before saving. ${workflowWorkspace ? "Saving queues tomorrow’s WhatsApp offers." : ""}</p>
       </form>
@@ -1066,7 +1101,8 @@ function loadGeneratorView() {
 
 async function loadAutomaticTestDraft(root) {
   try {
-    const { draft } = await api("/api/zoho/draft");
+    const response = await api("/api/zoho/draft");
+    const draft = response.draft || (response.planning ? await waitForPlanning(response.planning) : null);
     if (!draft || draft.start !== state.overview.nextPlanningDate || !root.isConnected || state.activeView !== "generator" || state.latestPreview) return;
     state.latestPreview = draft;
     state.currentDate = parseLocalDate(draft.start);
@@ -1079,6 +1115,15 @@ async function loadAutomaticTestDraft(root) {
   }
 }
 
+async function waitForPlanning(job) {
+  while (job.status === "QUEUED" || job.status === "PROCESSING") {
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    job = await api(`/api/schedules/jobs/${job.jobId}`);
+  }
+  if (job.status !== "DONE") throw new Error(job.error || "Planning did not complete. Generate a fresh preview.");
+  return job.preview;
+}
+
 async function generateSchedule(event) {
   event.preventDefault();
   const button = $('button[type="submit"]', event.currentTarget);
@@ -1088,9 +1133,10 @@ async function generateSchedule(event) {
   button.disabled = true;
   $("#generatorSearchSeconds").disabled = true;
   button.innerHTML = `<span class="spinner" style="width:16px;height:16px;border-color:rgba(255,255,255,.35);border-top-color:white"></span>Planning tomorrow…`;
-  $("#generatorResults").innerHTML = `<section class="panel"><div class="loading-state" style="min-height:260px"><span class="spinner"></span><strong>Checking tomorrow’s slots against weekly demand</strong><span>This can take up to ${searchLabel}. The result is independently validated before it can be saved.</span></div></section>`;
+  $("#generatorResults").innerHTML = `<section class="panel"><div class="loading-state" role="status" aria-live="polite" style="min-height:260px"><span class="spinner"></span><strong>Planning tomorrow’s sessions, one centre at a time</strong><span>Up to ${searchLabel} per centre or connected group. Each search finishes early when the best result is proven. Review the validated draft before saving.</span></div></section>`;
   try {
-    const result = await api("/api/schedules/generate", { method: "POST", body: JSON.stringify({ start, searchSeconds, planningMode: "day" }) });
+    const response = await api("/api/schedules/generate", { method: "POST", body: JSON.stringify({ start, searchSeconds, planningMode: "day", background: workflowWorkspace }) });
+    const result = response.jobId ? await waitForPlanning(response) : response;
     state.latestPreview = result;
     $("#generatorResults").innerHTML = renderGeneratorResults(result);
     bindSavePreview();
@@ -1322,11 +1368,18 @@ function showReplacementCandidates(groups) {
     try {
       const suggestion = useSuggestions ? (cachedCandidates !== null ? {candidates: cachedCandidates} : await api(`/api/appointments/${appointmentId}/replacement-candidates?wholeVisit=${wholeVisit}`)) : null;
       if (!current() || latest !== listVersion) return;
-      const people = useSuggestions ? suggestion.candidates.map(item => ({id:item.patient_id,name:item.patient_name || item.patient_code,code:item.patient_code,active:true,progress:item.weekly_progress})) : (await api(`/api/patients?q=${encodeURIComponent(query)}`)).patients;
+      if (useSuggestions && wholeVisit && !emptyBooking && (group.visitSessions || 1) > 1 && !suggestion.candidates.length) {
+        // Nobody can take the whole visit: show who can take this session, best fit first.
+        $("#replacementWhole",drawer).checked = false;
+        $("#replacementPatientList",drawer).innerHTML = '<p class="candidate-intro" role="status">No child can take the complete visit. Showing children for this session…</p>';
+        return loadPatientChoices();
+      }
+      const fitText = item => item.joins_existing_visit ? "joins their visit today" : item.visit_sessions > 1 ? (item.sessions_covered === item.visit_sessions ? `can take all ${item.visit_sessions} sessions` : `can take ${item.sessions_covered} of ${item.visit_sessions} sessions`) : "";
+      const people = useSuggestions ? suggestion.candidates.map(item => ({id:item.patient_id,name:item.patient_name || item.patient_code,code:item.patient_code,active:true,progress:item.weekly_progress,fit:fitText(item)})) : (await api(`/api/patients?q=${encodeURIComponent(query)}`)).patients;
       if (!current() || latest !== listVersion) return;
       const filtered = people.filter(item => item.active && (!query || `${item.name} ${item.code}`.toLowerCase().includes(query.toLowerCase())));
       const emptyMessage = useSuggestions ? "No matching suggestions. Choose patient searches all active patients." : "No matching active patients. Try searching by name or patient ID.";
-      root.innerHTML = filtered.length ? filtered.slice(0,50).map(item => `<button class="replacement-patient" data-replacement-patient="${item.id}"><span class="avatar">${escapeHtml(initials(item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.code)}${item.progress ? ` · ${escapeHtml(item.progress)} weekly sessions` : ""}</small></span>${icon("chevron-right")}</button>`).join("") + (filtered.length>50 ? '<p class="candidate-intro">Showing 50 matches. Refine your search to find another patient.</p>' : "") : `<p class="candidate-intro">${emptyMessage}</p>`;
+      root.innerHTML = filtered.length ? filtered.slice(0,50).map(item => `<button class="replacement-patient" data-replacement-patient="${item.id}"><span class="avatar">${escapeHtml(initials(item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.code)}${item.progress ? ` · ${escapeHtml(item.progress)} weekly sessions` : ""}${item.fit ? ` · ${escapeHtml(item.fit)}` : ""}</small></span>${icon("chevron-right")}</button>`).join("") + (filtered.length>50 ? '<p class="candidate-intro">Showing 50 matches. Refine your search to find another patient.</p>' : "") : `<p class="candidate-intro">${emptyMessage}</p>`;
       $$('[data-replacement-patient]',root).forEach(button => {
         button.disabled = !contextReady;
         button.setAttribute("aria-pressed", String(String(selectedPatient?.id) === button.dataset.replacementPatient));

@@ -62,7 +62,7 @@ def fetch_reports(*, since: str | None = None, until: str | None = None) -> dict
             for logical, actual in targets.items()}
 
 
-def test_api(base_url: str, token: str, path: str, body: dict | None = None) -> dict:
+def test_api(base_url: str, token: str, path: str, body: dict | None = None, *, timeout: float = 180) -> dict:
     """Call only the existing app's isolated Zoho test endpoints."""
     target = urlsplit(base_url)
     allowed_host = urlsplit(BASE_URL).hostname
@@ -70,13 +70,14 @@ def test_api(base_url: str, token: str, path: str, body: dict | None = None) -> 
             or not ((target.scheme == "https" and target.hostname == allowed_host)
                     or (target.scheme == "http" and target.hostname in {"localhost", "127.0.0.1"}))):
         raise ValueError("Use the existing Azure app or a loopback preview server")
-    if path not in {"status", "import", "export/preview", "export/prepare", "export/ack", "export/finish"}:
+    if path not in {"status", "import", "export/preview", "export/prepare", "export/ack", "export/failures",
+                    "export/finish", "export/push"}:
         raise ValueError("Unsupported test sync operation")
     request = Request(base_url.rstrip("/") + "/test/api/zoho/" + path,
                       data=json.dumps(body).encode() if body is not None else None,
                       headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
     try:
-        with build_opener(ProxyHandler({})).open(request, timeout=180) as response:
+        with build_opener(ProxyHandler({})).open(request, timeout=timeout) as response:
             return json.load(response)
     except HTTPError as exc:
         # The test endpoint returns only sanitised validation messages, not request bodies.
@@ -140,7 +141,7 @@ def main() -> None:
                        "branches": len(scenario["locations"]), "plan_start_source": "Added_Time (Asia/Kolkata date)",
                        "mode": "VALIDATION ONLY"}
         print(json.dumps(summary, indent=2))
-        if summary.get("draftError"):
+        if summary.get("draftError") or summary.get("partial"):
             raise SystemExit(1)
     except (ValueError, OSError, URLError) as exc:
         message = str(exc) if isinstance(exc, ValueError) else "Connection or local file operation failed"

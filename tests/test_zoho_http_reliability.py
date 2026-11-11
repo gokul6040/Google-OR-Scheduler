@@ -97,7 +97,7 @@ def exchange_for(flow):
             return prepare_export(flow, DAY)
         if operation == "ack":
             return acknowledge_export(flow, body["batchId"], body["appointmentId"],
-                                      body["fingerprint"], body["recordId"])
+                                      body["fingerprint"], body["recordId"], records=body.get("records"))
         return finish_export(flow, body["batchId"])
     return exchange
 
@@ -123,7 +123,7 @@ def test_commit_with_lost_response_reconciles_without_another_create(provider, b
     control(provider.api_url, {"path": "form/Scheduler", "count": 1, "afterWrite": True,
                                "disconnect": disconnect})
     result = push(provider, booked)
-    assert result["reconciled"] == 1 and result["created"] == result["pushed"] - 1
+    assert result["reconciled"] == result["pushed"] and result["created"] == 0
     assert push(provider, booked)["pushed"] == 0
     # Subsequent changes update the same key instead of creating another row.
     with booked.sessions.begin() as session:
@@ -151,7 +151,7 @@ def test_restart_after_write_before_ack_recovers_same_key(provider, booked):
     restarted = FlowTest(str(booked.engine.url), scenario=booked.scenario)
     try:
         result = push(provider, restarted)
-        assert result["reconciled"] == 1 and result["resumedBatch"] == batch["id"]
+        assert result["reconciled"] == len(batch["changes"]) and result["resumedBatch"] == batch["id"]
         rows = get_report_records(provider, "simulation-token", "Scheduler_Report", criteria="ID != 0")
         assert len([row for row in rows if row.get("Scheduler_Key") == first_key]) == 1
         assert export_preview(restarted, DAY)["openBatch"] is None
@@ -192,6 +192,36 @@ def test_actual_write_timeout_is_reconciled_before_another_write(provider, booke
 
     monkeypatch.setattr(zoho_push, "open_zoho_request", shorter_timeout)
     result = push(provider, booked)
-    assert result["reconciled"] == 1
-    assert result["created"] == (0 if update else result["pushed"] - 1)
+    assert result["reconciled"] == (1 if update else result["pushed"])
+    assert result["created"] == 0
+    assert push(provider, booked)["pushed"] == 0
+
+
+def test_bulk_partial_success_saves_good_rows_and_resumes_rejected_row(provider, booked):
+    request = Request(provider.api_url + "/__test__/reject-scheduler-row", data=b'{"index":1}',
+                      headers={"Content-Type": "application/json"})
+    with open_zoho_request(request, timeout=5) as response:
+        assert json.load(response)["armed"]
+    with pytest.raises(ValueError, match="batch retained"):
+        push(provider, booked)
+    batch = export_preview(booked, DAY)["openBatch"]
+    assert len(batch["acknowledged"]) == len(batch["changes"]) - 1
+    assert export_preview(booked, DAY)["lastPush"] is None
+    result = push(provider, booked)
+    assert result["created"] == 1 and result["resumedBatch"] == batch["id"]
+    rows = get_report_records(provider, "simulation-token", "Scheduler_Report", criteria="ID != 0")
+    keys = {r["fields"]["Scheduler_Key"] for r in batch["changes"]}
+    assert len([row for row in rows if row["Scheduler_Key"] in keys]) == len(keys)
+
+
+def test_bulk_attendance_update_preserves_owned_ids(provider, booked):
+    push(provider, booked)
+    before = get_report_records(provider, "simulation-token", "Scheduler_Report", criteria="ID != 0")
+    with booked.sessions.begin() as session:
+        for appointment in session.scalars(select(Appointment)):
+            appointment.status = AppointmentStatus.COMPLETED
+    result = push(provider, booked)
+    assert result["updated"] == 4 and result["created"] == 0
+    after = get_report_records(provider, "simulation-token", "Scheduler_Report", criteria="ID != 0")
+    assert {r["Scheduler_Key"]: r["ID"] for r in before} == {r["Scheduler_Key"]: r["ID"] for r in after}
     assert push(provider, booked)["pushed"] == 0

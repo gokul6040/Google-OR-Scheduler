@@ -157,7 +157,7 @@ def test_unknown_send_has_an_actionable_deduplicated_staff_warning(flow):
 
 def test_empty_cell_booking_uses_primary_assignment_without_extra_mapping_tables(flow):
     from sqlalchemy import inspect
-    assert len(inspect(flow.engine).get_table_names()) == 19
+    assert len(inspect(flow.engine).get_table_names()) == 22
     with flow.sessions.begin() as session:
         patient = session.scalar(select(Patient).where(Patient.patient_code == "TEST-A"))
         plan = session.scalar(select(TreatmentRequirement).where(TreatmentRequirement.patient_id == patient.id))
@@ -168,7 +168,8 @@ def test_empty_cell_booking_uses_primary_assignment_without_extra_mapping_tables
                                     override_warnings=bool(preview["warnings"]), mode="without_messaging")
         assert session.get(Appointment, result["appointment_ids"][0]).status.value == "CONFIRMED"
     assert not flow.state(DAY)["offers"]
-    assert len(inspect(flow.engine).get_table_names()) == 19
+    # 19 tables, plus export tracking, shared previews and offer links (performance pass).
+    assert len(inspect(flow.engine).get_table_names()) == 22
 
 
 def test_missing_optional_mappings_do_not_grant_other_therapy_or_branch(flow):

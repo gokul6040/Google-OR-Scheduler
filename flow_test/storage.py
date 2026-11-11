@@ -12,7 +12,8 @@ from database.models import (
     TreatmentRequirement,
 )
 from flow_test.models import Base as FlowBase
-from flow_test.models import FlowContactWindow, FlowInbox, FlowJob, FlowOffer, FlowSetting
+from flow_test.models import (FlowContactWindow, FlowExportItem, FlowInbox, FlowJob, FlowOffer,
+                              FlowOfferAppointment, FlowPreview, FlowSetting)
 
 
 ALLOWED_SCHEMAS = ("flow_test", "flow_test_preview")
@@ -21,7 +22,7 @@ TEST_MODELS = (
     Patient, PatientAvailability, PatientAbsence, TreatmentRequirement,
     Appointment, AuditLog, AdminBookingDecision, AdminSlotReservation,
     ParentAvailabilityResponse, FlowSetting, FlowOffer, FlowJob, FlowInbox,
-    FlowContactWindow,
+    FlowContactWindow, FlowExportItem, FlowPreview, FlowOfferAppointment,
 )
 TEST_TABLES = tuple(model.__table__ for model in TEST_MODELS)
 
@@ -82,3 +83,5 @@ def initialize_test_tables(engine: Engine, schema: str | None = None) -> None:
         migrate_treatment_courses(connection, schema)
         from flow_test.reliability_schema import migrate_queue
         migrate_queue(connection, schema)
+        from flow_test.performance_schema import migrate_performance
+        migrate_performance(connection, schema)

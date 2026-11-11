@@ -140,6 +140,35 @@ records.Scheduler_Report = [{ID:"950000",Reg_ID:"DEMO",PatientName:"Fictional Ex
   Therapy_Date:"24-10-2026",TherapyTime:"09:00 AM",Scheduler_Key:"",Status:"",Added_Time:"23-Oct-2026 11:05:33"}];
 let schedulerSequence = 950000, failAfterCreate = false, schedulerKeyUnique = true;
 let fault = null;
+let rejectSchedulerIndex = null;
+// Fictional structured Thanal contract. Never contains captured patient data.
+const calicut = {ID:"10",Branch_Name:"Iqraa Thanal Super Speciality EIC Centre Calicut"};
+const otherBranch = {ID:"11",Branch_Name:"Other fictional centre"};
+const thanalReports = {
+  All_Consultants: [
+    {ID:"200",Name:"Fictional clinician",Status:"Active",Branch:calicut,Consultation_Type:"Full-Time",
+     Consultations:[{ID:"20",Value:"Speech"},{ID:"21",Value:"Occupational"}]},
+    {ID:"201",Name:"Other fictional clinician",Status:"Active",Branch:otherBranch,
+     Consultations:[{ID:"20",Value:"Speech"}]}
+  ],
+  All_Registrations: [
+    {ID:"100",Registration_Id:"FAKE-1",Name2:"Fictional child",Phone_Number:"919999999999",
+     Branch:calicut,Added_Time:"01/11/2026 08:00:00"},
+    {ID:"101",Registration_Id:"TEST-UNUSED",Name2:"Unused fictional child",Phone_Number:"123",
+     Added_Time:"01/11/2026 08:00:00"}
+  ],
+  All_Therapy_Schedule_Plans: [
+    {ID:"300",Branch:calicut,Name:{ID:"100",Name2:"Fictional child"},Status:"Draft",
+     Added_Time:"01/11/2026 09:00:00",Schedule:[
+       {ID:"400",Therapy:{ID:"20",Value:"Speech"},Consultant:{ID:"200"},Per_Week:"2",No_Of_Week:"3"},
+       {ID:"401",Therapy:{ID:"21",Value:"Occupational"},Consultant:{ID:"200"},Per_Week:"2",No_Of_Week:"3"}]},
+    {ID:"301",Branch:otherBranch,Name:{ID:"101"},Status:"Draft",Added_Time:"01/11/2026 09:00:00",Schedule:[]}
+  ]
+};
+const thanalAppointments = [];
+const thanalFields = ['Branch','Registration','For_Parent','Date_field','Department','Consultation_Type',
+  'Consultant','Appointment_Time_Slot','Slot_Number','Status','Scheduler_Key','Date_Time','End_Time','Duration'];
+const thanalLookups = ['Branch','Registration','Department','Consultation_Type','Consultant','Appointment_Time_Slot'];
 http.createServer((req, res) => {
   const url = new URL(req.url, "http://localhost");
   // A separate fictional main-workflow namespace exercises target configuration.
@@ -149,6 +178,10 @@ http.createServer((req, res) => {
   if (req.method === "POST" && url.pathname === "/__test__/fault") {
     fault = req.body?.count ? {...req.body} : null;
     res.end(JSON.stringify({armed:Boolean(fault)})); return;
+  }
+  if (req.method === "POST" && url.pathname === "/__test__/reject-scheduler-row") {
+    rejectSchedulerIndex = Number.isInteger(req.body?.index) ? req.body.index : null;
+    res.end(JSON.stringify({armed:rejectSchedulerIndex !== null}));return;
   }
   if (req.method === "POST" && url.pathname === "/__test__/registration-phone") {
     const row = records.All_Registrations.find(item => item.Registration_Id === req.body?.registration);
@@ -166,6 +199,79 @@ http.createServer((req, res) => {
     res.end(JSON.stringify(Object.hasOwn(activeFault, "payload") ? activeFault.payload :
       {code:activeFault.status === 429 ? 2955 : 500})); return;
   }
+  const thanalReport = url.pathname.match(/^\/creator\/v2\.1\/data\/thanal\/eic\/report\/(\w+)$/);
+  const thanalBase = '/creator/v2.1/data/thanal/eic/';
+  if (req.method === 'GET' && url.pathname === '/creator/v2.1/meta/thanal/eic/form/Schedule_Adhoc_Trial/fields') {
+    res.end(JSON.stringify({code:3000,fields:thanalFields.map(link_name => ({link_name,
+      type:thanalLookups.includes(link_name) || link_name==='Status' ? 12 :
+        ({For_Parent:16,Date_field:10,Slot_Number:5,Date_Time:11,End_Time:11,Duration:5}[link_name] || 1),
+      is_lookup_field:thanalLookups.includes(link_name),unique:link_name==='Scheduler_Key',max_char:255,
+      choices:link_name==='Status' ? ['Scheduled','Completed','Cancelled','Recreate'].map(value=>({value,key:value})) : undefined}))}));return;
+  }
+  const thanalSingle = url.pathname.match(/^\/creator\/v2\.1\/data\/thanal\/eic\/report\/Schedule_Adhoc_Trial_Report\/(\d+)$/);
+  const thanalCreate = req.method==='POST' && url.pathname===thanalBase+'form/Schedule_Adhoc_Trial';
+  const thanalUpdate = req.method==='PATCH' && (thanalSingle || url.pathname===thanalBase+'report/Schedule_Adhoc_Trial_Report');
+  if (req.method==='GET' && url.pathname===thanalBase+'report/Schedule_Adhoc_Trial_Report') {
+    const keys=[...(url.searchParams.get('criteria')||'').matchAll(/Scheduler_Key == "([^"]+)"/g)].map(m=>m[1]);
+    if (!keys.length) {res.writeHead(400);res.end(JSON.stringify({code:3330}));return;}
+    const data=thanalAppointments.filter(row=>keys.includes(row.Scheduler_Key)).map(row=>{
+      const result={...row,For_Parent:String(row.For_Parent),Slot_Number:String(row.Slot_Number),
+        Date_Time:row.Date_Time+':00',Duration:String(row.Duration)};
+      for (const field of thanalLookups) result[field]={ID:row[field],zc_display_value:'Fictional display',
+        ...(field==='Registration' ? {Name2:'Fictional child'} : {})};
+      return result;
+    });
+    res.end(JSON.stringify({code:3000,data}));return;
+  }
+  if (thanalCreate || thanalUpdate) {
+    const bulk=Array.isArray(req.body?.data);
+    const ids=thanalSingle ? [thanalSingle[1]] : [...(req.body?.criteria||'').matchAll(/ID == (\d+)/g)].map(m=>m[1]);
+    const selected=thanalUpdate ? thanalAppointments.filter(row=>ids.includes(row.ID)) :
+      (bulk ? req.body.data : [req.body?.data]);
+    const result=selected.map((old,index)=>{
+      const data=thanalUpdate ? {...old,...req.body.data} : old;
+      const actualKeys=Object.keys(data||{}).filter(k=>k!=='ID').sort().join();
+      const start = data?.Appointment_Time_Slot==='700' ? '09:00' : '09:40';
+      const end = data?.Appointment_Time_Slot==='700' ? '09:40:00' : '10:20:00';
+      if (data?.Date_Time!==data?.Date_field+' '+start || data?.End_Time!==data?.Date_field+' '+end || data?.Duration!==40)
+        return {code:3001,message:'Date_Time, End_Time and Duration are required by the session workflow'};
+      if (actualKeys!==[...thanalFields].sort().join() || req.body.skip_workflow || data.For_Parent!==false ||
+          !data.Scheduler_Key?.startsWith('main-') || data.Branch!=='10' || data.Registration!=='100' ||
+          data.Consultant!=='200' || !['20','21'].includes(data.Consultation_Type) ||
+          !['900','901'].includes(data.Department) || !['700','701'].includes(data.Appointment_Time_Slot) ||
+          !['Scheduled','Completed','Cancelled'].includes(data.Status))
+        return {code:3001,message:'Invalid fictional Thanal lookup payload'};
+      if (thanalCreate && index===rejectSchedulerIndex) return {code:3001,message:'Fictional form validation rejection'};
+      if (thanalCreate && thanalAppointments.some(row=>row.Scheduler_Key===data.Scheduler_Key))
+        return {code:3001,message:'Duplicate Scheduler Key'};
+      const row=thanalUpdate ? Object.assign(old,req.body.data) : {ID:String(++schedulerSequence),...data};
+      if (thanalCreate) thanalAppointments.push(row);
+      return {code:3000,data:{ID:row.ID,Scheduler_Key:row.Scheduler_Key}};
+    });
+    rejectSchedulerIndex=null;
+    if (activeFault && activeFault.afterWrite) {
+      activeFault.count--;
+      if (activeFault.disconnect) {req.socket.destroy();return;}
+      res.writeHead(503);res.end(JSON.stringify({code:500}));return;
+    }
+    res.end(JSON.stringify(bulk || !thanalSingle ? {code:3000,result:result.reverse()} : result[0]));return;
+  }
+  if (req.method === "GET" && thanalReport && thanalReports[thanalReport[1]]) {
+    const report = thanalReport[1];
+    if (url.searchParams.get("field_config") !== "all" ||
+        (report === "All_Therapy_Schedule_Plans" && url.searchParams.get("criteria") !== "Branch == 10") ||
+        (report !== "All_Therapy_Schedule_Plans" && url.searchParams.has("criteria"))) {
+      res.writeHead(400); res.end(JSON.stringify({code:3330,message:"Unexpected structured snapshot query"}));return;
+    }
+    let data = thanalReports[report];
+    if (report === "All_Therapy_Schedule_Plans") data = data.filter(r => r.Branch.ID === "10");
+    if (report === "All_Registrations") {
+      if (!req.headers.record_cursor) {res.setHeader("record_cursor","thanal-page-2");data=data.slice(0,1);}
+      else if (req.headers.record_cursor === "thanal-page-2") data=data.slice(1);
+      else {res.writeHead(400);res.end(JSON.stringify({code:3330}));return;}
+    }
+    res.end(JSON.stringify({code:3000,data}));return;
+  }
   const schedulerBase = "/creator/v2.1/data/nidhin.kumar_turnb/test-gokul/";
   if (req.method === "GET" && url.pathname === "/creator/v2.1/meta/nidhin.kumar_turnb/test-gokul/form/Scheduler/fields") {
     res.end(JSON.stringify({code:3000,fields:["Reg_ID","PatientName","Doctor","Therapy_Date","TherapyTime","Scheduler_Key","Status"].map(link_name =>
@@ -178,10 +284,38 @@ http.createServer((req, res) => {
     failAfterCreate = true; res.end(JSON.stringify({armed:true})); return;
   }
   if (req.method === "GET" && url.pathname === schedulerBase + "report/Scheduler_Report") {
-    if (url.searchParams.get("field_config") !== "all" || url.searchParams.get("criteria") !== "ID != 0") {
+    const criteria = url.searchParams.get("criteria") || "";
+    const keys = [...criteria.matchAll(/Scheduler_Key == "([^"]+)"/g)].map(item => item[1]);
+    if (url.searchParams.get("field_config") !== "all" || (criteria !== "ID != 0" && !keys.length)) {
       res.writeHead(400); res.end(JSON.stringify({code:3330})); return;
     }
-    res.end(JSON.stringify({code:3000,data:records.Scheduler_Report})); return;
+    res.end(JSON.stringify({code:3000,data:keys.length ? records.Scheduler_Report.filter(r => keys.includes(r.Scheduler_Key)) : records.Scheduler_Report})); return;
+  }
+  if ((req.method === "POST" && url.pathname === schedulerBase + "form/Scheduler" && Array.isArray(req.body?.data)) ||
+      (req.method === "PATCH" && url.pathname === schedulerBase + "report/Scheduler_Report")) {
+    const updating = req.method === "PATCH";
+    const ids = [...(req.body.criteria || "").matchAll(/ID == (\d+)/g)].map(item => item[1]);
+    const input = updating ? records.Scheduler_Report.filter(row => ids.includes(row.ID)) : req.body.data;
+    if (!input.length || input.length > 200 || req.body.skip_workflow) {
+      res.writeHead(400); res.end(JSON.stringify({code:3001})); return;
+    }
+    const result = input.map((data, index) => {
+      if (!updating && index === rejectSchedulerIndex) return {code:3001,message:"Fictional form validation rejection"};
+      if (!updating && records.Scheduler_Report.some(r => r.Scheduler_Key === data.Scheduler_Key))
+        return {code:3001,message:"Duplicate Scheduler Key"};
+      const row = updating ? Object.assign(data, req.body.data) : {ID:String(++schedulerSequence),...data};
+      if (!updating) records.Scheduler_Report.push(row);
+      return {code:3000,data:{ID:row.ID,Scheduler_Key:row.Scheduler_Key}};
+    });
+    rejectSchedulerIndex = null;
+    if (failAfterCreate && !updating) {failAfterCreate=false;res.writeHead(500);res.end(JSON.stringify({code:500}));return;}
+    if (activeFault && activeFault.afterWrite) {
+      activeFault.count--;
+      if (activeFault.disconnect) {req.socket.destroy();return;}
+      if (activeFault.delayMs) {setTimeout(() => res.end(JSON.stringify({code:3000,result})), activeFault.delayMs);return;}
+      res.writeHead(503);res.end(JSON.stringify({code:500}));return;
+    }
+    res.end(JSON.stringify({code:3000,result:result.reverse()}));return;
   }
   const schedulerUpdate = url.pathname.match(/^\/creator\/v2\.1\/data\/nidhin\.kumar_turnb\/test-gokul\/report\/Scheduler_Report\/(\d+)$/);
   if ((req.method === "POST" && url.pathname === schedulerBase + "form/Scheduler") || (req.method === "PATCH" && schedulerUpdate)) {

@@ -3,7 +3,7 @@ from __future__ import annotations
 import enum
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Computed, Date, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint, literal_column
+from sqlalchemy import Boolean, Computed, Date, DateTime, Enum, ForeignKey, Index, Integer, String, Text, UniqueConstraint, literal_column
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database.db import Base
@@ -227,6 +227,9 @@ class ImportWarning(Base):
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
+    # Offer replies and decisions are looked up by entity ("offer:<token>") and action.
+    # Existing databases receive this index from flow_test.performance_schema.
+    __table_args__ = (Index("ix_audit_logs_entity_action", "entity", "action"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     action: Mapped[str] = mapped_column(String(80))

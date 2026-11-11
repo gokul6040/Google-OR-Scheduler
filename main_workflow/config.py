@@ -24,8 +24,8 @@ def local_no_auth() -> bool:
 
 
 def requires_access_key() -> bool:
-    """Select the main-page access policy independently of its database source."""
-    return os.getenv("MAIN_WORKFLOW_REQUIRE_ACCESS_KEY", "true").strip().lower() != "false"
+    """Open the normal app directly unless an operator explicitly requires a key."""
+    return os.getenv("MAIN_WORKFLOW_REQUIRE_ACCESS_KEY", "false").strip().lower() != "false"
 
 
 @dataclass(frozen=True)

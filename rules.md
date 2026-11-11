@@ -1,5 +1,438 @@
 # Therapy Scheduler Rules
 
+## Thanal appointment export — 11 November 2026
+
+The Thanal adapter exports exactly Branch, Registration, For_Parent, Date_field,
+Department, Consultation_Type, Consultant, Appointment_Time_Slot, Slot_Number,
+Status and Scheduler_Key, plus Date_Time, End_Time and Duration, to
+Schedule_Adhoc_Trial / Schedule_Adhoc_Trial_Report. These three workflow values
+come from the appointment date and selected slot in clinic local time:
+Date_Time uses dd/MM/yyyy HH:mm, End_Time dd/MM/yyyy HH:mm:ss, and Duration
+is the slot length in minutes. Zoho's On Validate workflow creates the related
+session; exports preserve that workflow. The eleven selected report columns
+remain the user-facing output. Date-only or inconsistent timing payloads are rejected.
+Registration uses the child's existing Creator registration ID. Live read-only
+report evidence confirms this lookup exposes Name2 (child name); names are
+displayed in the local preview, never used to choose an identity. For_Parent is
+always false as explicitly requested by the user.
+
+Department and consultation mappings use observed Creator IDs joined to imported
+therapy IDs. Time slots match both start and end time, branch and verified Zoho
+slot number. The checked-in non-patient lookup catalog covers all ten 40-minute
+scheduler slots. The sampled report also contains shorter slots; those are not
+substituted. Missing or ambiguous mappings block the push with a named preview
+reason. No master records are created or names guessed to repair a missing ID.
+
+Confirmed appointments export as Scheduled, including appointments confirmed by
+the existing manual unanswered-offer rule. The assumed/explicit reply distinction
+stays local. Completed and cancelled appointments retain Completed / Cancelled.
+NO_SHOW and NEEDS_RESCHEDULING are held pending approved destination semantics;
+they are never silently relabelled Scheduled. This change does not alter the
+existing unanswered-offer policy or make export automatic.
+
+The existing stable Scheduler_Key, durable batches and acknowledgements remain
+in use. Creator lookup objects are compared by ID when reconciling a lost write
+response or checking for changes. Repeat pushes must not duplicate rows. Preview
+is read-only; held lookup/status rows block preparation. The separate test-gokul
+export retains its original text-field contract. No WhatsApp sends are enabled.
+
+Covered by tests/test_thanal_export.py and existing export/main-workflow tests.
+Actual HTTP checks use the fictional Postman simulation; live schema, lookup
+shapes and master references were inspected read-only. No live appointment writes
+are implied by those tests.
+
+## Thanal release procedure (prepared locally)
+
+`deploy_thanal.ps1` and `main_workflow/thanal_release.py` are a separate, guarded
+release for Thanal's subscription, main public database and existing registry.
+Schema migration and the initial source/roster import run as manual jobs inside
+Azure; the website is stopped until these finish. Messaging stays off and the
+messaging worker is not started. The source pull uses the complete master reports
+and Calicut-only All_Therapy_Schedule_Plans. The initial approved eligibility
+snapshot applies once, with current source validation able to hold more patients
+inactive; later deployments preserve local eligibility and later valid new patients.
+Deployment creates no daily timer, saved schedule, message or Zoho appointment push.
+Local release tests cover wrong-target rejection, credential isolation, bounded
+roster encoding and clinical row preservation during additive schema migration.
+See DEPLOY_THANAL.md for commands, backup/restore details and failure behaviour.
+
+## Thanal daily import operation — 11 November 2026
+
+The separately configured `thanaljob` imports through the running app's
+authenticated API, using the app's image and structured three-report contract.
+It does not need a direct database URL. The intended Azure cron is
+`30 18 * * *` UTC, or 00:00 IST daily, with one replica and no automatic
+execution retry. This setup is separate from the initial release procedure.
+Imports preserve staff-controlled patient eligibility and do not reapply the
+initial roster. They can prepare an unsaved draft; no appointments are published,
+no WhatsApp messages are sent, and no appointments are written to Zoho by the
+timer. Live messaging remains disabled and its worker remains stopped.
+
+A cloud verification run committed 443 valid plans / 758 therapy requirements,
+with 273 plans held for source corrections and zero messages sent. Partial imports
+retain their checkpoint and return a nonzero CLI exit status; Azure consequently
+labels that execution Failed even when its valid import transaction committed.
+This does not bypass any validation or change scheduling constraints. The
+structured import/preservation rules remain covered by
+`tests/test_thanal_daily_sync.py`; this operation was checked against the live
+app and aggregate job logs. See DEPLOY_THANAL.md for the report names and
+verification procedure.
+
+## One-time active patient roster — 10 November 2026
+
+### Staff activation checks (implemented locally)
+
+- Staff activation in a Thanal database requires a usable latest Calicut plan,
+  complete registration identity, valid Indian mobile number, valid therapy
+  frequency/duration, and an active assigned consultant at the same centre with
+  the required therapy capability. The manager explicitly changed the earlier
+  contact-only policy: invalid phones now block manual activation too.
+- Opening the status dialog checks the latest complete source review and shows
+  every detected problem in plain language, naming the affected therapy and
+  consultant where available. Mark active is unavailable until checks pass.
+  Staff can close the dialog or check again after correcting Zoho and syncing.
+- The server repeats these checks on an inactive-to-active POST; direct API
+  requests cannot bypass the dialog. Blocked activation returns HTTP 409 and
+  preserves the patient's status, appointments and audit history.
+- A newly imported child with an invalid phone or inactive assigned consultant
+  starts inactive. Valid new children start active. Existing staff-controlled
+  status remains unchanged by source edits; staff review existing active children
+  if their source details become invalid. The manager explicitly approved making
+  one existing child inactive for an invalid phone, leaving 354 active patients.
+- Each structured sync publishes its activation review in the same transaction
+  as imported records. A partial source import can publish patient-specific
+  corrections; source failures/rollbacks cannot overwrite the previous review.
+  Successful correction allows manual activation without automatically changing
+  local eligibility. The spreadsheet is never an ongoing activation condition.
+- A roster-baselined database without a source review blocks activation until
+  a source check is available. Legacy/test databases without that baseline or
+  Thanal review keep their existing activation behaviour.
+- Tests: integrated source correction/multiple problems in
+  `tests/test_thanal_daily_sync.py`, authenticated read/direct-POST rejection,
+  missing plan and recovery in `tests/test_main_root_workflow.py`.
+
+### Original baseline
+
+- The manager's supplied roster is a one-time baseline, matched by exact
+  registration code, never by name. Listed patients with usable latest Calicut
+  plans and active assigned consultants are active. Other current patients are
+  inactive. Listed children and identifiable Calicut plan children remain visible
+  in the patient directory even when their source plan is invalid or absent.
+- Missing/ambiguous registration identity, invalid latest plans, and inactive
+  assigned consultants keep a listed child inactive with an explicit reason.
+  Invalid contact numbers alone did not prevent scheduling eligibility in the original baseline; they were
+  reported separately and follow the existing scheduled-message contact rule.
+- Apply through `services/patient_roster_service.py` in one transaction under
+  workflow/inbound coordination. The baseline is audited and the same operation
+  cannot be replayed. Existing status-change behavior applies, including cancelling
+  future proposed visits on deactivation; confirmed visits and history remain.
+- The spreadsheet is not a daily allowlist. Daily sync preserves existing local
+  eligibility, and a genuinely new patient with a valid later source plan starts
+  active through the existing importer. Correcting an inactive patient's source
+  data does not override staff-controlled eligibility automatically.
+- Verified by the one-time roster tests in `tests/test_thanal_daily_sync.py`:
+  invalid-plan visibility, inactive consultant handling, contact-only diagnostics,
+  identity matching, replay prevention and activation of a later new patient.
+
+## Thanal source contract — 10 November 2026
+
+### Integrated daily sync (implemented locally)
+
+The normal `main_workflow.sync --apply` path now routes through
+`main_workflow/thanal_sync.py` when source is thanal/eic and the configured reports
+are All_Registrations, All_Consultants and All_Therapy_Schedule_Plans. Every run
+rereads complete master snapshots without inventing Modified_Time/consultant
+timestamps. Plans are fetched using the uniquely resolved Branch lookup ID for
+Iqraa Thanal Super Speciality EIC Centre Calicut; other branches are rejected.
+Unrelated clinical fields are stripped before the job sends source data to the app.
+
+All projected registrations are retained in source settings; only children with
+valid latest Calicut plans enter the imported treatment roster. Missing/invalid
+phones on unused registrations produce diagnostics, NOT staff inbox tasks.
+Invalid phone numbers do NOT exclude an otherwise valid plan from generation.
+When saving/offering a scheduled visit cannot bind a verified contact, the visit
+is held with a contact review item. Dispatch rechecks current source contacts;
+unattempted offers may adopt corrected phones; attempted/sent/uncertain offers
+are never rebound or resent by sync.
+
+Valid consultants retain one physical identity and multiple capabilities. Source
+row errors on unrelated consultants remain diagnostic; affected current plans
+are quarantined, never assigned to a guessed doctor. Fundamental identity/DB
+adoption conflicts stop and roll back the whole import. Valid masters, source
+bindings, prescriptions, contact version and checkpoint share one transaction.
+
+All plan statuses are considered. Newest Added_Time selects the course; tied
+newest versions are held. No fallback to an older valid plan occurs when the
+newest plan is invalid. Renewals/removals retire demand without changing existing
+bookings, attendance or old prescription links; affected saved visits get review
+items. Staff-controlled patient eligibility is preserved. A previously imported
+child missing a valid scoped plan is held for source review, not silently deleted.
+
+Bad current plans create source review items and yield partial=true; valid plans
+still import, but the previous successful checkpoint is retained. Each subsequent
+run rereads all reports, so corrections can clear quarantine and advance it.
+Sync starts an unsaved background draft only; no appointments/offers are saved
+and no messages are sent by importing. The import route and CLI are exercised by
+tests/test_thanal_daily_sync.py, including real HTTP via the fictional Postman mock.
+
+Registration-only reading is implemented in `services/thanal_registration_reader.py`
+and covered by `tests/test_thanal_registration_reader.py`. It selects Creator ID,
+Registration_Id, Name2, Phone_Number, Branch, Status and Added_Time, discarding
+unrelated clinical/identity/address columns. Phones use the existing Indian-mobile
+normalization; invalid numbers become None with a review issue, never an older or
+guessed contact. Duplicate registration codes retain distinct Creator IDs for
+review rather than silently merging people. Source statuses are preserved without
+activating/deactivating patients or assuming which registrations require therapy.
+This stage performs no database writes, saves no schedule and sends no messages.
+
+Consultant-only import is implemented separately in
+`services/thanal_consultant_import.py`, covered by
+`tests/test_thanal_consultant_import.py`. `python -m main_workflow.consultants`
+validates the full report against an explicitly configured Thanal main database;
+only `--apply` commits. It does not generate a draft or import patients/plans.
+One `ZC-<Creator ID>` identity retains every declared Consultations capability;
+the primary department is a stable representative, not a restriction to one
+capability. Branch/therapy source IDs are bound to local IDs in workflow settings.
+No consultant creation/edit timestamps are fabricated. Missing source rows never
+delete/deactivate local records. Explicit Active/Inactive values are respected;
+blank/unknown values and malformed branch/capability lookups block an atomic apply.
+Existing names under unadopted source IDs and structural changes to a booked or
+prescribed consultant require review. Appointment/patient/plan rows are unchanged.
+New branches use the number of active consultants as initial capacity, counting
+each person once regardless of therapy count; existing capacities are preserved.
+
+User-confirmed: include the latest plan regardless of its Status (Draft, Scheduled
+or blank). This does not authorize importing every historical plan as simultaneous
+demand or inferring patient eligibility from registration statuses.
+
+For `thanal/eic` / `All_Therapy_Schedule_Plans`, `Per_Week` is weekly session count
+and the second number, currently exposed as `No_Of_Week`, is duration in MONTHS,
+despite that field's misleading API name. Examples confirmed by the user:
+`1, 1` = one session per week for one month; `2, 3` = two sessions per week for
+three months. Missing/zero durations or frequencies are flagged, never filled
+from guesses. This mapping is Thanal-specific, not a general weeks-to-months rule.
+
+The new read-only projection in `services/thanal_source_reader.py` joins plan
+`Name.ID` to registration `ID` and therapy `Consultant.ID` to consultant `ID`.
+Consultant `Consultations` supplies declared therapy capabilities;
+`Consultation_Type` is employment type (Full-Time/Part-Time), NOT therapy.
+Source Added_Time uses observed `dd/MM/yyyy HH:mm:ss`. Ambiguous latest creation
+timestamps require review; missing Modified_Time is not invented. These rules
+are tested in `tests/test_thanal_source_reader.py`. The projection is NOT yet
+connected to database imports; the existing scalar importer remains unchanged.
+
+## Performance and scaling pass — 8 November 2026
+
+**Implemented locally; covered by `tests/test_performance_pass.py` (SQLite and PostgreSQL).**
+No deployment, live message or Zoho write is implied.
+
+- **Upgrade step required.** Existing stores must run `python -m main_workflow.migrate --apply`
+  before this release starts; the app refuses to start otherwise. The step is additive and
+  idempotent: it adds the offer visit day, an offer-to-appointment link table, a Zoho
+  push-tracking table, a shared preview table, a contact-list version and query indexes.
+  Existing rows are kept; old per-appointment push-tracking settings rows are moved, not lost.
+  **Deployment (9 November 2026):** `deploy_main.ps1` checks whether the step is still needed;
+  if so, it waits for running sends and Zoho pushes, backs up the data, stops the old app and
+  WhatsApp worker, applies the step and verifies it before starting the new version. The
+  worker always runs the same image as the app. `flow_test/deploy_azure.ps1` refuses to deploy
+  while the step is pending. Covered by `tests/test_main_release.py` (fake Azure; PostgreSQL).
+- **Export preparation (#18)** reads only the target date: its offers (through the link
+  table, so a visit moved to that date is still found), their replies and decisions, and the
+  rows last pushed under that date. Results are identical to before.
+- **Contacts (#22, #23).** Webhooks and sends check only the numbers involved, with an indexed
+  lookup. The imported parent roster is cached per version; the version is written in the
+  same transaction as each import, so a changed roster is always picked up and an unchanged
+  one is never re-read.
+- **Staff screens (#24)** read without the workflow lock, from one consistent snapshot, and
+  return only the selected date's children. Full phone numbers are never included.
+- **Database locks (#25)** keep one reusable connection per lock. A dropped connection is
+  replaced before the lock is taken, never while it is held.
+- **Indexes (#26)** cover offers (day, state, recipient, child), jobs (kind/status, age), inbox
+  (resolved, child) and audit entries (entity/action).
+- **Retention (#27). Management decision: 180 days.** The worker cleans up hourly: finished
+  WhatsApp jobs, offers whose visit day has passed the period, resolved inbox items and Zoho
+  push tracking for older dates. Expired send timers and previews are always removed.
+  Appointments, therapy plans, patients, the audit log, unfinished or failed jobs and
+  unresolved inbox items are never removed; session counts are unaffected.
+  `WORKFLOW_RETENTION_DAYS` may change the period (30–3650).
+- **Several app copies (#28).** Only one Zoho push runs at a time across every copy (database
+  lock). Command-line pushes with `--apply` ask the app to push, so they use the same lock.
+  Schedule previews are stored in the database, so any copy can save them; they expire after
+  24 hours.
+
+## Centre search budget — 10 November 2026
+
+**Implemented locally; covered by `tests/test_centre_planning.py` and scheduler regressions.**
+Production daily previews use CP-SAT with a maximum search time of 300 seconds
+for EACH independent centre/resource component, processed sequentially in one
+application container. Centres sharing a patient or assigned therapist remain
+one component to prevent conflicts. The budget is not divided by demand or by
+consultant. A completed optimal/infeasible search returns immediately; unused
+time is not deliberately spent or transferred to another component. Model/input
+preparation and validation are additional to the solver's search time limit.
+
+Large inputs never skip CP-SAT based on requirement count or a short requested
+budget. A greedy placement may supply a solution hint only; the returned result
+comes from CP-SAT and passes the existing validator. FEASIBLE is the best valid
+incumbent found within the limit, not a claim of optimality. UNKNOWN/INFEASIBLE
+does not produce a saveable new draft. Preferences and spacing remain existing
+soft objectives; no clinical constraint or capacity rule is relaxed.
+
+Production manual and post-import previews run as database-backed background
+jobs. They never save appointments or send messages. A separate planning lock
+serializes searches across replicas; workers release the workflow lock after
+snapshotting inputs, so replies/sends/staff edits continue. Interrupted preview
+jobs can be recomputed on polling. Saved previews still recheck the input
+fingerprint and local date; changes during the search require a fresh preview.
+Test workflows retain explicitly selected short solver budgets for fixtures;
+each component receives that full budget and still uses CP-SAT.
+
+## Corrective pass, unsubscribe and phone format — 8 November 2026
+
+**Implemented locally; covered by `tests/test_corrective_pass.py`.** No deployment, live
+message or Zoho write is implied.
+
+- **Truthful saves.** When a centre (or group of centres sharing children or therapists)
+  is held because saved bookings conflict, the preview and the save name the held centres
+  and the children who got no new appointment. The save returns `complete: false`, its
+  message starts with "INCOMPLETE", and a staff warning is stored even for an unsaved preview.
+- **Warnings reopen.** A staff warning that was resolved reopens with fresh text when the
+  same failure happens again. This includes sending warnings (paused, allowance,
+  configuration, source record, deadline/retry limit, same-day contact). The one exception
+  is "delivery overdue", which is re-checked every cycle: once staff dismiss it for a
+  message, it does not reopen for that same unchanged message.
+- **Bounded replacement search** (applies only to the opt-in automatic fill after a No;
+  off by default since 11 November 2026). Every failure, including one while loading inputs, is
+  recorded with its reason. A job is retried at most three times, then stops and stays in
+  the staff inbox; resolving the item retries it once more. A schedule that keeps changing
+  allows only a few rechecks. A job holds a 15-minute lease, and only the worker that still
+  owns it may save suggestions or record a failure; a worker whose lease was taken over
+  leaves the new owner's job untouched. "No replacement found" creates a staff item.
+- **Allowance reasons.** Sending learns why it cannot send now: parent pacing or a send in
+  flight, the 24-hour allowance, a provider pause, the per-second rate or a reply sent first.
+  Only an exhausted allowance for a parent not already counted holds an offer for staff.
+- **Named Zoho failures.** Each record Zoho does not save becomes a staff task naming the
+  child, date, time and Zoho's reason. Saved records are kept; the batch stays open.
+  Within a failed bulk update, records are retried one at a time so one bad record cannot
+  block the rest. A task closes automatically once its record saves. Zoho's own
+  explanation (for example "Doctor is inactive") is kept, not just its code. A bulk
+  rejection is tied to a child only when the response proves its order; otherwise each
+  unconfirmed child's task lists all of that batch's rejection reasons, marked as
+  unmatched. The command-line push reports failures the same way; if the staff tasks
+  cannot be created, the push error says so and lists the records.
+- **Unsubscribe and subscribe.** A parent who replies exactly `unsubscribe` (any case,
+  spaces ignored) is added to a stored list in the database with the date and their
+  children. While listed, no offers or reminders are sent to that number; held offers show
+  as `UNSUBSCRIBED`, are never assumed accepted at the cutoff, and staff see the list. A
+  reply of exactly `subscribe` removes the number; later offers send normally. Offers held
+  while unsubscribed go back to the queue only if never sent, still pending, every visit is
+  still awaiting confirmation and none is in the past; the normal send checks (active
+  patient, deadline, source sync, contact window) still apply. Others are closed as
+  obsolete and not sent. The list is
+  by phone number, so siblings sharing it are covered together. Both actions are audited.
+  No confirmation message is sent and the child's visits stay scheduled (see questions).
+- **Reminder time.** Sending starts at these times and is then paced by the queue; it is
+  not a deadline for every message. Each unanswered offer gets one reminder, and the
+  parent always has at least one hour with the first offer: an offer sent before 13:00
+  is reminded at 14:00; one sent 13:00–15:00 at 16:00; a later offer (for example a
+  substitute) one hour after it was sent, at any time of day. If that hour would end on
+  the visit day, no reminder is sent. All existing reminder checks still apply.
+  (`tests/test_therapy_schedule_template.py`)
+- **Late reminders.** A reminder that is delayed until the visit day itself is not
+  sent: its "confirm for tomorrow" wording would mislabel today's visit. It is closed as
+  obsolete and the original offer stands. A waiting offer is never given a retry time in
+  the past; if its sending time has already passed, it goes to staff instead.
+  (`tests/test_therapy_schedule_template.py`)
+- **Parent phone format.** Numbers are stored as 91 plus a 10-digit Indian mobile starting
+  6–9. `9876543210`, `09876543210`, `+91 98765 43210` and `0091 9876543210` are converted.
+  A number written with `+` or `00` keeps its country code: only `91` is accepted, so
+  `+65 8123 4567` is flagged, never turned into an Indian number. Anything else, including
+  foreign and landline numbers, is never guessed: that patient is set aside with a staff
+  task while the other patients import.
+
+## Selected production fixes — 8 November 2026
+
+Local implementation; no deployment or live messaging is implied. Regression
+coverage is in `tests/test_production_fixes.py`, the existing daily/absence/admin
+reservation tests, import/contact tests and opt-in Zoho HTTP simulation tests.
+
+- The first successful daily save records `daily_planning_started` in the audit
+  log. Pre-start records or missing history never create catch-up demand. Current
+  week saved visits count towards the existing prescription. Previous-week
+  shortfall is considered only after a complete Monday–Saturday week falls on
+  or after that baseline; an initial partial week does not fabricate a full-week
+  debt. Daily runs do not reset the baseline. Weekly frequencies are not changed.
+- When capacity is scarce, the fast daily planner favours the smallest share of
+  the weekly visit target already booked, within existing absence/carryover
+  priorities; CP-SAT includes a diminishing fairness preference. Patient IDs
+  remain deterministic tie-breakers. This improves distribution, not a guarantee
+  that all demand fits. Existing safety constraints remain mandatory.
+- Saved explicit admin assignment, availability and absence warning overrides
+  are recognised during validation using the recorded decision's warning codes.
+  They do not permit newly generated assignment substitutions or remove overlap
+  checks. A completed pinned therapy remains historical fact when a later
+  therapist absence is recorded; new appointments still cannot enter the absence.
+- Daily planning isolates conflicting saved bookings to independent resource
+  components. A blocked centre retains its saved appointments, gets no new
+  bookings/offers and is surfaced for staff review. Independent centres proceed.
+  Centres sharing a patient or therapist stay coupled for safety. Validation
+  findings for held components are retained in result statistics and unmet reasons.
+- Parent Yes/No application and acknowledgment commit independently of repair.
+  A No releases the agreed visit/day; the released visit stays on the calendar in
+  red as "Needs rescheduling". **User decision (11 November 2026): nothing fills
+  the opening automatically.** Staff open it, choose a child from the ranked
+  Suggested list or by search, then send an offer or confirm without messaging
+  (see "Ranked substitutes"). The former automatic replacement job is opt-in only
+  (`fill_released_after_decline`); a job already queued in an existing database
+  still completes, runs outside the workflow lock, limited to affected openings
+  and centres, and its suggestions stay proposed until staff publish them. A
+  changed snapshot is retried instead of overwriting newer work. Failed events have bounded retries, an inbox item and staff retry
+  through resolution after correction. A repair failure never undoes a decline.
+  Failed replies block exports only for the date to which they apply.
+- Identified patient validation failures are quarantined while valid patients
+  import. Existing appointments are retained, affected patients receive no new
+  automatic offers, and the successful sync checkpoint does not advance. Correcting
+  the row and replaying the same window clears its quarantine. Ambiguous identity,
+  malformed report structure and timestamp-window failures still stop the import.
+  A consultant can become inactive without erasing history or stopping the whole
+  import; future saved bookings require staff review and new generation excludes
+  inactive consultants. Missing contacts hold the affected offers for staff,
+  rather than rolling back the whole calendar save.
+- Zoho report pages request 200 records. Reads, writes and reconciliation share a
+  conservative 48-starts/minute budget and one concurrent response. PostgreSQL
+  deployments coordinate through the shared `zoho_api_call_budget` table and
+  advisory lock; all replicas must use the same database/schema. The optional
+  `ZOHO_BUDGET_DATABASE_URL` selects dedicated coordination storage. SQLite
+  clients share `ZOHO_CALL_BUDGET_FILE` (default: a local temporary-directory
+  budget); multi-host SQLite deployments require shared storage or one integration
+  worker. Storage failures stop calls safely. HTTP 429 without Retry-After waits
+  60 seconds, with at most 180 seconds total rate-limit waiting per read.
+- Export reads are bounded by Scheduler_Key, never the whole historical report.
+  Creates use up to 200 records; updates with identical field changes are grouped
+  using explicit owned IDs. Workflows remain enabled. Acknowledgments are matched
+  by key/ID, never response position, and persisted once per batch. Partial or
+  uncertain outcomes are reconciled by owned keys; saved results are retained,
+  unsuccessful rows remain resumable, and completion waits for all rows. Long
+  pushes refresh tokens after 45 minutes when a refresh token is available.
+- The shared WhatsApp dispatch store tracks unique offer recipients over a
+  rolling 24 hours. `WHATSAPP_UNIQUE_PARENTS_PER_24H` defaults to 2,000 and must be
+  set to the verified account allowance. Uncertain sends conservatively consume
+  budget. Reminders to an already-counted parent do not consume a second unique
+  recipient; acknowledgment replies are not blocked by this offer budget.
+  **User decision:** offers exceeding capacity wait for staff review; there is
+  no automatic patient priority policy. Once capacity is available, resolving
+  their inbox item requeues them subject to validation and the sending deadline.
+- Same-day replacements use date-specific session buttons only inside a verified
+  contact window. Without that window they wait visibly for parent contact;
+  they never use the approved daily template's incorrect tomorrow wording.
+  Future offers wait until their supported sending day, and invalid/past-date
+  offers create staff attention instead of silently disappearing.
+
+Cancellation notifications, partial-visit policy, opt-out handling and app access
+were not authorised in this selected change and retain their existing behaviour.
+Provider allowances and production form workflows still require live/staging
+verification; fictional HTTP tests cannot establish those account-specific facts.
+
 ## Prepared therapy template and timed reminders — 5 November 2026
 
 **Timed sending is disabled.** On 6 November 2026, Meta accepted a one-off test
@@ -18,7 +451,8 @@ validation before activation.
   profile is blocked rather than guessing missing parameters.
 - When timed sending is explicitly enabled, offers saved for tomorrow are held
   until 09:00 IST on the preceding day. The worker queues at most one reminder
-  per offer from 14:00 IST, before the existing reply deadline. Sunday targets
+  per offer from 14:00 IST, before the existing reply deadline (late offers: 16:00
+  or one hour after sending; see "Reminder time" above). Sunday targets
   are skipped; Sunday processing can prepare Monday offers. Missed worker ticks
   can be caught up later the same day; delivery is not guaranteed at an exact
   second. This change does not automate the midnight source pull/review/save.
@@ -176,6 +610,10 @@ The established OR constraints, objectives, slot configuration, validator and we
 accounting are unchanged. The former two-start candidate shortcut has been removed.
 The enabled main application serves
 the complete tested flow at `/` and `/api/`; `/workflow` is a compatibility alias.
+Real-data operations always require the main access key. The hosted no-key
+setting is limited to retained test data. The existing `deploy_main.ps1` targets
+that test installation. The initial real-data rollout uses `MAIN_WORKFLOW_LIVE=false`
+until sending is explicitly approved.
 Main planning and response repair use normal SOLVER_SETTINGS; the separate fictional
 test flow retains its existing shorter search limit.
 
@@ -197,19 +635,35 @@ unavailable in these workflows. The browser generator defaults to tomorrow in
 Asia/Kolkata and shows only that day's draft. Covered by
 `tests/test_main_root_workflow.py`.
 
-Replacement suggestions search all active patients' remaining weekly demand. They
-reuse the scheduler's bundle construction and placement rules: the complete
-released visit must match the assigned doctors, therapies, centre and therapy
-order, use configured continuous slots without crossing lunch, fall within valid plan dates,
-respect patient/doctor availability and exact absence intervals, and leave saved
-bookings and branch capacity intact. Pending confirmations reserve weekly demand.
-Released/no-show records do not reserve demand. Missing explicit availability rows
-use R-13's normal operating-hours default. Suggestions never move a later visit,
-reserve a patient or send a message. Staff review/select before saving. Covered by
-`tests/test_replacement_eligibility.py` and `tests/test_replacements.py`.
-The existing complete-visit checkbox also controls suggestions: when unchecked,
-search only the selected released slot, while preserving the candidate's own
-continuous therapy needs. Refresh eligibility when the scope or saved data changes.
+Replacement suggestions search all active patients' remaining weekly demand. Each
+session a candidate takes must match one of the candidate's own unmet therapies with
+the same assigned doctor, therapy and centre, in the candidate's therapy order; fall
+within valid plan dates; respect patient/doctor availability and exact absence
+intervals; and leave saved bookings and branch capacity intact. Pending
+confirmations reserve weekly demand. Released/no-show records do not reserve demand.
+Missing explicit availability rows use R-13's normal operating-hours default.
+Suggestions never move a later visit, reserve a patient or send a message.
+
+**Ranked substitutes (user decision, 11 November 2026).** Real multi-therapy plans
+almost never matched the former exact whole-visit rule, so a No left every opening
+without suggestions. Now:
+- A substitute may need other therapies too and may take only part of them on that
+  day; they are only being offered a substitute visit.
+- A child already booked that day may take an opening directly before or after
+  their visit when the result is one continuous visit (no lunch crossing, same
+  centre). A separate later visit remains excluded (see D-01). Booking such a joined
+  opening raises no "another visit" warning.
+- The complete-visit checkbox lists only children who can take every released
+  session. Unchecked, it lists everyone who can take the selected session, best fit
+  first: children who can take the whole released visit, then those who can take
+  more of its sessions, then this session only; ties follow waitlist priority, then
+  the most sessions still owed this week. When nobody can take the whole visit the
+  drawer switches to the per-session list. Each suggestion shows its fit.
+- Staff still choose and confirm; nothing is offered automatically.
+
+Covered by `tests/test_replacement_eligibility.py`, `tests/test_replacements.py` and
+`node --test tests/replacement_picker.test.cjs`. Refresh eligibility when the scope
+or saved data changes.
 The isolated test schema has no main waitlist table; its absence means ordinary
 priority. Existing main waitlist priorities are used when that table is present.
 Suggestion reads do not create tables or migrate the selected database.
@@ -229,8 +683,11 @@ In a paused main app, resumed jobs remain held until explicit messaging activati
 Already-sent/uncertain offers keep their actual recipient. Failed delivery receipts
 produce one attributed staff item with numeric provider codes, preserve booking
 status and do not trigger automatic resends. Staff-cutoff acceptance is displayed
-as assumed acceptance rather than an actual parent Yes. These guarantees are
-covered by test_main_workflow.py and test_flow_test_pipeline_guards.py.
+as assumed acceptance rather than an actual parent Yes. In the real-data
+workflow, the cutoff requires a recorded send. Simulated offers stay pending
+for staff review when live messaging is off. Test stores can still exercise
+assumed acceptance using simulated sends. These guarantees are covered by
+test_main_workflow.py and test_flow_test_pipeline_guards.py.
 
 See main_workflow/README.md for contract prerequisites and future commands. Local
 changes do not deploy new Azure code or activate timers. The existing Azure test
@@ -483,10 +940,10 @@ coworker phone does not broaden the absence to other fictional patients.
 A repeated webhook cannot apply the same decline twice. Existing completed therapy
 is never undone; a conflicting day declaration goes to staff review under the
 unchanged response-service validation. Explicit legacy VISIT commands still retain
-their supplied visit scope; DAY is equivalent to the new NO default. The decline uses
-the shared response repair to propose eligible replacements only in released
-openings, retaining pending/no-response visits and unrelated bookings. A proposed
-replacement is reserved demand, not family confirmation. HELP/RESCHEDULE creates
+their supplied visit scope; DAY is equivalent to the new NO default. The decline
+releases only its own visits, retaining pending/no-response visits and unrelated
+bookings; staff choose any replacement (no automatic proposal since 11 November
+2026). A staff-chosen replacement offer is reserved demand, not family confirmation. HELP/RESCHEDULE creates
 an admin task without moving or releasing appointments. Unmatched/stale replies
 are sent to the admin inbox. Delivered/read message receipts are not acceptance.
 Offer snapshots and recipient binding reject replies to changed/closed visits.
@@ -525,7 +982,7 @@ User-approved search correction: daily, replacement and unbounded weekly searche
 consider every valid start in their respective planning boundary. The previous
 two-start-per-day candidate thinning shortcut is removed.
 A 100-child/10-consultant/two-branch regression fits all 100 daily sessions in
-both quick and CP-SAT paths; blocking one doctor-slot reduces that to 99. All
+CP-SAT with short or extended test budgets; blocking one doctor-slot reduces that to 99. All
 existing clash, lunch, availability, assigned-doctor and weekly-target rules remain.
 
 Staff records COMPLETED or NO_SHOW per confirmed therapy, allowing partial visit
@@ -548,6 +1005,8 @@ booking for a now-inactive patient must be regenerated before saving. Deactivati
 withdraws current and future proposals and offers that are still waiting to send.
 Offers that may have reached a family go to staff review and are excluded from
 assumed acceptance at the Zoho export cutoff while the patient is inactive.
+A WhatsApp Yes received while the patient is inactive goes to staff review and
+does not confirm the visit or send a confirmation.
 Confirmed appointments and past attendance are retained. Existing replies,
 attendance, and appointment outcome exports continue to use the existing
 workflow. Patient scheduling status and reasons are stored internally.
@@ -557,23 +1016,23 @@ workflow. Patient scheduling status and reasons are stored internally.
 | ID | Rule | Status | Current behavior or work needed |
 |---|---|---|---|
 | R-01 | A child must not attend two different locations on the same day. If the treatment plan uses Location A and Location B, those therapies must be placed on different days. | **Implemented** | New therapy groups are split by location and placed on different days. The final safety check also rejects saved or manually moved schedules that put one child at multiple locations on the same day. |
-| R-02 | Therapies during one visit should be continuous so the child does not have to wait between therapies. | **Implemented** | Therapies in a group are placed back-to-back and in treatment-plan order. |
+| R-02 | Therapies during one visit should be continuous so the child does not have to wait between therapies. | **Implemented** | New visits are placed back-to-back in treatment-plan order. If an absence, cancellation or no-show removes a middle session from a saved visit, validation preserves the remaining bookings and verifies the gap against the original released slot. The released slot does not count as booked therapy. Covered by `tests/test_absence.py`. |
 | R-03 | A continuous therapy group must not cross the lunch break, 12:35–13:15. Sessions may start at 13:15. | **Implemented** | Morning and afternoon are treated as separate blocks. The weekly calendar displays the actual lunch gap from the shared slot configuration, rather than shading the first afternoon slot. |
 | R-04 | Every treatment requirement must be delivered only by its assigned therapist. | **Implemented** | Therapist continuity is a hard constraint. If the assigned therapist is absent, unavailable, inactive, or fully booked, the scheduler records the session as unmet and carries it forward where applicable; it never assigns another therapist. |
 | R-05 | Generate tomorrow's draft only from the browser. | **Implemented** | Tomorrow is calculated in Asia/Kolkata. The generator counts saved visits for the full Monday–Saturday week and restricts new placements and preview saves to tomorrow. See `tests/test_web_app.py` and `tests/test_main_root_workflow.py`. |
 | R-06 | Running the scheduler again with new data must not rearrange the existing weekly schedule unnecessarily. | **Implemented for saved appointments** | Proposed, pending, confirmed, completed, and manually changed appointments in the selected Monday–Saturday week are kept in place. Only unmet needs are placed into remaining openings. Unsaved previews are not permanent and may be regenerated. |
 | R-07 | Manual changes made by management or an administrator take priority. The scheduler must preserve them and work around them. | **Implemented for saved manual moves** | Staff can move an appointment or its complete continuous group. The change is checked for clashes, recorded as manual, and protected during later scheduling runs. An explicit lock/unlock policy remains in `questions.md`. |
-| R-08 | When a child or therapist absence releases an appointment, the affected requirement must receive priority without rearranging unrelated saved appointments. | **Implemented** | Staff can record an absence. Daily replacement review keeps unrelated saved appointments fixed and considers eligible patients for released openings. |
+| R-08 | When a child or therapist absence releases an appointment, the affected requirement must receive priority without rearranging unrelated saved appointments. | **Implemented** | A daily draft gives priority to outstanding released requirements from the current week through its target day. Saved visits stay fixed. |
 | R-09 | In the daily workflow, fill cancellations from eligible patients' remaining weekly demand without moving later appointments. | **Implemented** | Latest user correction: plan one day only and search all patients for matching doctor, therapy and centre, valid continuous visits and remaining weekly requirements. Staff select and review a replacement before reserving or offering it. Multiweek planning and pull-forward chains are excluded from the daily workflow. See replacement eligibility tests above. |
-| R-10 | Schedule as many required therapies as safely possible and allow a longer search when it can produce a better result. | **Implemented with four search choices** | The browser scheduler always runs in Best Effort mode. For large workloads, the 20-second quick preview uses a validated greedy pass that returns promptly; it applies the same therapist, branch, availability, continuity, capacity, one-visit-per-day, and plan-date rules. The 1-minute thorough, 2-minute extended, and 5-minute deep choices use the CP-SAT optimizer. Every choice reports unmet therapy rather than failing the whole schedule. |
+| R-10 | Schedule as many required therapies as safely possible and allow enough search time per independent centre. | **Implemented: five minutes per production centre/group** | Production daily planning always uses CP-SAT in Best Effort mode, with up to 300 seconds per independent centre/resource group, sequentially; shared patients/therapists keep centres coupled. Search returns early on proof of optimality/infeasibility. A timeout retains a validated FEASIBLE incumbent; no solution means no saveable new draft. There is no size-based greedy bypass. Background preview jobs keep long searches outside HTTP request lifetimes and outside the workflow lock. Explicit shorter fixture/legacy search choices remain CP-SAT and apply per component. |
 | R-11 | A child added after the schedule was created may use a matching therapist’s free future slot without disturbing existing appointments. | **Implemented** | On the next run, the new child’s active treatment requirements are included, all saved active appointments remain fixed, and only suitable remaining openings are considered. |
 | R-12 | Every unmet therapy should show the main reason it was not placed and any other constraints that contributed. | **Implemented** | The unmet-demand report now distinguishes therapist contention, location saturation, the one-visit-per-day limit, fixed availability or absence restrictions, continuous-block restrictions, and a search ending before an otherwise valid opening was used. This diagnostic does not change the generated timetable. |
 | R-13 | Active therapists work every configured slot from Monday through Saturday unless they are marked absent; children may attend any configured slot. | **Implemented** | This is a manager-confirmed operating policy. It creates availability records for all active therapists and patients during import, without assigning a time preference. |
 | R-14 | `Plan_Detail` is the source of demand for the active scheduler. | **Implemented** | The approved source sheets are persisted as `plan_detail`, `therapist_master`, and `specialty_master` tables. The scheduler projection is built from those tables: each valid row in a child's latest plan version creates a treatment requirement with its registration ID, therapy type, weekly frequency, assigned therapist, branch, duration, and plan start date. Exact duplicate rows and non-positive frequencies are excluded with import warnings. |
 | R-16 | Therapy and specialty names must use `Specialty_Master` canonical values. | **Implemented** | The importer validates therapy types against the master mapping and stores its canonical specialty. A differing supplied specialty is normalized and logged for review. |
-| R-17 | A patient absence or cancellation should show children who can fill the released appointment without breaking therapist continuity. | **Implemented** | Selecting a released appointment in Operations opens a dedicated **Possible replacements** drawer. Candidates need the same therapy, branch, and assigned therapist; must be available and not absent at the exact opening; and must still have an unmet weekly target. Suggestions never reassign the therapist or book anyone automatically. |
+| R-17 | A patient absence or cancellation should show children who can fill the released appointment without breaking therapist continuity. | **Implemented** | Selecting a released appointment in Operations opens a dedicated **Possible replacements** drawer. Candidates need the same therapy, branch, and assigned therapist; must be available and not absent at the exact opening; and must still have an unmet weekly target. They may need other therapies too, and a child already coming that day qualifies only when the opening joins their visit. Children who can take the whole released visit are listed first, then those who can take more of it, then single sessions. Suggestions never reassign the therapist or book anyone automatically. |
 | R-22 | A patient's recurring preferred day and morning/afternoon time band must influence scheduling without preventing therapy when another available time is the only safe option. | **Implemented** | The patient preference table stores Patient ID, preferred day, and preferred morning or afternoon band. The scheduler considers all valid candidate starts and rewards the preferred day/time combination. |
-| R-23 | Report remaining weekly demand after generating the daily draft. | **Implemented** | The draft reports weekly sessions still unplaced and leaves later dates for separate daily runs. |
+| R-23 | Give unmet weekly targets priority in the following week, without inventing pre-start history. | **Implemented** | Daily drafts add a previous Monday–Saturday shortfall only when that full week is on or after the first saved daily-run baseline. Missing pre-start history adds nothing. Saved and completed sessions count toward the target; new placements remain on the selected date. Covered by daily capacity and production regression tests. |
 | R-20 | Today's-session views must allow an operator to narrow the displayed appointments by branch, therapist, and patient. | **Implemented** | The dashboard filters the current day's loaded appointments in the browser and updates the displayed count. Filtering does not alter appointments or scheduling rules. |
 | R-15 | Repeated visits should have a gap wherever capacity permits. | **Implemented as a preference** | The scheduler prefers even spacing—such as Monday, Wednesday, Friday for 3× weekly—but will use consecutive or wider-gap days when that is the only way to meet weekly demand. Therapies belonging to the same visit remain continuous. |
 | R-18 | A child’s therapy must be delivered at the branch recorded on the treatment plan. | **Implemented** | The scheduler uses the `Plan_Detail` branch as the appointment location and only considers therapist capability at that branch. |
@@ -653,7 +1112,10 @@ in place or superseded by the chosen patient's reservation, without moving unrel
 appointments. A slot already reserved by another request must be refreshed; duplicate
 submissions of the same request must not create another booking. Invalid references
 and stale previews are input/concurrency errors, not clinical-policy restrictions.
-An off-plan reservation does not satisfy an unrelated therapy's weekly target.
+An off-plan reservation occupies the saved time and does not satisfy an unrelated
+therapy's weekly target. Generation and replacement search account for it the
+same way as weekly progress. The assigned-therapist check still applies to every
+new solver placement.
 For a patient without any requirement row, an inactive zero-frequency technical row
 marked `ADMIN_RESERVATION_ONLY` maintains the appointment relationship; it is not an
 active clinical plan and creates no solver demand. Local reservations use the
@@ -797,8 +1259,8 @@ A child scheduled on Thursday cancels. The intended workflow is:
 - The first run fetches all relevant rows before its cutoff. Later runs query
   Added Time OR Modified Time in `[last successful checkpoint, new cutoff)`.
   Criteria use Asia/Kolkata boundaries for both fields. Both are compared as UTC
-  instants on import; the saved checkpoint remains UTC. For a 03:00 IST cutoff,
-  both Zoho fields use 03:00 IST and the stored checkpoint uses 21:30 UTC on the previous date.
+  instants on import; the saved checkpoint remains UTC. For a 00:00 IST cutoff,
+  both Zoho fields use 00:00 IST and the stored checkpoint uses 21:30 UTC on the previous date.
   All report pages must finish before import. Source deltas merge by Creator ID;
   missing rows mean no change, never deletion. Valid empty windows preserve data
   and advance the checkpoint. Data, source cache and checkpoint commit atomically;
@@ -812,7 +1274,9 @@ A child scheduled on Thursday cancels. The intended workflow is:
   may have made their cached modification times appear too recent.
   Existing booking/history guards still apply. Incremental API requests must
   declare Added_Time=Asia/Kolkata and Modified_Time=Asia/Kolkata; old clients cannot silently
-  advance the checkpoint. Invalid imports preserve the old cache and checkpoint.
+  advance the checkpoint. Structural failures preserve the old cache and checkpoint.
+  Identified patient errors use the 8 November quarantine rules: valid patients
+  may update while the checkpoint is retained for replay.
 - The user removed the A–H/count/name-prefix fixture limits. Any valid Registration
   ID and any number of consultants may be imported from the authorized test app
   across the branches in that test app. Initial input needs at least one plan and consultant. A
@@ -842,8 +1306,10 @@ A child scheduled on Thursday cancels. The intended workflow is:
   for fixed-booking validation. New doctor/branch assignments on requirements with
   history remain pending staff review, retaining the existing requirement while
   other valid records import; a warning recurs until that conflict is resolved.
-  Consultant capability/status changes with history and Registration ID mutations
-  still require deliberate review. Sync never resets or rewrites appointment history.
+  Consultant capability changes with history and Registration ID mutations
+  still require deliberate review. Status-only deactivation preserves history and
+  creates a booking-review item without blocking valid imports. Sync never resets
+  or rewrites appointment history.
   Per the user's instruction, valid Parent No.
   values from the authorized Zoho test records supply the recipient bindings
   directly; no additional manually configured number pool is required. Imported
@@ -860,7 +1326,7 @@ A child scheduled on Thursday cancels. The intended workflow is:
   draft with the existing review/save controls, refreshing against current bookings.
   Only an explicit staff save publishes offers. No sync or timer sends WhatsApp.
 - The Azure job launcher defaults to a manual job and requires a successful live
-  test import first. `-EnableDailySchedule` configures 03:00 IST (21:30 UTC).
+  test import first. `-EnableDailySchedule` configures 00:00 IST (21:30 UTC).
   Deployment and a live test import are still required after these local changes.
 
 Covered by `tests/test_flow_test_zoho.py`, `tests/test_flow_test_zoho_incremental.py`,
@@ -879,18 +1345,19 @@ and the opt-in `tests/test_zoho_http_reliability.py` Postman HTTP checks.
 - OAuth refresh, report pages and export schema reads retry connection failures,
   response transport interruptions and HTTP 408/429/500/502/503/504. Each read
   allows four total attempts, with exponential waits starting at one second plus
-  jitter, and at most 45 seconds of cumulative waiting (request timeout time is
-  separate). Numeric and HTTP-date Retry-After values are respected. A provider
+  jitter, and at most 45 seconds of cumulative waiting for non-429 errors (request
+  timeout time is separate). HTTP 429 permits up to 180 seconds of waiting, with
+  a 60-second cooldown when Retry-After is absent. Numeric and HTTP-date Retry-After values are respected. A provider
   delay exceeding the remaining budget stops the operation; it is never shortened.
   Permission, validation and malformed JSON failures are not automatically retried.
 - A failed fetch never calls the importer with partial pages. Import projections,
-  source cache and successful checkpoint still commit atomically. Invalid source
-  records block the whole import and create a durable, deduplicated staff inbox
-  item identifying the report, record where available, reason and correction step.
-  The inbox item commits separately after rollback. Staff correct Zoho and replay
-  the same window; no record is skipped and no checkpoint moves past invalid data.
-  The first blocking validation issue is shown per attempt; staff close its review
-  item after correcting it. No patient record bodies or credentials are logged.
+  source cache and successful checkpoint still commit atomically. Structural or
+  identity/window failures block the import and create a durable staff inbox item
+  after rollback. Identified patient errors are quarantined while valid patients
+  import; the checkpoint stays put. Staff correct Zoho and replay the same window.
+  Corrected quarantine items close automatically. No checkpoint moves past invalid
+  data, and quarantined patients receive no new automatic offers. No patient
+  record bodies or credentials are logged.
 - Exports retain their frozen batch, acknowledged rows and stable Scheduler_Key
   across interruption/restart. Zoho must enforce No duplicate values on that key;
   the existing schema preflight remains mandatory. On an uncertain/rejected write,

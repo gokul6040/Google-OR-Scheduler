@@ -93,12 +93,12 @@ def test_invalid_delta_and_stale_execution_never_advance_checkpoint(flow, report
     initial(flow, reports)
     incoming = new_records(reports)
     incoming["Plan_Report"][0]["Schedule"] = "Psychology Therapy Session, 1, 3, Missing Doctor"
-    with pytest.raises(ValueError, match="consultant match"):
-        apply_reports(flow, incoming, START, window={"from": FIRST, "to": SECOND})
+    result = apply_reports(flow, incoming, START, window={"from": FIRST, "to": SECOND})
+    assert result["partial"] and result["quarantined"]
     assert checkpoint(flow) == FIRST
     with flow.sessions() as session:
         assert session.scalar(select(func.count(Patient.id))) == 8
-        assert session.scalar(select(func.count(Therapist.id)).where(Therapist.therapist_code == "ZC-900002")) == 0
+        assert session.scalar(select(func.count(Therapist.id)).where(Therapist.therapist_code == "ZC-900002")) == 1
     with pytest.raises(ValueError, match="checkpoint changed"):
         apply_reports(flow, delta(), START, window={"from": None, "to": SECOND})
     assert checkpoint(flow) == FIRST
@@ -446,7 +446,7 @@ def test_utc_cache_migration_retains_missing_rows_dates_and_bookings(flow, repor
 
 @pytest.mark.parametrize("field,value,reason", [
     ("Schedule", "Psychology Therapy Session, 1, 3, Missing Doctor", "consultant match"),
-    ("Parent_No", "bad-phone", "international parent phone"),
+    ("Parent_No", "bad-phone", "letters or symbols"),
     ("Added_Time", "invalid-time", "Added_Time/Modified_Time"),
     ("ID", "", "source record ID"),
 ])
@@ -460,6 +460,19 @@ def test_invalid_source_record_is_durably_flagged_without_partial_import(flow, r
         cached = session.get(FlowSetting, "zoho_test_source").value
     incoming = new_records(reports)
     incoming["Plan_Report"][0][field] = value
+    if field in {"Schedule", "Parent_No"}:
+        for _ in range(2):
+            result = apply_reports(flow, incoming, START, window={"from": FIRST, "to": SECOND})
+            assert result["partial"] and result["quarantined"]
+        assert checkpoint(flow) == FIRST
+        assert flow.state(START)["appointments"] == before
+        with flow.sessions() as session:
+            issues = list(session.scalars(select(FlowInbox).where(FlowInbox.event_key.like("zoho-quarantine:%"))))
+            assert len(issues) == 1 and issues[0].resolved == 0
+            assert reason in issues[0].text
+        apply_reports(flow, new_records(reports), START, window={"from": FIRST, "to": SECOND})
+        assert checkpoint(flow) == SECOND
+        return
     for _ in range(2):
         with pytest.raises(ValueError, match=reason):
             apply_reports(flow, incoming, START, window={"from": FIRST, "to": SECOND})

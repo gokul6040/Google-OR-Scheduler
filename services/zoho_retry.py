@@ -47,10 +47,13 @@ def retry_read(operation: Callable[[], T]) -> T:
                 if exc.code not in TRANSIENT_STATUS:
                     raise
                 delay = retry_after_seconds(exc.headers.get("Retry-After")) if exc.headers else 0.0
+                if exc.code == 429 and not delay:
+                    delay = 60.0
             if attempt == MAX_ATTEMPTS - 1:
                 raise
             delay = max(delay, 2 ** attempt + random.uniform(0, 0.25 * 2 ** attempt))
-            if waited + delay > MAX_WAIT_SECONDS:
+            budget = 180.0 if isinstance(exc, HTTPError) and exc.code == 429 else MAX_WAIT_SECONDS
+            if waited + delay > budget:
                 raise
             if isinstance(exc, HTTPError):
                 exc.close()

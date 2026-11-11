@@ -57,6 +57,7 @@ class DispatchControl:
             raise ValueError("WHATSAPP_OUTAGE_RECIPIENTS must be at least 2 distinct parents")
         self.window = integer_setting("WHATSAPP_OUTAGE_WINDOW_SECONDS", 60, 3600)
         self.cooldown = integer_setting("WHATSAPP_OUTAGE_PAUSE_SECONDS", 30, 3600)
+        self.daily_limit = integer_setting("WHATSAPP_UNIQUE_PARENTS_PER_24H", 2000, 10000000)
         # Global control lock is independent of workflow schema and queue locks.
         self.lock = WorkflowLock(self.engine, "control", self.schema)
         if self.schema is None:
@@ -93,19 +94,37 @@ class DispatchControl:
         return hashlib.sha256(recipient.encode()).hexdigest()
 
     def reserve(self, phone_id: str, recipient: str, owner: str, *, priority: bool = False) -> dict | None:
-        """Reserve immediately or return; never sleep holding a queue lock."""
+        """Reserve immediately or return None; never sleep holding a queue lock."""
+        return self.reserve_with_reason(phone_id, recipient, owner, priority=priority)[0]
+
+    def reserve_with_reason(self, phone_id: str, recipient: str, owner: str, *,
+                            priority: bool = False) -> tuple[dict | None, str | None]:
+        """Reserve, or explain the refusal.
+
+        Reasons: ``recipient_busy`` (6-second pacing or a send in flight to this parent),
+        ``allowance`` (24-hour unique-parent allowance used up by other parents),
+        ``paused`` (provider outage pause or probe), ``rate`` (per-second limit) and
+        ``priority`` (a reply is being sent first). Only ``allowance`` is a lasting block.
+        """
         with self.state(phone_id) as (state, now):
             starts = [stamp for stamp in state.get("starts", []) if stamp > now - 1]
             parents = {key: until for key, until in state.get("parents", {}).items() if until > now}
             inflight = {key: item for key, item in state.get("inflight", {}).items() if item["until"] > now}
             key = self.recipient_key(recipient)
             if key in parents or key in inflight:
-                return None
+                return None, "recipient_busy"
+            reached = {key: stamp for key, stamp in state.get("initiated", {}).items() if stamp > now - 86400}
+            state["initiated"] = reached
+            if not priority and key not in reached and len(reached) >= self.daily_limit:
+                return None, "allowance"
             if priority:
                 state["priority_until"] = now + 1
-            if (state.get("open_until", 0) > now or state.get("probe_until", 0) > now
-                    or len(starts) >= self.rate or (not priority and state.get("priority_until", 0) > now)):
-                return None
+            if state.get("open_until", 0) > now or state.get("probe_until", 0) > now:
+                return None, "paused"
+            if len(starts) >= self.rate:
+                return None, "rate"
+            if not priority and state.get("priority_until", 0) > now:
+                return None, "priority"
             probe = bool(state.get("open_until"))
             if probe:
                 # Only one probe may be in flight across processes. An abandoned
@@ -118,7 +137,10 @@ class DispatchControl:
             state["parents"] = parents
             inflight[key] = {"owner": owner, "until": now + 120}
             state["inflight"] = inflight
-            return {"generation": state["generation"], "probe": probe, "owner": owner}
+            if not priority:
+                # Reserve before network I/O; uncertain sends still consume budget.
+                reached[key] = now
+            return {"generation": state["generation"], "probe": probe, "owner": owner}, None
 
     def outcome(self, phone_id: str, recipient: str, ticket: dict, exc: Exception | None) -> None:
         provider_failure = (isinstance(exc, (WhatsAppDeliveryError, OSError)) and (
@@ -153,7 +175,10 @@ class DispatchControl:
 
     def summary(self, phone_id: str) -> dict:
         with self.state(phone_id) as (state, now):
-            return {"open_until": state.get("open_until"), "probing": state.get("probe_until", 0) > now}
+            used = sum(stamp > now - 86400 for stamp in state.get("initiated", {}).values())
+            return {"open_until": state.get("open_until"), "probing": state.get("probe_until", 0) > now,
+                    "budget_used": used, "budget_limit": self.daily_limit,
+                    "budget_remaining": max(0, self.daily_limit - used)}
 
 
 def main() -> None:

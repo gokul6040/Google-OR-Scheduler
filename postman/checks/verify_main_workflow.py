@@ -138,12 +138,17 @@ def main():
             assert state()["appointments"] == unchanged_bookings
             exported = api("zoho/export/push", {"date": str(target)})
             assert exported["created"] > 0
+            if use_test_data:
+                assert exported["assumedAcceptedVisits"] > 0
+            else:
+                assert exported["assumedAcceptedVisits"] == 0 and exported["awaitingStaff"]
+                assert state()["appointments"] == unchanged_bookings
             assert command("main_workflow.push", "--date", str(target), "--apply")["pushed"] == 0
             checkpoint = api("zoho/status")["checkpoint"]
             time.sleep(1.1)
             command("main_workflow.sync", "--apply", success=False, failure_source=True)
             assert api("zoho/status")["checkpoint"] == checkpoint
-            # Cutoff confirms silent offers; compare only the already explicit outcomes.
+            # Explicit outcomes remain the same in either workspace.
             assert next(a for a in state()["appointments"] if a["id"] == b["id"])["status"] == "COMPLETED"
             assert next(a for a in state()["appointments"] if a["id"] == released["id"])["status"] == "NEEDS_RESCHEDULING"
             print(json.dumps({"source_import": "passed", "shared_main_ui_review_save": "passed",

@@ -1,8 +1,10 @@
 """Contract checks for the therapy template and timed sending."""
 
-from datetime import datetime, time
+from datetime import date, datetime, time, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
+
+import pytest
 
 from flow_test.models import FlowJob
 from flow_test.service import FlowTest, TestTransport
@@ -81,6 +83,83 @@ def test_saved_initial_request_waits_until_nine_ist(monkeypatch):
     assert job.status == "RETRY_WAIT"
     assert job.next_attempt_at == datetime(2026, 11, 8, 3, 30)
     assert job.attempts == 0
+
+
+def test_reminder_delayed_to_the_visit_day_is_closed_not_retried_in_the_past(monkeypatch):
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 19, 8, tzinfo=ZoneInfo("Asia/Kolkata")).astimezone(tz)
+
+    monkeypatch.setattr(template, "datetime", Clock)
+    flow = SimpleNamespace(transport=SimpleNamespace(mode="template", profile=template.PROFILE, timed_schedule=True))
+    payload = {"template_profile": template.PROFILE, "template_timed": True, "reminder": True,
+               "recipient": "fictional", "token": "fictional-token", "fields": {"date": "2026-10-19"},
+               "not_before": datetime(2026, 10, 18, 14, tzinfo=ZoneInfo("Asia/Kolkata")).timestamp()}
+    job = SimpleNamespace(attempts=1, next_attempt_at=None)
+    assert not template.prepare_template_job(flow, None, job, payload)
+    # Previously: RETRY_WAIT at 09:00 on 18 October, already in the past.
+    assert job.status == "OBSOLETE" and job.next_attempt_at is None
+    assert "visit day" in job.error
+
+
+@pytest.mark.parametrize("sent,expected", [
+    ("2026-11-08 09:00", "2026-11-08 14:00"),  # Normal morning offer: 2 PM.
+    ("2026-11-08 13:00", "2026-11-08 14:00"),  # Exactly one hour before 2 PM.
+    ("2026-11-08 13:55", "2026-11-08 16:00"),  # Too close to 2 PM: 4 PM instead.
+    ("2026-11-08 15:00", "2026-11-08 16:00"),  # Sent after 2 PM: 4 PM.
+    ("2026-11-08 15:30", "2026-11-08 16:30"),  # Too close to 4 PM: one hour later.
+    ("2026-11-08 18:10", "2026-11-08 19:10"),  # Late substitute offer: one hour later.
+    ("2026-11-07 18:00", "2026-11-08 14:00"),  # Sent the evening before: 2 PM.
+    ("2026-11-08 23:30", None),                # The hour ends on the visit day: none.
+])
+def test_reminder_time_gives_every_parent_at_least_an_hour(sent, expected):
+    ist = ZoneInfo("Asia/Kolkata")
+    accepted = datetime.strptime(sent, "%Y-%m-%d %H:%M").replace(tzinfo=ist).astimezone(timezone.utc).replace(tzinfo=None)
+    due = template.reminder_due(accepted, date(2026, 11, 8))
+    assert (due.strftime("%Y-%m-%d %H:%M") if due else None) == expected
+
+
+def test_offer_sent_just_before_two_is_reminded_at_four(tmp_path, legacy_flow_scenario, workflow_clock, monkeypatch):
+    import hashlib
+    import json
+    from sqlalchemy import select
+    from flow_test.models import FlowOffer
+
+    ist = ZoneInfo("Asia/Kolkata")
+    clock = {"now": datetime(2026, 10, 18, 14, 5, tzinfo=ist)}
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"].astimezone(tz)
+
+    flow = FlowTest(f"sqlite:///{(tmp_path / 'reminder.sqlite').as_posix()}", scenario=legacy_flow_scenario)
+    try:
+        workflow_clock(date(2026, 10, 18), 9)
+        flow.generate(date(2026, 10, 19))
+        flow.publish(date(2026, 10, 19))
+        monkeypatch.setattr(template, "datetime", Clock)
+        sent = datetime(2026, 10, 18, 13, 55, tzinfo=ist).astimezone(timezone.utc).replace(tzinfo=None)
+        with flow.sessions.begin() as session:
+            offer = session.scalar(select(FlowOffer).limit(1))
+            offer.expires_at = datetime(2026, 10, 19, 0, 0)
+            key = hashlib.sha256(f"offer:{offer.token}".encode()).hexdigest()
+            job = session.scalar(select(FlowJob).where(FlowJob.event_key == key))
+            payload = json.loads(job.payload)
+            payload.update(template_profile=template.PROFILE, fields={"date": "2026-10-19", "message_context": "."})
+            job.payload, job.status, job.message_id, job.accepted_at = json.dumps(payload), "SENT", "dummy", sent
+        flow.transport = SimpleNamespace(mode="template", profile=template.PROFILE, timed_schedule=True)
+        flow.live = True
+        assert template.queue_daily_reminders(flow) == 0  # 2:05 PM: only 10 minutes after the offer.
+        clock["now"] = datetime(2026, 10, 18, 16, 0, tzinfo=ist)
+        assert template.queue_daily_reminders(flow) == 1
+        with flow.sessions() as session:
+            reminder = next(json.loads(item.payload) for item in session.scalars(select(FlowJob))
+                            if json.loads(item.payload).get("reminder"))
+        assert reminder["not_before"] == clock["now"].timestamp()
+    finally:
+        flow.engine.dispose()
 
 
 def test_successful_reminder_does_not_extend_the_original_reply_deadline():

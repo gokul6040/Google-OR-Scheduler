@@ -26,26 +26,33 @@ def validate_schedule(problem: SchedulingProblem, appointments: list[ScheduledAp
     patient_slots = Counter((a.patient_id, a.date, a.slot_index) for a in appointments)
     location_slots = Counter((a.location_id, a.date, a.slot_index) for a in appointments)
     patient_day_locations: dict[tuple[int, object], set[int]] = defaultdict(set)
+    pinned = set(problem.pinned)
 
     for appointment in appointments:
+        accepted = set(appointment.overridden_warnings) if appointment in pinned else set()
         requirement = requirement_map.get(appointment.requirement_id)
-        if not requirement or (
+        mismatched_assignment = requirement is None or (
             appointment.therapist_id != requirement.therapist_id
             or appointment.department_id != requirement.department_id
-        ):
+        )
+        saved_off_plan = appointment in pinned and (
+            not appointment.counts_toward_requirement or appointment.assignment_override
+        )
+        if mismatched_assignment and not saved_off_plan:
             issues.append(ValidationIssue("wrong_therapist", "Assigned therapist/department mismatch."))
         if not 0 <= appointment.slot_index < len(SLOTS):
             issues.append(ValidationIssue("invalid_slot_durations", "Unknown slot index."))
-        if (appointment.therapist_id, appointment.date, appointment.slot_index) in problem.absences:
+        completed_history = appointment in pinned and appointment.status == "COMPLETED"
+        if not completed_history and "THERAPIST_ABSENCE" not in accepted and (appointment.therapist_id, appointment.date, appointment.slot_index) in problem.absences:
             issues.append(ValidationIssue("absence_conflicts", "Therapist is absent."))
-        if (appointment.patient_id, appointment.date, appointment.slot_index) in problem.patient_absences:
+        if "PATIENT_ABSENCE" not in accepted and (appointment.patient_id, appointment.date, appointment.slot_index) in problem.patient_absences:
             issues.append(ValidationIssue("patient_absence_conflicts", "Patient is absent."))
         weekday = appointment.date.weekday()
-        if (appointment.therapist_id, weekday, appointment.slot_index) not in problem.therapist_availability:
+        if "THERAPIST_UNAVAILABLE" not in accepted and (appointment.therapist_id, weekday, appointment.slot_index) not in problem.therapist_availability:
             issues.append(ValidationIssue(
                 "therapist_availability_conflicts", "Therapist is unavailable in the requested slot."
             ))
-        if (appointment.patient_id, weekday, appointment.slot_index) not in problem.patient_availability:
+        if "PATIENT_UNAVAILABLE" not in accepted and (appointment.patient_id, weekday, appointment.slot_index) not in problem.patient_availability:
             issues.append(ValidationIssue(
                 "patient_availability_conflicts", "Patient is unavailable in the requested slot."
             ))
@@ -74,6 +81,15 @@ def validate_schedule(problem: SchedulingProblem, appointments: list[ScheduledAp
         dates = {item.date for item in bundle_appointments}
         slots = sorted(item.slot_index for item in bundle_appointments)
         locations = {item.location_id for item in bundle_appointments}
+        patients = {item.patient_id for item in bundle_appointments}
+        if (slots[-1] - slots[0] + 1 > len(slots) and len(dates) == len(locations) == 1
+                and len(patients) == 1 and pinned.issuperset(bundle_appointments)):
+            # An explicitly released session can leave a gap in a saved visit.
+            # Use it only to validate the original sequence, never as capacity or demand.
+            first = bundle_appointments[0]
+            visit = (first.patient_id, first.date, first.location_id, first.bundle_id)
+            slots = sorted(slots + [slot for slot in range(slots[0] + 1, slots[-1])
+                                    if slot not in slots and (*visit, slot) in problem.released_bundle_slots])
         if (
             len(dates) != 1
             or len(locations) != 1

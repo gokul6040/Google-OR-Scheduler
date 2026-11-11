@@ -11,10 +11,10 @@ from sqlalchemy.orm import Session
 
 from config import SOLVER_SETTINGS, SolverSettings
 from database.models import (
-    AdminSlotReservation, Appointment, AppointmentStatus, AuditLog, ParentAvailabilityResponse,
+    Appointment, AppointmentStatus, AuditLog, ParentAvailabilityResponse,
     Patient, PatientAbsence, TreatmentRequirement,
 )
-from database.repository import load_scheduling_problem
+from database.repository import load_scheduling_problem, off_plan_appointment_ids
 from scheduling.response_repair import fill_released_openings, suggest_declined_visits
 from scheduling.types import ScheduledAppointment, UnmetRequirement
 
@@ -99,9 +99,7 @@ def weekly_progress(
     end = start + timedelta(days=5)
     appointments = list(session.scalars(select(Appointment).where(
         Appointment.date >= start, Appointment.date <= end,
-        Appointment.id.notin_(select(AdminSlotReservation.appointment_id).where(
-            AdminSlotReservation.counts_toward_requirement.is_(False),
-        )),
+        Appointment.id.notin_(off_plan_appointment_ids()),
     )))
     completed = Counter(
         item.treatment_requirement_id for item in appointments
@@ -126,12 +124,13 @@ def weekly_progress(
     ]
 
 
-def _scheduled(item: Appointment) -> ScheduledAppointment:
+def _scheduled(item: Appointment, *, counts_toward_requirement: bool) -> ScheduledAppointment:
     return ScheduledAppointment(
         patient_id=item.patient_id, requirement_id=item.treatment_requirement_id,
         therapist_id=item.therapist_id, department_id=item.department_id,
         location_id=item.location_id, date=item.date, slot_index=item.slot_index,
         bundle_id=item.bundle_id or f"PIN-{item.id}", status=item.status.value,
+        counts_toward_requirement=counts_toward_requirement,
     )
 
 
@@ -185,6 +184,9 @@ def process_daily_responses(
     target_date: date,
     *,
     settings: SolverSettings = SOLVER_SETTINGS,
+    repair: bool = True,
+    include_progress: bool = True,
+    event_ids: set[str] | None = None,
 ) -> DailyResponseResult:
     """Apply queued replies and persist tentative replacements on this date only.
 
@@ -197,19 +199,22 @@ def process_daily_responses(
     session.flush()
     result = DailyResponseResult(target_date)
     with session.begin_nested():
-        responses = list(session.scalars(select(ParentAvailabilityResponse).where(
+        query = select(ParentAvailabilityResponse).where(
             ParentAvailabilityResponse.appointment_date == target_date,
             ParentAvailabilityResponse.processed_at.is_(None),
-        ).order_by(ParentAvailabilityResponse.event_id).with_for_update()))
+        )
+        if event_ids is not None:
+            query = query.where(ParentAvailabilityResponse.event_id.in_(event_ids))
+        responses = list(session.scalars(query.order_by(ParentAvailabilityResponse.event_id).with_for_update()))
         groups = _response_groups(session, responses)
-        released = []
+        released_appointments = []
         for (reply, scope), group in groups.values():
             if reply == "YES":
                 for item in group:
                     item.status = AppointmentStatus.CONFIRMED
                     result.kept_appointment_ids.append(item.id)
             else:
-                released.extend(_scheduled(item) for item in group)
+                released_appointments.extend(group)
                 slots = [item.slot_index for item in group]
                 session.add(PatientAbsence(
                     patient_id=group[0].patient_id, date=target_date,
@@ -222,7 +227,13 @@ def process_daily_responses(
                     item.status = AppointmentStatus.NEEDS_RESCHEDULING
                     result.released_appointment_ids.append(item.id)
         session.flush()
-        if released:
+        if released_appointments and repair:
+            off_plan = set(session.scalars(select(Appointment.id).where(
+                Appointment.id.in_([item.id for item in released_appointments]),
+                Appointment.id.in_(off_plan_appointment_ids()),
+            )))
+            released = [_scheduled(item, counts_toward_requirement=item.id not in off_plan)
+                        for item in released_appointments]
             start = target_date - timedelta(days=target_date.weekday())
             problem = load_scheduling_problem(
                 session, start, preserve_confirmed=True, horizon_days=6,
@@ -231,7 +242,7 @@ def process_daily_responses(
             # Keep existing bookings for inactive patients pinned, but never
             # select them as new replacement candidates.
             active_patients = set(session.scalars(select(Patient.id).where(Patient.active.is_(True))))
-            pinned_counts = Counter(item.requirement_id for item in problem.pinned)
+            pinned_counts = Counter(item.requirement_id for item in problem.pinned if item.counts_toward_requirement)
             problem = replace(problem, requirements=[
                 item if item.patient_id in active_patients else replace(
                     item, sessions_per_week=pinned_counts[item.id],
@@ -258,6 +269,8 @@ def process_daily_responses(
             replaced_counts = Counter(item.requirement_id for item in proposed)
             remaining_released = []
             for item in released:
+                if not item.counts_toward_requirement:
+                    continue
                 if replaced_counts[item.requirement_id]:
                     replaced_counts[item.requirement_id] -= 1
                 else:
@@ -280,6 +293,7 @@ def process_daily_responses(
             ))
         result.processed = len(responses)
         session.flush()
-        result.weekly_progress = weekly_progress(session, target_date)
+        if include_progress:
+            result.weekly_progress = weekly_progress(session, target_date)
     session.commit()
     return result

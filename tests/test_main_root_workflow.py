@@ -106,6 +106,44 @@ def test_patient_status_requires_reason_and_survives_sync(root_main):
         assert all(item.timestamp and item.user == root_main.flow.admin_id for item in history)
 
 
+def test_activation_http_rejects_bad_source_even_when_posted_directly(root_main):
+    from services.patient_activation_service import store_activation_review
+    patient = payload("/api/patients?q=TEST-A")[1]["patients"][0]
+    path = f"/api/patients/{patient['id']}"
+    assert payload(path + "/status", {"active": False, "reason": "Paused"})[0] == 200
+    review = {"source": "thanal/eic", "checkedAt": "2026-11-10T08:00:00Z", "planCodes": ["TEST-A"],
+              "issues": {"TEST-A": ["The phone number is invalid. Correct it in Zoho.",
+                                      "Speech therapy: no consultant is selected. Choose a consultant in Zoho."]}}
+    with root_main.flow.sessions.begin() as session:
+        store_activation_review(session, review)
+    assert payload(path + "/activation", token="wrong")[0] == 401
+    assert payload("/api/patients/999999/activation")[0] == 404
+    status, check = payload(path + "/activation")
+    assert status == 200 and not check["canActivate"] and len(check["issues"]) == 2
+    status, rejected = payload(path + "/status", {"active": True})
+    assert status == 409 and rejected["activation"] == check
+    assert not payload("/api/patients?q=TEST-A")[1]["patients"][0]["active"]
+    review["issues"] = {}
+    with root_main.flow.sessions.begin() as session:
+        store_activation_review(session, review)
+    assert payload(path + "/activation")[1]["canActivate"]
+    assert payload(path + "/status", {"active": True}) == (200, {"active": True})
+
+
+def test_activation_explains_missing_plan_and_blocks_unreviewed_baseline(root_main):
+    from services.patient_activation_service import store_activation_review
+    patient = payload("/api/patients?q=TEST-A")[1]["patients"][0]
+    path = f"/api/patients/{patient['id']}"
+    with root_main.flow.sessions.begin() as session:
+        session.add(AuditLog(action="patient_roster_baseline", entity="roster:fictional", user="tester"))
+    assert not payload(path + "/activation")[1]["canActivate"]
+    with root_main.flow.sessions.begin() as session:
+        store_activation_review(session, {"source": "thanal/eic", "checkedAt": "2026-11-10T08:00:00Z",
+                                          "planCodes": [], "issues": {}})
+    check = payload(path + "/activation")[1]
+    assert not check["canActivate"] and "Calicut report" in check["issues"][0]
+
+
 @pytest.mark.parametrize("sent", [False, True])
 def test_deactivation_withdraws_unsent_offers_and_flags_sent_ones(root_main, monkeypatch, sent):
     import web_app
@@ -138,6 +176,19 @@ def test_deactivation_withdraws_unsent_offers_and_flags_sent_ones(root_main, mon
         preview = payload("/api/zoho/export/preview", {"date": str(DAY)})[1]
         assert preview["wouldAssumeAcceptedVisits"] == before - 1
         assert set(offer["appointment_ids"]) <= set(preview["awaitingFinalisation"])
+        assert payload("/api/simulate", {"token": offer["token"], "action": "YES"})[0] == 200
+        assert payload("/api/process", {})[0] == 200
+        reviewed = payload(f"/api/state?date={DAY}")[1]
+        assert {
+            item["status"] for item in reviewed["appointments"] if item["id"] in offer["appointment_ids"]
+        } == {"PENDING_CONFIRMATION"}
+        assert any(item["reason"] == "Inactive patient accepted an offer — staff review"
+                   for item in reviewed["inbox"])
+        with root_main.flow.sessions() as session:
+            assert session.get(FlowOffer, offer["token"]).state == "PENDING"
+            assert session.scalar(select(AuditLog.id).where(
+                AuditLog.action == "flow_reply_yes", AuditLog.entity == f"offer:{offer['token']}",
+            )) is None
     else:
         assert (offer["send_status"], offer["state"]) == ("OBSOLETE", "CLOSED")
         assert bookings == {"CANCELLED_OTHER"}

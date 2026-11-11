@@ -1,16 +1,63 @@
 """Bounded daily search must not hide free times through candidate thinning."""
 
 from collections import Counter
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
 from config import SolverSettings
+from database.models import (
+    Appointment, AppointmentStatus, AuditLog, Department, Location, Patient, Therapist,
+    TherapistAvailability, TreatmentRequirement,
+)
+from database.repository import limit_new_bookings_to_day, load_daily_scheduling_problem
 from scheduling.cp_sat_scheduler import generate_weekly_schedule
 from scheduling.cp_sat_scheduler import _candidate_placements
 from scheduling.bundle_builder import build_bundles
 from scheduling.slot_config import SLOTS
 from scheduling.types import RequirementInput, SchedulingProblem
+
+
+@pytest.mark.parametrize("priority", ["absence", "carryover"])
+def test_daily_planner_prioritizes_missed_demand_for_the_only_slot(db_session, priority):
+    target = date(2026, 10, 20)
+    department = Department(name="Speech")
+    location = Location(name="Clinic", capacity=1)
+    therapist = Therapist(therapist_code="T-01", name="Therapist", department=department, location=location)
+    patients = [Patient(patient_code=code, name=code) for code in ("REGULAR", "PRIORITY")]
+    db_session.add_all([therapist, *patients])
+    db_session.flush()
+    regular, preferred = [
+        TreatmentRequirement(patient_id=patient.id, department_id=department.id,
+                             assigned_therapist_id=therapist.id, sessions_per_week=1, sequence_order=0)
+        for patient in patients
+    ]
+    db_session.add_all([regular, preferred])
+    db_session.flush()
+    db_session.add_all([
+        TherapistAvailability(therapist_id=therapist.id, day_of_week=target.weekday(),
+                              slot_index=slot.slot_index, available=False)
+        for slot in SLOTS[1:]
+    ])
+
+    def appointment(requirement, day, status):
+        return Appointment(patient_id=requirement.patient_id, treatment_requirement_id=requirement.id,
+                           therapist_id=therapist.id, department_id=department.id, location_id=location.id,
+                           date=day, slot_index=0, status=status)
+
+    db_session.add(appointment(regular, target - timedelta(days=7), AppointmentStatus.COMPLETED))
+    db_session.add(AuditLog(action="daily_planning_started", entity="2026-10-12"))
+    if priority == "absence":
+        db_session.add(appointment(preferred, target - timedelta(days=7), AppointmentStatus.COMPLETED))
+        db_session.add(appointment(preferred, target - timedelta(days=1), AppointmentStatus.NEEDS_RESCHEDULING))
+    db_session.flush()
+    problem = load_daily_scheduling_problem(db_session, target)
+    limit_new_bookings_to_day(problem, target)
+    result = generate_weekly_schedule(problem, settings=SolverSettings(max_time_seconds=2))
+
+    assert result.requested_sessions == (3 if priority == "carryover" else 2)
+    assert [(item.date, item.patient_id) for item in result.appointments] == [(target, preferred.patient_id)]
+    assert not any(result.validation.values())
 
 
 def test_unbounded_weekly_search_keeps_every_valid_start(base_problem):

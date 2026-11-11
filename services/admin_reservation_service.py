@@ -219,7 +219,15 @@ def _preview_reservation(
     remaining = [item for item in appointments if item.id not in superseded]
     same_day = [item for item in remaining if item.patient_id == patient_id and item.date == sources[0].date]
     if same_day:
-        warn("ANOTHER_VISIT", "The patient already has another visit on this date.")
+        # Joining the child's existing visit, directly before or after it, is one
+        # continuous visit (user decision); anything else is a second visit.
+        taken = sorted([item.slot_index for item in same_day] + [item["slot"] for item in slots])
+        joins = (all(item.location_id == sources[0].location_id for item in same_day)
+                 and len(set(taken)) == len(taken)
+                 and taken == list(range(taken[0], taken[0] + len(taken)))
+                 and valid_consecutive_block(taken[0], len(taken)))
+        if not joins:
+            warn("ANOTHER_VISIT", "The patient already has another visit on this date.")
     if any(item.location_id != sources[0].location_id for item in same_day):
         warn("MULTIPLE_BRANCHES", "The patient would attend more than one branch on the same day.")
     patient_absences = list(session.scalars(select(PatientAbsence).where(PatientAbsence.patient_id == patient_id)))

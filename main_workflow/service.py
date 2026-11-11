@@ -25,6 +25,8 @@ class MainWorkflow(FlowTest):
     message_prefix = ""
     export_key_prefix = "main"
     button_prefix = "mw"
+    compact_state = True  # Staff screens get only the selected date's children.
+    background_planning = True  # Also applies when main uses retained test data.
 
     def __init__(self, engine: Engine, config: WorkflowConfig, *, send=None) -> None:
         # Do not call FlowTest.__init__: it owns test storage and fictional seeds.
@@ -90,12 +92,17 @@ class MainWorkflow(FlowTest):
             merged = json.loads(json.dumps(scenario))
             known = {item["code"] for item in merged["patients"]}
             with self.sessions() as session:
+                # Two queries in total, not one requirements query per patient.
+                weekly: dict[int, list[int]] = {}
+                for patient_id, sessions_per_week in session.execute(select(
+                        TreatmentRequirement.patient_id, TreatmentRequirement.sessions_per_week).where(
+                        TreatmentRequirement.active.is_(True)).order_by(TreatmentRequirement.id)):
+                    weekly.setdefault(patient_id, []).append(sessions_per_week)
                 for patient in session.scalars(select(Patient).where(Patient.active.is_(True))):
                     if patient.patient_code not in known:
                         merged["patients"].append({"code": patient.patient_code, "name": patient.name,
-                            "initial_roster": True, "requirements": [{"weekly": item.sessions_per_week}
-                            for item in session.scalars(select(TreatmentRequirement).where(
-                                TreatmentRequirement.patient_id == patient.id, TreatmentRequirement.active.is_(True)))]})
+                            "initial_roster": True, "requirements": [{"weekly": value}
+                            for value in weekly.get(patient.id, [])]})
             self.scenario = merged
             self.recipients = {item["code"]: item["phone"] for item in merged["patients"] if item.get("phone")}
             if self.transport:
@@ -103,23 +110,6 @@ class MainWorkflow(FlowTest):
 
     def _audit(self, session, action: str, entity: str) -> None:
         session.add(AuditLog(action=action, entity=entity, user=self.admin_id))
-
-    def _publish(self, session, target, appointment_id=None) -> int:
-        # The main workflow never invents preview recipient bindings.
-        from database.models import Appointment, AppointmentStatus
-
-        source = session.get(FlowSetting, "zoho_test_scenario")
-        if source:
-            self.use_source_contacts(json.loads(source.value))
-        query = select(Patient.patient_code).join(Appointment).where(
-            Appointment.date == target, Appointment.status == AppointmentStatus.PROPOSED, Patient.active.is_(True))
-        if appointment_id is not None:
-            anchor = session.get(Appointment, appointment_id)
-            if anchor is not None:
-                query = query.where(Patient.id == anchor.patient_id)
-        if any(code not in self.recipients for code in session.scalars(query)):
-            raise ValueError("Import verified parent contacts before publishing the main schedule")
-        return super()._publish(session, target, appointment_id)
 
     def state(self, target: date) -> dict:
         result = super().state(target)

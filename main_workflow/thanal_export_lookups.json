@@ -1,0 +1,162 @@
+{
+  "version": 1,
+  "target": "thanal/eic/Schedule_Adhoc_Trial_Report",
+  "verified_at": "2026-11-11",
+  "registration_display": "Name2",
+  "approved_branch_ids": [
+    "149769000021575634"
+  ],
+  "department_bindings": [
+    {
+      "branch_id": "149769000021575634",
+      "consultation_id": "149769000018081769",
+      "department_id": "149769000017980566"
+    },
+    {
+      "branch_id": "149769000021575634",
+      "consultation_id": "149769000018081765",
+      "department_id": "149769000017980570"
+    },
+    {
+      "branch_id": "149769000021575634",
+      "consultation_id": "149769000018081773",
+      "department_id": "149769000017980562"
+    },
+    {
+      "branch_id": "149769000021575634",
+      "consultation_id": "149769000018081777",
+      "department_id": "149769000017980558"
+    },
+    {
+      "branch_id": "149769000021575634",
+      "consultation_id": "149769000018081781",
+      "department_id": "149769000017980574"
+    },
+    {
+      "branch_id": "149769000021575634",
+      "consultation_id": "149769000018081753",
+      "department_id": "149769000017980574"
+    },
+    {
+      "branch_id": "149769000021575634",
+      "consultation_id": "149769000018081733",
+      "department_id": "149769000017980578"
+    },
+    {
+      "branch_id": "149769000021575634",
+      "consultation_id": "149769000018081745",
+      "department_id": "149769000017980566"
+    },
+    {
+      "branch_id": "149769000021575634",
+      "consultation_id": "149769000195563045",
+      "department_id": "149769000134828591"
+    }
+  ],
+  "slot_bindings": [
+    {
+      "ID": "149769000024324523",
+      "Start_Time": "09:00:00",
+      "End_Time": "09:40:00",
+      "Slot_Number": "1",
+      "branch_id": "149769000021575634",
+      "appointment_slot_number": "1"
+    },
+    {
+      "ID": "149769000024324582",
+      "Start_Time": "14:35:00",
+      "End_Time": "15:15:00",
+      "Slot_Number": "8",
+      "branch_id": "149769000021575634",
+      "appointment_slot_number": "8"
+    },
+    {
+      "ID": "149769000024324586",
+      "Start_Time": "15:30:00",
+      "End_Time": "16:10:00",
+      "Slot_Number": "9",
+      "branch_id": "149769000021575634",
+      "appointment_slot_number": "9"
+    },
+    {
+      "ID": "149769000024324590",
+      "Start_Time": "16:10:00",
+      "End_Time": "16:50:00",
+      "Slot_Number": "10",
+      "branch_id": "149769000021575634",
+      "appointment_slot_number": "10"
+    },
+    {
+      "ID": "149769000024324562",
+      "Start_Time": "13:15:00",
+      "End_Time": "13:55:00",
+      "Slot_Number": "6",
+      "branch_id": "149769000021575634",
+      "appointment_slot_number": "6"
+    },
+    {
+      "ID": "149769000024324544",
+      "Start_Time": "11:55:00",
+      "End_Time": "12:35:00",
+      "Slot_Number": "5",
+      "branch_id": "149769000021575634",
+      "appointment_slot_number": "5"
+    },
+    {
+      "ID": "149769000024324567",
+      "Start_Time": "13:55:00",
+      "End_Time": "14:35:00",
+      "Slot_Number": "7",
+      "branch_id": "149769000021575634",
+      "appointment_slot_number": "7"
+    },
+    {
+      "ID": "149769000024324540",
+      "Start_Time": "11:15:00",
+      "End_Time": "11:55:00",
+      "Slot_Number": "4",
+      "branch_id": "149769000021575634",
+      "appointment_slot_number": "4"
+    },
+    {
+      "ID": "149769000024324536",
+      "Start_Time": "10:35:00",
+      "End_Time": "11:15:00",
+      "Slot_Number": "3",
+      "branch_id": "149769000021575634",
+      "appointment_slot_number": "3"
+    },
+    {
+      "ID": "149769000024324532",
+      "Start_Time": "09:40:00",
+      "End_Time": "10:20:00",
+      "Slot_Number": "2",
+      "branch_id": "149769000021575634",
+      "appointment_slot_number": "2"
+    },
+    {
+      "ID": "149769000025619066",
+      "Start_Time": "12:00:00",
+      "End_Time": "12:15:00",
+      "Slot_Number": "12",
+      "branch_id": "149769000021575634",
+      "appointment_slot_number": "12"
+    },
+    {
+      "ID": "149769000025619046",
+      "Start_Time": "10:30:00",
+      "End_Time": "10:45:00",
+      "Slot_Number": "7",
+      "branch_id": "149769000021575634",
+      "appointment_slot_number": "7"
+    },
+    {
+      "ID": "149769000025619038",
+      "Start_Time": "10:00:00",
+      "End_Time": "10:15:00",
+      "Slot_Number": "5",
+      "branch_id": "149769000021575634",
+      "appointment_slot_number": "5"
+    }
+  ]
+}

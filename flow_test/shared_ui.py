@@ -2,23 +2,27 @@
 
 from contextlib import nullcontext
 from dataclasses import replace
-from datetime import datetime
+from datetime import date, datetime
 import re
 import secrets
 from urllib.parse import urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from config import SolverSettings
+
 GET_ROUTES = (
+    r"/api/schedules/jobs/\d+",
     r"/api/(overview|schedule|patients|therapists|operations|health)",
     r"/api/zoho/(status|draft)",
     r"/api/patients/\d+/preferences",
+    r"/api/patients/\d+/activation",
     r"/api/appointments/\d+/(replacement-candidates|reservation-context)",
 )
 POST_ROUTES = (
     r"/api/reset",
     r"/api/zoho/import",
-    r"/api/zoho/export/(preview|prepare|ack|finish|push)",
+    r"/api/zoho/export/(preview|prepare|ack|failures|finish|push)",
     r"/api/absences",
     r"/api/patients/\d+/preferences",
     r"/api/patients/\d+/status",
@@ -38,9 +42,26 @@ def generate_daily_preview(request, instance) -> None:
     seconds = web_app.parse_search_seconds(body.get("searchSeconds"))
     if body.get("planningMode", "day") != "day":
         raise web_app.ApiError(400, "This workflow plans one selected day at a time")
+    if type(body.get("background", False)) is not bool:
+        raise web_app.ApiError(400, "background must be true or false")
+    # Production always gets the agreed five-minute maximum, even when an old
+    # browser sends the former 20-second quick-preview selection.
+    settings = replace(instance.flow.solver_settings, max_time_seconds=(
+        300.0 if not instance.flow.is_test else seconds))
+    if body.get("background") or not instance.flow.is_test:
+        from flow_test.planning_tasks import submit_preview
+        request.send_json(submit_preview(instance, target, body.get("patients"), settings), 202)
+        return
+    request.send_json(build_daily_preview(instance, target, body.get("patients"), settings), 201)
+
+
+def build_daily_preview(instance, target: date, patient_codes: list[str] | None, settings: SolverSettings) -> dict:
+    """Generate an unsaved preview; usable by synchronous tests and background jobs."""
+    import web_app
+
     try:
         result, pinned = instance.flow.preview_daily(
-            target, body.get("patients"), settings=replace(instance.flow.solver_settings, max_time_seconds=seconds),
+            target, patient_codes, settings=settings,
         )
     except ValueError as exc:
         raise web_app.ApiError(400, str(exc)) from exc
@@ -56,15 +77,27 @@ def generate_daily_preview(request, instance) -> None:
         "created": datetime.utcnow(),
         "offer_on_save": offer_on_save,
     }
-    payload = web_app.serialize_preview(day_result, target, target)
+    context = web_app.WORKSPACE_CONTEXT.set({"sessions": instance.flow.sessions,
+        "previews": instance.previews, "flow": instance.flow,
+        "admin_user": getattr(instance.flow, "admin_id", "scheduler_manager")})
+    try:
+        payload = web_app.serialize_preview(day_result, target, target)
+    finally:
+        web_app.WORKSPACE_CONTEXT.reset(context)
     payload.update({
         "previewId": preview_id, "planningStart": target.isoformat(),
         "planningMode": "day", "planningDays": 1,
         "newSessions": new_count, "scheduledOnSelectedDay": len(day_result.appointments),
         "autoOfferOnSave": offer_on_save, "liveMessaging": getattr(instance.flow, "messaging_enabled", instance.flow.live),
+        "heldCentres": result.statistics.get("held_centres", []),
+        "childrenNotPlanned": result.statistics.get("held_children", []),
         "messagingPaused": instance.flow.live and not getattr(instance.flow, "messaging_enabled", instance.flow.live),
     })
-    request.send_json(payload, 201)
+    # Keep the response alongside the draft, not in a long-lived queue payload.
+    preview = instance.previews[preview_id]
+    preview["response"] = payload
+    instance.previews[preview_id] = preview
+    return payload
 
 
 def save_daily_preview(request, instance, preview_id: str) -> None:
@@ -86,6 +119,8 @@ def save_daily_preview(request, instance, preview_id: str) -> None:
     except ValueError as exc:
         raise web_app.ApiError(409, str(exc)) from exc
     preview["saved_response"] = response
+    # Write back: previews may live in the shared database, where `get` returns a copy.
+    instance.previews[preview_id] = preview
     request.send_json(response)
 
 
@@ -105,6 +140,18 @@ def dispatch_shared_api(request, instance, *, prefix: str = "/test") -> bool:
         request.send_json({"configured": False})
         return True
     import web_app
+
+    planning_status = re.fullmatch(r"/api/schedules/jobs/(\d+)", path)
+    if request.command == "GET" and planning_status:
+        from flow_test.planning_tasks import preview_status
+        request.send_json(preview_status(instance, int(planning_status[1])))
+        return True
+
+    # A background solver takes its own short snapshot lock. Never hold the
+    # request's outer workflow lock for the lifetime of a synchronous solve.
+    if request.command == "POST" and path == "/api/schedules/generate":
+        generate_daily_preview(request, instance)
+        return True
 
     if path == "/api/zoho/import" and getattr(instance.flow, "remote_worker", False):
         from flow_test.zoho_routes import dispatch_zoho
@@ -177,8 +224,6 @@ def dispatch_shared_api(request, instance, *, prefix: str = "/test") -> bool:
                     except ValueError as exc:
                         raise web_app.ApiError(409, str(exc)) from exc
                     adapter.send_json(result)
-            elif request.command == "POST" and path == "/api/schedules/generate":
-                generate_daily_preview(adapter, instance)
             elif request.command == "GET" and path == "/api/overview":
                 local_today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
                 adapter.send_json({**web_app.overview_payload(local_today), "planningMode": "day"})

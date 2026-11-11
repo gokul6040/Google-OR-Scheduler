@@ -1,5 +1,46 @@
 # Scheduling flow readiness audit — 23 October 2026
 
+## Production preparation — 7 November 2026
+
+- A release, cancellation or no-show in the middle of a saved visit could
+  invalidate the following draft. Validation now recognises the exact released
+  slot in that saved visit. The planner still requires new visits to be continuous.
+- An off-plan reservation could block generation and count toward an unrelated
+  therapy. It now holds its saved time while the patient's prescribed therapy
+  remains due. Staff can still move eligible reservations.
+- Real-data APIs now enforce the main operations key even if the hosted test
+  setting permits keyless access. The sample configuration selects the approved
+  `eic_whatsapp_scheduler` template with live and timed sending off.
+- The real-data export cutoff now leaves simulated offers pending when WhatsApp
+  is off. It requires a recorded send before silence can count as acceptance.
+- Signed fictional Yes/No callbacks exercise the same handler as production.
+  Yes confirms the visit. No releases unfinished bookings and proposes an eligible
+  replacement for staff review. Duplicate callbacks are processed once.
+- Local Postman HTTP checks covered paginated and incremental Zoho sync,
+  report failures, day review and save, attendance, and calendar export. The
+  export checks distinguish a rejected write from a committed write whose response
+  was lost. The latter is reconciled by key without creating a duplicate.
+  The sender smoke check now processes the incoming START before checking the
+  offer send, and closes its SQLite dispatch database during Windows cleanup.
+- Final results on the changed code: 643 Python tests passed across all 53
+  modules, including 26 provider HTTP tests and the PostgreSQL release and
+  concurrency cases. The SQLite variant of the PostgreSQL-only release test
+  was intentionally skipped. All 10 JavaScript tests and six end-to-end scenarios
+  passed. A Chrome smoke test verified access-key sign-in, preference save, a
+  Friday 16:10 placement for the preferred afternoon, calendar review and
+  persistence of 10 fictional appointments.
+- The initial Windows sandbox run blocked local sockets and PowerShell test
+  drivers. A temporary PostgreSQL instance also expired during an intermediate
+  run. The final suite used restarted localhost fixtures and finished cleanly.
+- The read-only live test authenticated with `ZohoCreator.report.READ`. Empty-result
+  probes on `Plan_Report` and `All_Consultants` both returned HTTP 403 with Creator
+  code `2933`. Zoho documents this as missing access to the application. The
+  Creator administrator needs to share the test app with the account used by the
+  scheduler connection. Rerun read-only validation after access is granted, then
+  validate the intended production reports on a staging copy before deployment.
+  The functional tests used disposable SQLite/PostgreSQL and localhost provider
+  simulations. No production data was written and no WhatsApp messages were sent.
+
 Subsequent authorized addition: manual final-schedule export to test-gokul's
 Scheduler form / Scheduler_Report is implemented locally. Manual cutoff assumes
 sent unanswered offers accepted with a distinct audit/status, preserving explicit

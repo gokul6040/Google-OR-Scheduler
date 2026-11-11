@@ -72,6 +72,24 @@ function Wait-TestWorkspace {
     throw "Image/config updates may have succeeded, but the live test endpoint was not verified. Check the revision before rebuilding or publishing offers."
 }
 
+function Assert-StoreUpgraded {
+    # This script never upgrades the database. When a release needs the upgrade,
+    # deploy it with .\deploy_main.ps1, which stops the old version first.
+    param([string]$Python, [string]$DatabaseUrl)
+    $saved = [Environment]::GetEnvironmentVariable("MAIN_RELEASE_DATABASE_URL", "Process")
+    [Environment]::SetEnvironmentVariable("MAIN_RELEASE_DATABASE_URL", $DatabaseUrl, "Process")
+    try {
+        $output = & $Python -m main_workflow.release --check
+        $exitCode = $LASTEXITCODE
+    } finally {
+        [Environment]::SetEnvironmentVariable("MAIN_RELEASE_DATABASE_URL", $saved, "Process")
+    }
+    if ($exitCode -ne 0) { throw "The test database check failed; no Azure changes have been made." }
+    if ((($output -join "`n") | ConvertFrom-Json).upgradeNeeded) {
+        throw "The test database needs this release's upgrade. Deploy with .\deploy_main.ps1 first: it stops the old version and upgrades safely. No Azure changes have been made."
+    }
+}
+
 $projectRoot = Split-Path $PSScriptRoot -Parent
 Push-Location -LiteralPath $projectRoot
 try {
@@ -86,6 +104,7 @@ try {
     if (-not $databaseUrl -or $databaseSchema -ne "flow_test") {
         throw "Expected the existing restricted test database URL and flow_test schema in flow_test/.env."
     }
+    Assert-StoreUpgraded -Python $python -DatabaseUrl $databaseUrl
     $adminKey = (Get-Content -LiteralPath "flow_test/data/admin.token" -Raw).Trim()
     if (-not $adminKey) { throw "The existing local test admin key is empty." }
     # Optional fixture contacts; imported Zoho parents need no separate entry.

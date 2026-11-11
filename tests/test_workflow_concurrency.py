@@ -24,6 +24,48 @@ DAY = date(2026, 10, 19)
 CTX = mp.get_context("spawn")
 
 
+def test_zoho_budget_serializes_responses_across_independent_clients(target, tmp_path, monkeypatch):
+    from services.zoho_budget import call_budget
+
+    monkeypatch.setenv("ZOHO_BUDGET_DATABASE_URL", target)
+    monkeypatch.setenv("ZOHO_CALL_BUDGET_FILE", str(tmp_path / "zoho-budget.json"))
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    stamps, errors = [], []
+    url = "https://www.zohoapis.in/creator/v2.1/data/fictional-owner/app/report/Plan_Report"
+
+    def first():
+        try:
+            with call_budget(url):
+                stamps.append(time.monotonic())
+                entered.set()
+                assert release.wait(5)
+        except Exception as exc:
+            errors.append(exc)
+
+    def second():
+        try:
+            with call_budget(url):
+                stamps.append(time.monotonic())
+                finished.set()
+        except Exception as exc:
+            errors.append(exc)
+
+    workers = [threading.Thread(target=first), threading.Thread(target=second)]
+    workers[0].start()
+    try:
+        assert entered.wait(5)
+        workers[1].start()
+        assert not finished.wait(0.1)  # One response owns the shared budget.
+    finally:
+        release.set()
+        for worker in workers:
+            if worker.ident is not None:
+                worker.join(timeout=8)
+    assert not errors
+    assert finished.is_set() and len(stamps) == 2
+    assert stamps[1] - stamps[0] >= 1.2
+
+
 @pytest.fixture(params=["sqlite", "postgresql"])
 def target(request, tmp_path):
     if request.param == "sqlite":

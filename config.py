@@ -66,7 +66,8 @@ DEMO_LOCATION_CAPACITIES = {
 
 @dataclass(frozen=True)
 class SolverSettings:
-    max_time_seconds: float = 20.0
+    # Maximum CP-SAT search time for EACH independent centre/resource group.
+    max_time_seconds: float = 300.0
     random_seed: int = 20260908
     num_search_workers: int = 1  # one worker makes test runs reproducible
     unmet_bundle_penalty: int = 1_000_000

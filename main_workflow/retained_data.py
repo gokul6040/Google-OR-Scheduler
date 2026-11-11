@@ -71,8 +71,11 @@ class ExistingTestWorkflow(MainWorkflow):
         self.database_schema = schema
         try:
             names = set(inspect(self.engine).get_table_names(schema=schema))
-            if not {table.name for table in TEST_TABLES} <= names:
+            from flow_test.performance_schema import ADDED_TABLES, missing_performance_storage
+            if not {table.name for table in TEST_TABLES} - set(ADDED_TABLES) <= names:
                 raise ValueError("The selected test store is incomplete; no tables or records were created")
+            if missing_performance_storage(self.engine, schema):
+                raise ValueError("Upgrade this test store with python -m main_workflow.migrate --apply before starting")
             from database.treatment_migrations import has_course_identity
             if not has_course_identity(self.engine, schema):
                 raise ValueError("Upgrade treatment courses with python -m main_workflow.migrate --apply")
@@ -253,7 +256,8 @@ class TestDataRuntime:
         self.flow = ExistingTestWorkflow(*selected_test_target())
         if self.flow.remote_worker:
             self.token = access_key()
-        self.previews = {}
+        from flow_test.preview_store import PreviewStore
+        self.previews = PreviewStore(self.flow)  # Shared by every app copy.
         self.stop = threading.Event()
         self.worker = None
         if self.flow.messaging_enabled and not self.flow.remote_worker and embedded_worker_enabled():

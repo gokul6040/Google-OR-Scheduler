@@ -43,6 +43,23 @@ class ZohoProvider:
         self.verify(settings)
         try:
             token = refresh_access_token(settings)["access_token"]
+            from main_workflow.thanal_sync import BRANCH, PLANS, enabled as thanal_enabled
+            if thanal_enabled(self.config):
+                consultants = get_report_records(settings, token, self.config.consultant_report)
+                branches = {str(b["ID"]) for row in consultants for b in [row.get("Branch", {})]
+                            if isinstance(b, dict) and b.get("Branch_Name") == BRANCH
+                            and str(b.get("ID", "")).isdigit()}
+                if len(branches) != 1:
+                    raise ValueError("Approved Calicut branch must resolve to one lookup ID")
+                branch_id = next(iter(branches))
+                registrations = get_report_records(settings, token, self.config.registration_report)
+                plans = get_report_records(settings, token, self.config.plan_report,
+                                           criteria="Branch == " + branch_id)
+                if any(not isinstance(row.get("Branch"), dict)
+                       or str(row["Branch"].get("ID")) != branch_id for row in plans):
+                    raise ValueError("Plan report returned rows outside the approved branch")
+                from main_workflow.thanal_sync import select_fields
+                return select_fields({PLANS: plans, "All_Consultants": consultants, "All_Registrations": registrations})
             criteria = (snapshot_criteria(until) if self.config.registration_report
                         else window_criteria(since, until))
             targets = dict(zip(REPORTS, (self.config.plan_report, self.config.consultant_report)))

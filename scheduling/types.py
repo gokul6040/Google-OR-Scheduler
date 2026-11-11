@@ -60,6 +60,8 @@ class SchedulingProblem:
     priority_requirement_ids: set[int] = field(default_factory=set)
     # Optional repair boundary for new placements; existing pinned visits stay fixed.
     new_booking_slots: set[tuple[int, int, int, date, int]] | None = None
+    released_bundle_slots: set[tuple[int, date, int, str, int]] = field(default_factory=set)
+    isolate_saved_failures: bool = False
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,9 @@ class ScheduledAppointment:
     slot_index: int
     bundle_id: str
     status: str = "PROPOSED"
+    counts_toward_requirement: bool = field(default=True, compare=False)
+    assignment_override: bool = field(default=False, compare=False)
+    overridden_warnings: tuple[str, ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)

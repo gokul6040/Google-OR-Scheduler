@@ -33,13 +33,21 @@ class Reliability:
         self.retry_seconds = setting_int("WHATSAPP_RETRY_BASE_SECONDS", 30, 1, 3600)
         self.delivery_wait_minutes = setting_int("WHATSAPP_DELIVERY_ALERT_MINUTES", 15, 1, 1440)
 
-    def _attention(self, session, job, reason: str, message: str) -> None:
+    def _attention(self, session, job, reason: str, message: str, *, reopen: bool = True) -> None:
+        """Create the staff item, or reopen it with fresh text when the problem recurs.
+
+        ``reopen=False`` is for a condition re-checked every cycle (delivery overdue):
+        once staff dismiss it, the same unchanged condition must not nag again.
+        """
         key = f"attention:{job.event_key}:{reason}"
-        if session.scalar(select(FlowInbox.id).where(FlowInbox.event_key == key)) is None:
+        item = session.scalar(select(FlowInbox).where(FlowInbox.event_key == key))
+        if item is None:
             token = json.loads(job.payload).get("token")
             offer = session.get(FlowOffer, token) if token else None
             session.add(FlowInbox(event_key=key, patient_code=offer.patient_code if offer else None,
                                   reason=reason, text=message + " Booking unchanged."))
+        elif reopen and item.resolved:
+            item.resolved, item.text = 0, message + " Booking unchanged."
 
     def _terminal(self, session, job, message: str) -> None:
         job.status, job.error, job.next_attempt_at = "NEEDS_ATTENTION", message, None
@@ -62,7 +70,8 @@ class Reliability:
                 FlowJob.accepted_at <= now - timedelta(minutes=self.delivery_wait_minutes))):
             if job.delivery not in {"delivered", "read", "failed"}:
                 self._attention(session, job, "WhatsApp delivery overdue",
-                    "Accepted by Meta; delivery remains unconfirmed. Follow up with the parent; do not blindly resend.")
+                    "Accepted by Meta; delivery remains unconfirmed. Follow up with the parent; do not blindly resend.",
+                    reopen=False)
         for job in session.scalars(select(FlowJob).where(FlowJob.status == "UNKNOWN",
                 ~select(FlowInbox.id).where(FlowInbox.event_key == "unknown:" + FlowJob.event_key).exists())):
             self._send_failure_inbox(session, job)

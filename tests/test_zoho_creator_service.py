@@ -191,7 +191,7 @@ def test_get_report_records_reads_creator_report(monkeypatch):
 
     assert records == [{"ID": "creator-plan-1", "Registration_Id": "P-001"}]
     assert "/report/Plan_Detail_Report?" in captured["url"]
-    assert "max_records=1000" in captured["url"]
+    assert "max_records=200" in captured["url"]
     assert captured["auth"] == "Zoho-oauthtoken token"
     assert captured["timeout"] == 60
 

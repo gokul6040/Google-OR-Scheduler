@@ -158,7 +158,10 @@ def test_replacement_preserves_remaining_therapy_sequence_and_continuity(db_sess
         assigned_therapist_id=doctor.id, location_id=branch.id, sessions_per_week=1, sequence_order=1)
     db_session.add(other)
     db_session.flush()
-    assert candidates(db_session, opening) == []  # A single opening would split this visit.
+    # A substitute may take one of their therapies (user decision: substitutes only).
+    single = candidates(db_session, opening)
+    assert [item["patient_code"] for item in single] == ["ELIGIBLE"]
+    assert single[0]["fit"] == "complete_visit" and single[0]["sessions_covered"] == 1
     source = Appointment(patient_id=vacant.patient_id, treatment_requirement_id=vacant.treatment_requirement_id,
         therapist_id=doctor.id, department_id=therapy.id, location_id=branch.id,
         date=DAY, slot_index=3, status=AppointmentStatus.CANCELLED_PATIENT,
@@ -178,6 +181,79 @@ def test_replacement_preserves_remaining_therapy_sequence_and_continuity(db_sess
 def test_weekly_target_ignores_bookings_from_another_week(db_session, opening):
     booking(db_session, opening[2], target=DAY + timedelta(days=7))
     assert len(candidates(db_session, opening)) == 1
+
+
+def _two_session_opening(db_session, opening):
+    """Release a Speech 2 + OT 3 visit; return (speech_vacancy, ot_therapy)."""
+    vacant, _, _, doctor, branch, _ = opening
+    ot = Department(name="Fictional OT")
+    db_session.add(ot)
+    db_session.flush()
+    ot_requirement = TreatmentRequirement(patient_id=vacant.patient_id, department_id=ot.id,
+        assigned_therapist_id=doctor.id, location_id=branch.id, sessions_per_week=1, sequence_order=1)
+    db_session.add(ot_requirement)
+    db_session.flush()
+    db_session.add(Appointment(patient_id=vacant.patient_id, treatment_requirement_id=ot_requirement.id,
+        therapist_id=doctor.id, department_id=ot.id, location_id=branch.id, date=DAY, slot_index=3,
+        status=AppointmentStatus.CANCELLED_PATIENT, bundle_id=vacant.bundle_id, source="test"))
+    db_session.flush()
+    return vacant, ot
+
+
+def test_children_who_fill_the_whole_visit_rank_before_single_session_fits(db_session, opening):
+    vacant, ot = _two_session_opening(db_session, opening)
+    _, eligible, _, doctor, branch, _ = opening
+    db_session.add(TreatmentRequirement(patient_id=eligible.id, department_id=ot.id,
+        assigned_therapist_id=doctor.id, location_id=branch.id, sessions_per_week=1, sequence_order=1))
+    speech_only = Patient(patient_code="A-SPEECH-ONLY")  # Sorts first by code, so ranking must reorder.
+    db_session.add(speech_only)
+    db_session.flush()
+    db_session.add(TreatmentRequirement(patient_id=speech_only.id, department_id=vacant.department_id,
+        assigned_therapist_id=doctor.id, location_id=branch.id, sessions_per_week=1, sequence_order=0))
+    db_session.flush()
+    whole = find_replacement_candidates(db_session, vacant, DAY)
+    assert [item["patient_code"] for item in whole] == ["ELIGIBLE"]
+    assert whole[0]["fit"] == "complete_visit" and whole[0]["sessions_covered"] == 2
+    ranked = find_replacement_candidates(db_session, vacant, DAY, whole_visit=False)
+    assert [(item["patient_code"], item["sessions_covered"], item["fit"]) for item in ranked] == [
+        ("ELIGIBLE", 2, "complete_visit"), ("A-SPEECH-ONLY", 1, "this_session")]
+
+
+def test_substitute_may_need_other_therapies_with_other_doctors(db_session, opening):
+    vacant, _, _, _, branch, _ = opening
+    physio = Department(name="Fictional Physio")
+    db_session.add(physio)
+    db_session.flush()
+    other_doctor = Therapist(therapist_code="PHYSIO", name="Fictional Physio Doctor",
+                             department_id=physio.id, location_id=branch.id)
+    db_session.add(other_doctor)
+    db_session.flush()
+    db_session.add(TreatmentRequirement(patient_id=opening[1].id, department_id=physio.id,
+        assigned_therapist_id=other_doctor.id, location_id=branch.id, sessions_per_week=2, sequence_order=1))
+    db_session.flush()
+    result = find_replacement_candidates(db_session, vacant, DAY, whole_visit=False)
+    assert [item["patient_code"] for item in result] == ["ELIGIBLE"]
+
+
+@pytest.mark.parametrize("slot,listed", [(1, True), (3, True), (0, False), (6, False)])
+def test_child_already_coming_may_take_an_adjacent_opening_only(db_session, opening, slot, listed):
+    opening[2].sessions_per_week = 2
+    booking(db_session, opening[2], target=DAY, slot=slot)
+    result = candidates(db_session, opening)
+    assert [item["patient_code"] for item in result] == (["ELIGIBLE"] if listed else [])
+    if listed:
+        assert result[0]["joins_existing_visit"] is True
+        assert "Joins the child's existing visit" in result[0]["reason"]
+
+
+@pytest.mark.parametrize("slot,warned", [(3, False), (6, True)])
+def test_reservation_warns_only_when_the_opening_is_a_second_visit(db_session, opening, slot, warned):
+    from services.admin_reservation_service import preview_admin_reservation
+    opening[2].sessions_per_week = 2
+    booking(db_session, opening[2], target=DAY, slot=slot)
+    db_session.commit()
+    preview = preview_admin_reservation(db_session, opening[0].id, opening[1].id, whole_visit=False)
+    assert ("ANOTHER_VISIT" in {item["code"] for item in preview["warnings"]}) is warned
 
 
 def test_single_slot_selection_can_fill_part_of_a_released_visit(db_session, opening):

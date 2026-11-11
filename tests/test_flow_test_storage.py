@@ -74,6 +74,8 @@ def test_full_flow_uses_test_namespace_and_preserves_existing_tables(monkeypatch
         assert flow.publish(target) == 3
         flow.drain()
         token = next(o["token"] for o in flow.state(target)["offers"] if o["patient"] == "TEST-B")
+        # Opt in to the automatic fill so its writes are proven to stay in the test schema.
+        flow.fill_released_after_decline = True
         flow.simulate(token, "DAY")
         flow.drain()
         assert any(a["patient"] == "TEST-D" and a["status"] == "PROPOSED"
@@ -115,7 +117,8 @@ def test_initializer_refuses_missing_schema_and_unrelated_tables():
 
 def test_test_namespace_has_only_the_needed_tables_and_complete_foreign_keys():
     names = {table.name for table in TEST_TABLES}
-    assert len(names) == 19
+    # 19, plus export tracking, shared previews and offer links (performance pass).
+    assert len(names) == 22
     assert "appointments" in names and "flow_test_contact_windows" in names
     assert not any("zoho" in name or name.endswith("_source") for name in names)
     for table in TEST_TABLES:

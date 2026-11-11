@@ -72,10 +72,15 @@ def test_each_morning_block_has_a_standby_replacement(tmp_path, declines, replac
         flow.drain()
         after = flow.state(MONDAY)
         released = next(a for a in after["appointments"] if a["patient"] == declines)
-        candidate = next(a for a in after["appointments"] if a["patient"] == replacement)
         assert released["status"] == "NEEDS_RESCHEDULING"
-        assert candidate["status"] == "PROPOSED"
-        assert candidate["time"] == released["time"]
+        # The standby is suggested for staff to choose; nothing is booked automatically.
+        assert not any(a["status"] == "PROPOSED" for a in after["appointments"])
+        from database.models import Appointment
+        from services.replacement_service import find_replacement_candidates
+        with flow.sessions() as session:
+            listed = find_replacement_candidates(session, session.get(Appointment, released["id"]),
+                                                 MONDAY, whole_visit=False)
+        assert replacement in [item["patient_code"] for item in listed]
         assert not any(o["patient"] == replacement for o in after["offers"])
         for booking in before["appointments"]:
             if booking["patient"] != declines:

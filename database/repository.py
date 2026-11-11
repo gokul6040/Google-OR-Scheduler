@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from collections import Counter
 from calendar import monthrange
+from dataclasses import replace
 from datetime import date, timedelta
+import json
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import Select, and_, or_, select
 
 from database.models import (
+    AdminSlotReservation,
+    AdminBookingDecision,
     Appointment,
     AppointmentStatus,
     AuditLog,
@@ -29,6 +33,13 @@ ACTIVE_SCHEDULE_STATUSES = (
     AppointmentStatus.CONFIRMED,
     AppointmentStatus.COMPLETED,
 )
+
+
+def off_plan_appointment_ids() -> Select[tuple[int]]:
+    """Select manual reservations that occupy time without satisfying a plan."""
+    return select(AdminSlotReservation.appointment_id).where(
+        AdminSlotReservation.counts_toward_requirement.is_(False),
+    )
 
 
 def _plan_end_date(start_date: date | None, duration_months: int | None) -> date | None:
@@ -146,12 +157,24 @@ def load_scheduling_problem(
         for item, _ in requirements
     }
     pinned = []
+    overrides = {identifier: tuple(warning["code"] for warning in json.loads(warnings))
+                 for identifier, warnings in session.execute(select(
+                     AdminSlotReservation.appointment_id, AdminBookingDecision.warnings).join(
+                     AdminBookingDecision, AdminBookingDecision.request_id == AdminSlotReservation.decision_id).join(
+                     Appointment, Appointment.id == AdminSlotReservation.appointment_id).where(
+                     Appointment.date.between(week_start, week_end)))}
+    released_bundle_slots = set()
     if preserve_confirmed:
-        for item in session.scalars(select(Appointment).where(
+        for item, counts_toward_requirement in session.execute(select(
+            Appointment, Appointment.id.notin_(off_plan_appointment_ids()),
+        ).where(
             Appointment.date >= week_start,
             Appointment.date <= week_end,
-            Appointment.status.in_(ACTIVE_SCHEDULE_STATUSES),
+            or_(Appointment.status.in_(ACTIVE_SCHEDULE_STATUSES), Appointment.bundle_id.is_not(None)),
         )):
+            if item.status not in ACTIVE_SCHEDULE_STATUSES:
+                released_bundle_slots.add((item.patient_id, item.date, item.location_id, item.bundle_id, item.slot_index))
+                continue
             pinned.append(ScheduledAppointment(
                 patient_id=item.patient_id,
                 requirement_id=item.treatment_requirement_id,
@@ -162,6 +185,9 @@ def load_scheduling_problem(
                 slot_index=item.slot_index,
                 bundle_id=item.bundle_id or f"PIN-{item.id}",
                 status=item.status.value,
+                counts_toward_requirement=counts_toward_requirement,
+                assignment_override="THERAPIST_MISMATCH" in overrides.get(item.id, ()),
+                overridden_warnings=overrides.get(item.id, ()),
             ))
     return SchedulingProblem(
         week_start=week_start,
@@ -178,7 +204,58 @@ def load_scheduling_problem(
         patient_absences=patient_absences,
         planning_start_date=planning_start_date,
         priority_requirement_ids=priority_requirement_ids or set(),
+        released_bundle_slots=released_bundle_slots,
     )
+
+
+def load_daily_scheduling_problem(session, target: date) -> SchedulingProblem:
+    """Apply daily priorities using saved visits and the current plan targets."""
+    week_start = target - timedelta(days=target.weekday())
+    problem = load_scheduling_problem(session, week_start, planning_start_date=target)
+    problem.isolate_saved_failures = True
+    previous_start = week_start - timedelta(days=7)
+    previous_end = week_start - timedelta(days=2)
+    # Never invent missed therapy before this installation began saving visits.
+    # A partially observed first week cannot establish a full-week shortfall.
+    baseline = session.scalar(select(AuditLog).where(
+        AuditLog.action == "daily_planning_started").order_by(AuditLog.id).limit(1))
+    first_run = date.fromisoformat(baseline.entity) if baseline else target
+    observed_previous_week = first_run <= previous_start
+    previous_bookings = Counter(session.scalars(select(Appointment.treatment_requirement_id).where(
+        Appointment.date.between(previous_start, previous_end),
+        Appointment.status.in_(ACTIVE_SCHEDULE_STATUSES),
+        Appointment.id.notin_(off_plan_appointment_ids()),
+    )))
+    released_requirements = set(session.scalars(select(Appointment.treatment_requirement_id).where(
+        Appointment.date.between(week_start, target),
+        Appointment.status == AppointmentStatus.NEEDS_RESCHEDULING,
+        Appointment.id.notin_(off_plan_appointment_ids()),
+    )))
+    for index, requirement in enumerate(problem.requirements):
+        if requirement.sessions_per_week <= 0:
+            continue
+        if requirement.id in released_requirements:
+            problem.priority_requirement_ids.add(requirement.id)
+        if (
+            not observed_previous_week
+            or
+            (requirement.plan_start_date and requirement.plan_start_date > previous_end)
+            or (requirement.plan_end_date and requirement.plan_end_date < previous_start)
+        ):
+            continue
+        shortfall = requirement.sessions_per_week - previous_bookings[requirement.id]
+        if shortfall > 0:
+            problem.requirements[index] = replace(
+                requirement, sessions_per_week=requirement.sessions_per_week + shortfall,
+            )
+            problem.priority_requirement_ids.add(requirement.id)
+    return problem
+
+
+def record_daily_planning_start(session, target: date) -> None:
+    """Persist the baseline only with a successful calendar save."""
+    if session.scalar(select(AuditLog.id).where(AuditLog.action == "daily_planning_started").limit(1)) is None:
+        session.add(AuditLog(action="daily_planning_started", entity=target.isoformat()))
 
 
 def limit_new_bookings_to_day(problem: SchedulingProblem, target: date) -> None:
@@ -249,6 +326,7 @@ def save_proposed_schedule(session, result, week_start: date, horizon_days: int 
         Appointment.date >= week_start,
         Appointment.date <= week_end,
         Appointment.status == AppointmentStatus.NEEDS_RESCHEDULING,
+        Appointment.id.notin_(off_plan_appointment_ids()),
     )):
         if any(
             item.requirement_id == released.treatment_requirement_id
@@ -265,5 +343,7 @@ def save_proposed_schedule(session, result, week_start: date, horizon_days: int 
             f"scheduled={result.scheduled_sessions}; status={result.status}"
         ),
     ))
+    if horizon_days == 1:
+        record_daily_planning_start(session, week_start)
     session.commit()
     return added

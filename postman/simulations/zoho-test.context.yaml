@@ -1,0 +1,51 @@
+purpose:
+  stands_in_for: Zoho Creator source reports and Scheduler create/update endpoints.
+  unblocks: Local verification of paced reads and resumable bulk schedule exports.
+assumptions:
+  - id: thanal-lookup-export
+    status: supported
+    claim: The Thanal appointment adapter emits the eleven report fields plus Date_Time, End_Time and Duration for session creation, with Registration linked by Creator ID and For_Parent unchecked.
+    reason: Live metadata identified field types, unique Scheduler_Key and status choices. Read-only existing report responses expose Registration.Name2 and slot start/end/number. The branch was independently resolved through the approved consultant report.
+    verification: On 2026-11-11 the first authorized live test was rejected with code 3001 because the On Validate session workflow required Date_Time. The user confirmed existing-row timing evidence and expected session creation. The fictional mock now requires all three timing values and returns timestamps with seconds to exercise reconciliation. The one-record retry result is recorded separately in output/thanal-one-direct-export-result.json when verified; simulation alone cannot establish live workflow success.
+    source: main_workflow/thanal_export.py; main_workflow/thanal_export_lookups.json; tests/test_thanal_export.py; https://www.zoho.com/creator/help/api/v2.1/add-records.html
+    updated_at: "2026-11-11"
+  - id: thanal-structured-source
+    status: supported
+    claim: The configured Thanal daily adapter reads complete registration and consultant snapshots, follows pagination, and filters plans by the resolved Calicut Branch ID.
+    reason: Live read-only inspection established lookup/subform fields; the local mock uses fictional records with those shapes and rejects missing or incorrect branch criteria.
+    verification: tests/test_thanal_daily_sync.py exercises actual OAuth/report HTTP through this simulation, then imports into disposable SQLite. A later HTTP 403 stops fetching and retains the prior database checkpoint. Local tests cover CLI/import routing, master updates, multiple capabilities, course renewal, contact guards and transaction rollback. No production imports or messages were made.
+    source: main_workflow/provider.py; main_workflow/thanal_sync.py; tests/test_thanal_daily_sync.py; THANAL_IMPORT_REVIEW.md
+    updated_at: "2026-11-10"
+  - id: bulk-create-key-correlation
+    status: supported
+    claim: The documented Creator v2.1 create API accepts up to 200 rows and can return Scheduler_Key when requested as a result field.
+    reason: The official create contract documents batch data and requested result fields; the local caller uses the returned key instead of array position.
+    verification: On 2026-11-08 the focused local HTTP run passed bulk creation with reversed response order, partial form rejection, committed writes with lost responses, and restart before acknowledgment. This establishes caller behaviour against the fictional mock, not the production form workflows.
+    source: https://www.zoho.com/creator/help/api/v2.1/add-records.html; flow_test/zoho_push.py; tests/test_zoho_http_reliability.py; postman/mocks/zoho-test/default.js
+    updated_at: "2026-11-08"
+  - id: bulk-update-identical-delta
+    status: supported
+    claim: The documented bulk update applies one data object to records selected by criteria; distinct patient rows must not be sent as a list of unrelated update payloads.
+    reason: The official update contract uses one data object. The caller groups identical field changes and selects explicit previously reconciled owned IDs.
+    verification: On 2026-11-08 the focused local HTTP run passed a four-record attendance update while preserving record IDs and creating no duplicates. Custom production validation and workflow effects remain unverified.
+    source: https://www.zoho.com/creator/help/api/v2.1/update-records.html; flow_test/zoho_push.py; tests/test_zoho_http_reliability.py
+    updated_at: "2026-11-08"
+  - id: conservative-call-budget
+    status: supported
+    claim: Local Creator requests share a persisted 1.25-second minimum spacing across reads and writes, with one response held at a time.
+    reason: The wrapper covers report, schema, create and update requests. Local counter tests and HTTP request timestamps support this caller property.
+    verification: On 2026-11-08 deterministic counter tests passed and the sole zoho simulation member recorded the paced requests. Additional SQLite and throwaway PostgreSQL tests passed two independent clients sharing the response lock and start spacing. The 22 workflow concurrency checks passed across both databases. Actual account quotas are not established by these tests.
+    source: services/zoho_budget.py; services/zoho_creator_service.py; tests/test_production_fixes.py; output/zoho-selected-fixes.ndjson
+    updated_at: "2026-11-08"
+  - id: production-account-behaviour
+    status: unknown
+    claim: Actual account permissions, quota scope, custom form workflows and live Scheduler field mapping match the fictional simulation.
+    reason: No live provider writes or Meta messages were authorised or made during this change.
+    verification: Staging/live verification remains required before rollout. The simulation is fictional and cannot settle this claim.
+    source: review_prod.md; postman/simulations/zoho-test.context.md
+    updated_at: "2026-11-08"
+fingerprints:
+  - id: selected-production-fixes
+    date: "2026-11-08"
+    commit: null
+    cli: "1.75.0"

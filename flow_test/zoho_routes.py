@@ -51,9 +51,18 @@ def dispatch_zoho(request, instance, path: str) -> None:
             item = session.get(FlowSetting, "zoho_test_draft_date")
             value = json.loads(item.value) if item else None
             target = date.fromisoformat(value) if value else None
-        # Refresh on opening: source, absences or saved bookings may have changed since 3 AM.
+        # Production returns the background draft; save still rejects changed
+        # inputs. Test fixtures retain synchronous refresh-on-opening behaviour.
         if target is None or target != flow.next_offer_date():
             request.send_json({"draft": None})
+        elif not flow.is_test or getattr(flow, "background_planning", False):
+            from flow_test.planning_tasks import preview_status, submit_preview
+            with flow.sessions() as session:
+                job = session.get(FlowSetting, "zoho_draft_planning_job")
+                ident = json.loads(job.value) if job else None
+            planning = preview_status(instance, ident) if ident else submit_preview(
+                instance, target, None, flow.solver_settings)
+            request.send_json({"draft": planning.get("preview"), "planning": planning})
         else:
             request.send_json({"draft": daily_draft(instance, target)})
         return
@@ -65,8 +74,12 @@ def dispatch_zoho(request, instance, path: str) -> None:
         target = flow.next_offer_date()
         if target.weekday() == 6:
             target = None
-        result = apply_reports(flow, body["reports"], window=body.get("syncWindow"),
-                               full_snapshot=body.get("fullSnapshot", False))
+        from main_workflow.thanal_sync import enabled as thanal_enabled, apply_snapshot
+        if getattr(instance, "config", None) and thanal_enabled(instance.config):
+            result = apply_snapshot(flow, body["reports"], window=body.get("syncWindow"))
+        else:
+            result = apply_reports(flow, body["reports"], window=body.get("syncWindow"),
+                                   full_snapshot=body.get("fullSnapshot", False))
         instance.previews.clear()
         with flow.sessions.begin() as session:
             put_setting(session, "zoho_test_draft_date", target.isoformat() if target else None)
@@ -76,6 +89,14 @@ def dispatch_zoho(request, instance, path: str) -> None:
     # Import and planning are separate outcomes: a valid sync must not be described
     # as rolled back if the solver cannot prepare its draft.
     try:
+        if target and (not flow.is_test or getattr(flow, "background_planning", False)):
+            from flow_test.planning_tasks import submit_preview
+            planning = submit_preview(instance, target, None, flow.solver_settings)
+            with flow.sessions.begin() as session:
+                put_setting(session, "zoho_draft_planning_job", planning["jobId"])
+            request.send_json({**result, "draftDate": target.isoformat(), "draftPending": True,
+                               "planning": planning, "messages_sent": 0})
+            return
         draft = daily_draft(instance, target) if target else None
     except ValueError as exc:
         request.send_json({**result, "draftDate": None, "draftError": str(exc), "messages_sent": 0})

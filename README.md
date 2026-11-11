@@ -24,9 +24,22 @@ Open `http://127.0.0.1:8765` and use **Schedule generator**. By default, the app
 from those authoritative tables: `plan_detail` supplies treatment demand, `therapist_master`
 supplies therapy capabilities and branch eligibility, and `specialty_master` standardizes therapy
 names.
-Generated schedules cover one Monday–Saturday calendar week. Existing active appointments are
-kept in place, new needs fill remaining capacity, and every result is independently validated
-before the manager can persist new `PROPOSED` appointments.
+Browser drafts place new sessions on tomorrow's calendar and count saved appointments across
+that Monday–Saturday week. The scheduler keeps saved appointments in place and validates the
+draft before staff can save it.
+
+## Real-data rollout
+
+Use the production database and Zoho settings from `.env.example` with
+`MAIN_WORKFLOW_ENABLED=true` and `MAIN_WORKFLOW_DATA_SOURCE=main`. Prepare and back up
+the database, inspect it with `python -m main_workflow.migrate`, then apply the migration
+to the reviewed target. Configure the main operations key and verify that unauthenticated
+requests to `/api/patients` are rejected on the hosted site.
+
+Confirm the Zoho report names, field mapping, timestamps and report access against the
+production connection before applying the first sync. Keep `MAIN_WORKFLOW_LIVE=false`
+for the initial rollout. The example config selects `eic_whatsapp_scheduler` for a later
+activation, with timed sending off. `deploy_main.ps1` targets the existing test installation.
 
 ## Prototype boundaries
 

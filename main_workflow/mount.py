@@ -13,8 +13,9 @@ from urllib.parse import urlsplit
 
 from flow_test.shared_ui import dispatch_shared_api
 from flow_test.web_app import handler_for
-from flow_test.zoho_calendar import _push_lock
-from flow_test.zoho_export import acknowledge_export, export_preview, finish_export, prepare_export
+from flow_test.zoho_calendar import push_guard
+from flow_test.zoho_export import (acknowledge_export, export_preview, finish_export, prepare_export,
+                                   record_export_failures)
 from flow_test.zoho_push import REQUIRED_SCOPES, run_push
 from flow_test.zoho_routes import dispatch_zoho
 from main_workflow.config import WorkflowConfig, data_source, enabled, local_no_auth, requires_access_key
@@ -36,7 +37,8 @@ class MainRuntime:
         self.flow = MainWorkflow(engine, self.config)
         self.token = self.config.admin_token
         self.provider = ZohoProvider(self.config)
-        self.previews = {}
+        from flow_test.preview_store import PreviewStore
+        self.previews = PreviewStore(self.flow)  # Shared by every app copy.
         self.stop = threading.Event()
         self.worker = None
         if self.flow.live and embedded_worker_enabled():
@@ -77,12 +79,19 @@ class MainRuntime:
         import web_app
 
         target = web_app.parse_date(request.read_json().get("date"), "date")
-        if not _push_lock.acquire(blocking=False):
-            raise web_app.ApiError(409, "A Zoho push is already running; wait and refresh")
+        guard = push_guard(instance.flow)
+        try:
+            guard.__enter__()
+        except ValueError:
+            raise web_app.ApiError(409, "A Zoho push is already running; wait and refresh") from None
         try:
             settings = instance.provider.settings()
             instance.provider.verify(settings)
-            connection = refresh_access_token(settings)
+            try:
+                connection = refresh_access_token(settings)
+            except (ValueError, OSError):
+                # Never echo a provider's token response; nothing was finalised.
+                raise ValueError("Zoho could not reconnect. Check the main Zoho connection; no schedule was finalised") from None
             if not REQUIRED_SCOPES <= set(connection.get("scope", "").split()):
                 raise ValueError("The main Zoho connection needs read/create/update and form-definition permissions")
 
@@ -95,15 +104,20 @@ class MainRuntime:
                     return result
                 if operation == "ack":
                     return acknowledge_export(instance.flow, body["batchId"], body["appointmentId"],
-                                              body["fingerprint"], body["recordId"])
+                                              body["fingerprint"], body["recordId"], records=body.get("records"))
+                if operation == "failures":
+                    return record_export_failures(instance.flow, body["batchId"], body["failures"])
                 return finish_export(instance.flow, body["batchId"])
 
             result = run_push(settings, connection["access_token"], "", "", target, apply=True,
                               exchange=exchange, verify=instance.provider.verify, key_prefix="main-")
-        except (ValueError, OSError):
+        except ValueError as exc:
+            # Keep the named record failures (child code, date, Zoho reason) visible.
+            raise web_app.ApiError(409, f"Zoho push could not complete: {exc}") from None
+        except OSError:
             raise web_app.ApiError(409, "Zoho push could not complete. Check the configured main form, unique Scheduler_Key and permissions; any prepared batch is retained") from None
         finally:
-            _push_lock.release()
+            guard.__exit__(None, None, None)
         request.send_json(result)
 
 
@@ -170,6 +184,12 @@ def dispatch(request: Any, *, prefix: str = "/workflow") -> None:
         request.send_json({"error": "The main daily workflow is disabled"}, 404)
         return
     if request.command == "GET" and path in {"/workflow", "/workflow/"}:
+        if not requires_access_key():
+            request.send_response(302)
+            request.send_header("Location", "/")
+            request.send_header("Content-Length", "0")
+            request.end_headers()
+            return
         request.send_html(workspace_html())
         return
     assets = {"/workflow/shared.js": ROOT.parent / "web/app.js",
@@ -266,13 +286,16 @@ def route_webhook(payload: dict) -> dict:
         return route_payload(payload, instance) if instance.flow.live else payload
     if not instance.flow.live:
         return payload
-    contacts = instance.flow.contact_numbers()
+    from flow_test.mount import webhook_numbers
+
+    numbers = webhook_numbers(payload)
+    contacts = instance.flow.contacts_for(numbers)
     business = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
     test_contacts = set()
     if os.getenv("FLOW_TEST_LIVE", "false").lower() == "true":
         from flow_test.mount import runtime as test_runtime
 
-        test_contacts = test_runtime().flow.contact_numbers()
+        test_contacts = test_runtime().flow.contacts_for(numbers)
     remaining, selected = copy.deepcopy(payload), copy.deepcopy(payload)
     for original_entry, main_entry in zip(remaining.get("entry", []), selected.get("entry", [])):
         for original_change, main_change in zip(original_entry.get("changes", []), main_entry.get("changes", [])):

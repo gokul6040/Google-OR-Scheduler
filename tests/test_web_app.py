@@ -213,7 +213,7 @@ def test_read_only_browser_summary_memory_restores_after_server_context_loss():
 
 
 def test_parse_search_seconds_accepts_manager_facing_options():
-    assert web_app.parse_search_seconds(None) == 20.0
+    assert web_app.parse_search_seconds(None) == 300.0
     assert web_app.parse_search_seconds("120") == 120.0
     assert web_app.parse_search_seconds(300) == 300.0
 
@@ -282,9 +282,8 @@ def test_generate_schedule_uses_tomorrow_and_one_day_slots(monkeypatch):
         scheduled_sessions=0, validation={}, statistics={},
     )
 
-    def load_problem(_session, week_start, *, planning_start_date):
-        assert week_start == date(2026, 9, 28)
-        assert planning_start_date == target
+    def load_problem(_session, planning_date):
+        assert planning_date == target
         return problem
 
     def solve(inputs, *, mode, settings):
@@ -297,7 +296,7 @@ def test_generate_schedule_uses_tomorrow_and_one_day_slots(monkeypatch):
 
     monkeypatch.setattr(web_app, "next_planning_date", lambda: target)
     monkeypatch.setattr(web_app, "SessionLocal", lambda: nullcontext(object()))
-    monkeypatch.setattr(web_app, "load_scheduling_problem", load_problem)
+    monkeypatch.setattr(web_app, "load_daily_scheduling_problem", load_problem)
     monkeypatch.setattr(web_app, "generate_weekly_schedule", solve)
     monkeypatch.setattr(web_app, "serialize_preview", lambda _, start, end: {"start": start, "end": end})
     monkeypatch.setattr(web_app, "PREVIEWS", {})

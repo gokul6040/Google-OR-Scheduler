@@ -7,6 +7,7 @@ written to the database, source tree, audit log, or HTTP responses.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 from http.client import HTTPException
 import json
 import os
@@ -25,6 +26,7 @@ DEFAULT_SCOPES = (
 )
 
 
+@contextmanager
 def open_zoho_request(request: Request, timeout: int):
     """Open a Zoho request without the unavailable inherited local proxy.
 
@@ -32,7 +34,11 @@ def open_zoho_request(request: Request, timeout: int):
     and retrying an already-opened ``Request`` against another opener leaves its
     proxy destination mutated.  A clean direct opener avoids both behaviours.
     """
-    return build_opener(ProxyHandler({})).open(request, timeout=timeout)
+    from services.zoho_budget import call_budget
+
+    with call_budget(request.full_url):
+        with build_opener(ProxyHandler({})).open(request, timeout=timeout) as response:
+            yield response
 
 
 @dataclass(frozen=True)
@@ -318,7 +324,7 @@ def get_report_records(
     records: list[dict[str, Any]] = []
     cursor: str | None = None
     seen_cursors: set[str] = set()
-    parameters = {"max_records": 1000, "field_config": "all"}
+    parameters = {"max_records": 200, "field_config": "all"}
     if criteria:
         parameters["criteria"] = criteria
     while True:

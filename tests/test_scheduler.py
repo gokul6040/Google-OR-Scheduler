@@ -56,7 +56,7 @@ def test_absence_priority_wins_when_only_one_safe_slot_remains(base_problem):
     assert result.appointments[0].requirement_id == 2
 
 
-def test_large_quick_preview_uses_a_validated_fast_schedule(base_problem):
+def test_large_preview_always_uses_cp_sat(base_problem):
     requirements = [req(index, index, 1, index) for index in range(1, 121)]
 
     result = generate_weekly_schedule(
@@ -65,7 +65,7 @@ def test_large_quick_preview_uses_a_validated_fast_schedule(base_problem):
     )
 
     assert_valid(result)
-    assert result.statistics["strategy"] == "quick_greedy"
+    assert result.statistics["strategy"] == "cp_sat"
     assert result.scheduled_sessions == 120
 
 

@@ -180,6 +180,37 @@ def test_changed_fingerprint_during_push_is_picked_up_next_time(flow):
     assert next_batch["changes"][0]["fields"]["Status"] == "NO_SHOW"
 
 
+def test_unfinished_date_does_not_block_an_independent_date(flow):
+    flow.drain()
+    first = prepare_export(flow, DAY)
+    tomorrow = DAY + timedelta(days=1)
+    flow.generate(tomorrow)
+    with flow.sessions.begin() as session:
+        for item in session.scalars(select(Appointment).where(Appointment.date == tomorrow)):
+            item.status = AppointmentStatus.CONFIRMED
+    second = prepare_export(flow, tomorrow)
+    assert second["id"] != first["id"] and second["changes"]
+    assert not {r["appointmentId"] for r in first["changes"]}.intersection(
+        r["appointmentId"] for r in second["changes"])
+    acknowledge_all(flow, second)
+    finish_export(flow, second["id"])
+    assert export_preview(flow, DAY)["openBatch"]["id"] == first["id"]
+    acknowledge_all(flow, first)
+    finish_export(flow, first["id"])
+
+
+def test_failed_reply_blocks_only_its_own_date(flow):
+    flow.drain()
+    with flow.sessions.begin() as session:
+        offer = session.scalar(select(FlowOffer))
+        job = flow._job(session, "failed-date-reply", "INBOUND", {
+            "from": offer.recipient, "button": {"payload": f"ft:{offer.token}:NO"}})
+        job.status = "FAILED"
+    with pytest.raises(ValueError, match="reply needs staff review"):
+        prepare_export(flow, DAY)
+    assert prepare_export(flow, DAY + timedelta(days=1))["date"] == (DAY + timedelta(days=1)).isoformat()
+
+
 def test_export_api_is_authenticated_and_rejects_forged_ack(flow, monkeypatch):
     monkeypatch.setattr(mount, "runtime", lambda: SimpleNamespace(flow=flow, token="test-key", previews={}))
     assert request("/test/api/zoho/export/prepare", {"date": DAY.isoformat()}, token="wrong")[0] == 401

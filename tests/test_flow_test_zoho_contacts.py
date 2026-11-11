@@ -106,9 +106,9 @@ def test_invalid_import_does_not_activate_a_new_contact(source_contacts):
     flow, reports, _calls = source_contacts
     broken = deepcopy(reports)
     broken["Plan_Report"][0].update(Parent_No="917777777777", Schedule="bad schedule")
-    with pytest.raises(ValueError, match="needs therapy"):
-        apply_reports(flow, broken, START)
-    assert flow.recipients["TEST-H"] == PARENT
+    result = apply_reports(flow, broken, START)
+    assert result["partial"] and "TEST-H" in result["quarantined"]
+    assert "TEST-H" not in flow.recipients
     assert "917777777777" not in flow.transport.allowed
 
 

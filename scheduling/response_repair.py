@@ -33,8 +33,8 @@ def suggest_declined_visits(
     settings: SolverSettings = SOLVER_SETTINGS,
 ) -> ScheduleResult:
     """Find unsaved alternatives within this week, limited to released demand."""
-    pinned_counts = Counter(item.requirement_id for item in problem.pinned)
-    released_counts = Counter(item.requirement_id for item in released)
+    pinned_counts = Counter(item.requirement_id for item in problem.pinned if item.counts_toward_requirement)
+    released_counts = Counter(item.requirement_id for item in released if item.counts_toward_requirement)
     requirements = [
         replace(item, sessions_per_week=min(
             item.sessions_per_week,

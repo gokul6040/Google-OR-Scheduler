@@ -91,15 +91,30 @@ def test_yes_confirms_whole_visit_without_moving_others(flow):
     assert {j["status"] for j in flow.state(MONDAY)["jobs"]} <= {"DONE", "SIMULATED"}
 
 
-def test_no_immediately_declines_whole_day_and_proposes_standby(flow):
+def test_no_releases_the_visit_and_staff_choose_the_replacement(flow):
+    from services.admin_reservation_service import preview_admin_reservation
+    from services.replacement_service import find_replacement_candidates
+
     tokens = publish(flow)
     reply(flow, tokens["TEST-B"], "NO")
     state = flow.state(MONDAY)
-    assert next(a for a in state["appointments"] if a["patient"] == "TEST-B")["status"] == "NEEDS_RESCHEDULING"
-    standby = next(a for a in state["appointments"] if a["patient"] == "TEST-D")
-    assert standby["status"] == "PROPOSED"
-    assert len(state["offers"]) == 3  # replacement does not auto-message
-    assert flow.publish(MONDAY, standby["id"]) == 1
+    released = [a for a in state["appointments"] if a["patient"] == "TEST-B"]
+    assert released and all(a["status"] == "NEEDS_RESCHEDULING" for a in released)
+    # Nothing fills the slot by itself: no automatic proposal, job or message.
+    assert not any(a["status"] == "PROPOSED" for a in state["appointments"])
+    with flow.sessions() as session:
+        assert session.scalar(select(FlowJob.id).where(FlowJob.kind == "REPAIR")) is None
+        source = session.get(Appointment, released[0]["id"])
+        listed = find_replacement_candidates(session, source, MONDAY, whole_visit=False)
+        assert "TEST-D" in [item["patient_code"] for item in listed]
+        d_id = next(item["patient_id"] for item in listed if item["patient_code"] == "TEST-D")
+        preview = preview_admin_reservation(session, source.id, d_id, whole_visit=False)
+    assert len(state["offers"]) == 3
+    # Staff picked TEST-D and chose "Send offer & wait for confirmation".
+    flow.reserve_with_message(source.id, patient_id=d_id, request_id="staff-pick-d",
+                              preview_token=preview["preview_token"], whole_visit=False,
+                              override_warnings=bool(preview["warnings"]))
+    standby = next(a for a in flow.state(MONDAY)["appointments"] if a["patient"] == "TEST-D")
     flow.drain()
     d_token = next(o["token"] for o in flow.state(MONDAY)["offers"] if o["patient"] == "TEST-D")
     reply(flow, d_token, "YES")
@@ -242,7 +257,8 @@ def test_response_failure_rolls_back_appointment_and_ack(flow, monkeypatch):
     monkeypatch.setattr("flow_test.service.process_daily_responses", failure)
     reply(flow, tokens["TEST-B"], "DAY")
     assert flow.state(MONDAY)["appointments"] == before
-    assert flow.state(MONDAY)["jobs"][0]["status"] == "FAILED"
+    assert flow.state(MONDAY)["jobs"][0]["status"] == "QUEUED"
+    assert any("reply needs review" in item["reason"].lower() for item in flow.state(MONDAY)["inbox"])
 
 
 def test_recipient_file_requires_explicit_consent(tmp_path):
@@ -296,9 +312,9 @@ def test_transport_registered_contact_check_and_preview_never_calls_meta(monkeyp
 def test_live_simulation_and_unmapped_publish_are_rejected(flow):
     flow.generate(MONDAY)
     flow.live = True
-    with pytest.raises(ValueError, match="parent phone number"):
-        flow.publish(MONDAY)
+    assert flow.publish(MONDAY) == 0
     assert not flow.state(MONDAY)["jobs"]
+    assert flow.state(MONDAY)["inbox"]
     with pytest.raises(ValueError, match="preview"):
         flow.simulate("a" * 20, "YES")
 

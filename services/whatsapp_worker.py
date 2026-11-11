@@ -38,18 +38,43 @@ def run_worker(flow, stop: threading.Event) -> None:
                 print(f"WhatsApp acknowledgment worker error type={type(exc).__name__}", flush=True)
             stop.wait(0.2)
 
+    def repairs() -> None:
+        while not stop.is_set():
+            try:
+                flow.process_repairs()
+            except Exception as exc:
+                print(f"WhatsApp repair worker error type={type(exc).__name__}", flush=True)
+            stop.wait(0.2)
+
     events = threading.Thread(target=incoming, name="whatsapp-replies")
     replies = threading.Thread(target=acknowledgments, name="whatsapp-acknowledgments")
+    repair_worker = threading.Thread(target=repairs, name="whatsapp-repairs")
     events.start()
     replies.start()
+    repair_worker.start()
     print("WhatsApp worker ready; replies have a separate processing lane.", flush=True)
     next_reminder_scan = 0.0
+    next_cleanup = time.monotonic() + 60  # Let start-up recovery finish first.
     try:
         while not stop.is_set():
             try:
                 if time.monotonic() >= next_reminder_scan:
-                    flow.queue_template_reminders()
+                    try:
+                        flow.queue_template_reminders()
+                    except Exception as exc:
+                        print(f"WhatsApp reminder scan error type={type(exc).__name__}", flush=True)
                     next_reminder_scan = time.monotonic() + 30
+                if time.monotonic() >= next_cleanup:
+                    # Hourly retention clean-up (#27); a failure retries next hour.
+                    next_cleanup = time.monotonic() + 3600
+                    try:
+                        from flow_test.cleanup import cleanup_operational_data
+                        removed = cleanup_operational_data(flow)
+                        if any(removed.values()):
+                            print("Retention clean-up removed " + ", ".join(
+                                f"{name}={count}" for name, count in removed.items() if count), flush=True)
+                    except Exception as exc:
+                        print(f"Retention clean-up error type={type(exc).__name__}", flush=True)
                 flow._dispatch_batch(flow.send_batch_size, kinds=("OFFER",))
             except Exception as exc:
                 print(f"WhatsApp sender error type={type(exc).__name__}", flush=True)
@@ -58,6 +83,7 @@ def run_worker(flow, stop: threading.Event) -> None:
         stop.set()
         events.join()
         replies.join()
+        repair_worker.join()
 
 
 def main() -> None:

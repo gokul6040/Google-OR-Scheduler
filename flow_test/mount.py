@@ -32,6 +32,8 @@ class MountedFlow:
             recipients=load_recipients(contacts) if has_contacts else {},
             recipient_names=load_recipient_names(contacts) if has_contacts else {},
         )
+        # /test serves the shared staff screens, which need only the selected date.
+        self.flow.compact_state = True
         self.token = os.getenv("FLOW_TEST_ADMIN_TOKEN", "").strip()
         if not self.token:
             token_file = ROOT / "data" / "admin.token"
@@ -40,7 +42,8 @@ class MountedFlow:
                 token_file.write_text(secrets.token_urlsafe(32), encoding="utf-8")
             self.token = token_file.read_text(encoding="utf-8").strip()
         self.stop = threading.Event()
-        self.previews = {}
+        from flow_test.preview_store import PreviewStore
+        self.previews = PreviewStore(self.flow)  # Shared by every app copy.
         self.worker = None
         if live and embedded_worker_enabled():
             self.worker = threading.Thread(target=self.work, daemon=True)
@@ -94,10 +97,19 @@ def route_webhook(payload):
     return route_payload(payload, instance)
 
 
+def webhook_numbers(payload: dict) -> set[str]:
+    """Sender and receipt numbers in one callback; only these need a contact check."""
+    return {str(item.get(field))
+            for entry in payload.get("entry", []) if isinstance(entry, dict)
+            for change in entry.get("changes", []) if isinstance(change, dict)
+            for kind, field in (("messages", "from"), ("statuses", "recipient_id"))
+            for item in change.get("value", {}).get(kind, []) if isinstance(item, dict) and item.get(field)}
+
+
 def route_payload(payload: dict, instance) -> dict:
     """Route a signed callback to the selected retained test runtime."""
     phone_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
-    allowed = instance.flow.contact_numbers()
+    allowed = instance.flow.contacts_for(webhook_numbers(payload))
     remaining = copy.deepcopy(payload)
     selected = copy.deepcopy(payload)
     for original_entry, test_entry in zip(remaining.get("entry", []), selected.get("entry", [])):

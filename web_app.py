@@ -45,7 +45,9 @@ from database.models import (
     ZohoAppointmentSync,
     ZohoPlanDetailRecord,
 )
-from database.repository import limit_new_bookings_to_day, load_scheduling_problem, save_proposed_schedule
+from database.repository import (
+    limit_new_bookings_to_day, load_daily_scheduling_problem, load_scheduling_problem, save_proposed_schedule,
+)
 from importers.initialize_source import initialize_source_database
 from scheduling.cp_sat_scheduler import generate_weekly_schedule
 from scheduling.slot_config import CONSECUTIVE_TO_NEXT, SLOTS, slot_label
@@ -1754,6 +1756,15 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
                 params = parse_qs(parsed.query)
                 self.send_json(patients_payload(params.get("q", [""])[0]))
                 return
+            match = re.fullmatch(r"/api/patients/(\d+)/activation", parsed.path)
+            if match:
+                from services.patient_activation_service import activation_review
+                with SessionLocal() as session:
+                    patient = session.get(Patient, int(match.group(1)))
+                    if patient is None:
+                        raise ApiError(HTTPStatus.NOT_FOUND, "Patient not found")
+                    self.send_json(activation_review(session, patient))
+                return
             match = re.fullmatch(r"/api/patients/(\d+)/preferences", parsed.path)
             if match:
                 self.send_json(patient_preferences_payload(int(match.group(1))))
@@ -1936,6 +1947,13 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             patient = lock_patient(session, patient_id)
             if patient is None:
                 raise ApiError(HTTPStatus.NOT_FOUND, "Patient not found")
+            if active and not patient.active:
+                from services.patient_activation_service import activation_review
+                review = activation_review(session, patient)
+                if not review["canActivate"]:
+                    self.send_json({"error": "Cannot mark this patient active. " + " ".join(review["issues"]),
+                                    "activation": review}, HTTPStatus.CONFLICT)
+                    return
             if patient.active and not active and flow is not None:
                 flow.review_inactive_patient_offers(session, patient, today)
             change_patient_status(
@@ -2432,7 +2450,7 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             raise ApiError(HTTPStatus.BAD_REQUEST, "The centre does not schedule sessions on Sundays")
         settings = replace(SOLVER_SETTINGS, max_time_seconds=parse_search_seconds(body.get("searchSeconds")))
         with SessionLocal() as session:
-            problem = load_scheduling_problem(session, monday(target), planning_start_date=target)
+            problem = load_daily_scheduling_problem(session, target)
             limit_new_bookings_to_day(problem, target)
             result = generate_weekly_schedule(problem, mode=SolverMode.BEST_EFFORT, settings=settings)
         day_result = replace(result, appointments=[item for item in result.appointments if item.date == target])

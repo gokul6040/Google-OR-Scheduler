@@ -131,9 +131,9 @@ def main():
                     "text": {"body": "START"},
                 }],
             }}]}]})
+            assert remote.process_batch() == 1 and sent == []  # Process START first.
             assert remote.process_batch() == 1 and sent == ["OFFER"]
-            remote.process_batch()  # Process the inbound event; it must not resend the offer.
-            assert sent == ["OFFER"]
+            assert remote.process_batch() == 0 and sent == ["OFFER"]
             with local.sessions() as session:
                 job = session.scalar(select(FlowJob).where(FlowJob.kind == "OFFER"))
                 offer = session.scalar(select(FlowOffer))
@@ -148,6 +148,9 @@ def main():
             remote_server.shutdown()
             remote_server.server_close()
             remote_thread.join(timeout=5)
+            control = vars(remote).get("dispatch_control")
+            if control is not None:
+                control.engine.dispose()
             local.engine.dispose()
             remote.engine.dispose()
             mount._runtime = None

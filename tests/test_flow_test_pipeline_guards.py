@@ -67,8 +67,8 @@ def test_queued_offer_waits_for_reconciliation_and_resumes_once(imported_flow, c
     window = {"from": None, "to": "2026-10-24T00:00:00Z"}
     invalid = deepcopy(corrected)
     invalid["Plan_Report"][0]["Schedule"] = "invalid"
-    with pytest.raises(ValueError):
-        apply_reports(flow, invalid, window=window, full_snapshot=True)
+    result = apply_reports(flow, invalid, window=window, full_snapshot=True)
+    assert result["partial"] and "TEST-H" in result["quarantined"]
     assert flow.state(DAY)["offers"][0]["send_status"] == "WAITING_FOR_SYNC"
     assert calls == []
 

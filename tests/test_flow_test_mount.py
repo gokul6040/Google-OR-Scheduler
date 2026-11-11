@@ -175,6 +175,9 @@ def test_shared_preview_save_is_isolated_from_main_preview_store(mounted, monkey
 
 def test_shared_daily_preview_counts_fixed_past_future_and_completed_sessions(mounted):
     monday, target, friday = date(2026, 10, 19), date(2026, 10, 21), date(2026, 10, 23)
+    with mounted.sessions.begin() as session:
+        for requirement in session.scalars(select(TreatmentRequirement)):
+            requirement.plan_start_date = monday
     mounted.generate(monday)
     mounted.generate(friday)
     with mounted.sessions.begin() as session:
@@ -283,7 +286,7 @@ def test_saving_another_date_never_publishes_its_visits_or_tomorrows(mounted, mo
 
 
 @pytest.mark.parametrize("missing", ["recipient"])
-def test_tomorrow_save_rolls_back_whole_batch_until_recipients_ready(mounted, monkeypatch, missing):
+def test_tomorrow_save_holds_missing_recipient_without_blocking_other_families(mounted, monkeypatch, missing):
     from database.models import AuditLog
     from flow_test.models import FlowJob, FlowOffer
 
@@ -299,16 +302,17 @@ def test_tomorrow_save_rolls_back_whole_batch_until_recipients_ready(mounted, mo
     assert preview["liveMessaging"]
     path = f"/test/api/schedules/{preview['previewId']}/save"
     status, raw = request(path, {})
-    assert status == 409, raw
-    assert (b"parent phone number" if missing == "recipient" else b"START") in raw
+    assert status == 200, raw
+    assert json.loads(raw)["offers"] == 2
+    assert json.loads(raw)["heldForReview"] == 1
     with mounted.sessions() as session:
-        assert all(not list(session.scalars(select(model))) for model in (Appointment, AuditLog, FlowOffer, FlowJob))
-    # The same preview remains retryable after fixing contact readiness.
+        assert len(list(session.scalars(select(Appointment)))) == 4
+        assert len(list(session.scalars(select(FlowOffer)))) == 2
+    # Fixing the contact allows publishing the held visit without duplicate offers.
     mounted.recipients["TEST-C"] = "919999999992"
     monkeypatch.setattr(mounted, "_session_deadline", lambda *_: float("inf"))
-    status, raw = request(path, {})
-    assert status == 200, raw
-    assert json.loads(raw)["offers"] == 3
+    assert mounted.publish(tomorrow) == 1
+    assert len(mounted.state(tomorrow)["offers"]) == 3
     assert len(mounted.state(tomorrow)["appointments"]) == 4
     assert all(j["status"] == "QUEUED" for j in mounted.state(tomorrow)["jobs"])
 
@@ -463,10 +467,23 @@ def test_shared_ui_no_declines_day_then_requires_replacement_publication(mounted
     assert offer["last_reply"] == "NO" and offer["state"] == "DECLINED"
     current = state()
     assert next(o for o in current["offers"] if o["token"] == token)["last_reply"] == "NO"
-    replacement = next(a for a in current["appointments"] if a["patient"] == "TEST-D")
-    assert replacement["status"] == "PROPOSED"
+    released = next(a for a in current["appointments"] if a["patient"] == "TEST-B")
+    assert released["status"] == "NEEDS_RESCHEDULING"
+    # No automatic proposal: staff see the ranked list, choose, then send the offer.
+    assert not any(a["status"] == "PROPOSED" for a in current["appointments"])
     assert not any(o["patient"] == "TEST-D" for o in current["offers"])
-    assert request("/test/api/publish", {"date": target, "appointment_id": replacement["id"]})[0] == 200
+    status, raw = request(f"/test/api/appointments/{released['id']}/replacement-candidates?wholeVisit=false")
+    listed = json.loads(raw)["candidates"]
+    assert status == 200 and "TEST-D" in [item["patient_code"] for item in listed]
+    choice = next(item["patient_id"] for item in listed if item["patient_code"] == "TEST-D")
+    status, raw = request(f"/test/api/appointments/{released['id']}/reservation-preview",
+                          {"patientId": choice, "wholeVisit": False})
+    preview = json.loads(raw)
+    assert status == 200
+    status, _ = request(f"/test/api/appointments/{released['id']}/reserve", {
+        "patientId": choice, "wholeVisit": False, "mode": "with_messaging", "requestId": "staff-pick-d",
+        "previewToken": preview["preview_token"], "overrideWarnings": bool(preview["warnings"])})
+    assert status == 200
     request("/test/api/process", {})
     assert next(o for o in state()["offers"] if o["patient"] == "TEST-D")["send_status"] == "SIMULATED"
 
@@ -477,9 +494,10 @@ def test_shared_ui_live_mode_rejects_simulation_and_unconfigured_recipients(moun
     if target.weekday() == 6:
         target += timedelta(days=1)
     mounted.generate(target)
-    assert request("/test/api/publish", {"date": target.isoformat()})[0] == 400
+    assert request("/test/api/publish", {"date": target.isoformat()})[0] == 200
     assert request("/test/api/simulate", {"token": "a" * 20, "action": "YES"})[0] == 400
     assert mounted.state(target)["offers"] == []
+    assert mounted.state(target)["inbox"]
 
 
 def replacement_offer_request(flow):

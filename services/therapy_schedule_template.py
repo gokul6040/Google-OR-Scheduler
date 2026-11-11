@@ -84,21 +84,40 @@ def current_contact_matches(session: Session, offer: FlowOffer) -> bool:
     return contacts is None or contacts.get(offer.patient_code) == offer.recipient
 
 
+REMINDER_GAP = timedelta(hours=1)
+REMINDER_TIMES = (time(14), time(16))
+
+
+def reminder_due(accepted_utc: datetime, day: date) -> datetime | None:
+    """When an unanswered offer's single reminder is due (IST), on the day before the visit.
+
+    The parent always has at least one hour with the first offer. Offers sent before 13:00
+    are reminded at 14:00; offers sent 13:00-15:00 at 16:00; later offers one hour after
+    they were sent. ``None`` means the hour ends on the visit day, so no reminder is sent.
+    """
+    earliest = accepted_utc.replace(tzinfo=timezone.utc).astimezone(IST) + REMINDER_GAP
+    for slot in REMINDER_TIMES:
+        candidate = datetime.combine(day, slot, tzinfo=IST)
+        if candidate >= earliest:
+            return candidate
+    return earliest if earliest.date() == day else None
+
+
 def queue_daily_reminders(flow: Any) -> int:
-    """Queue one 14:00 reminder per sent, unanswered, unexpired offer."""
+    """Queue one reminder per sent, unanswered, unexpired offer (14:00, 16:00 or sent + 1 hour)."""
     if (not scheduled_template_enabled(flow) or not flow.live
             or not getattr(flow, "messaging_enabled", True) or getattr(flow, "remote_worker", False)):
         return 0
     now = datetime.now(IST)
-    reminder_at = datetime.combine(now.date(), time(14), tzinfo=IST)
     target = now.date() + timedelta(days=1)
-    if now < reminder_at or target.weekday() == 6:
+    # No reminder is ever due before 14:00 on the day before the visit.
+    if now < datetime.combine(now.date(), REMINDER_TIMES[0], tzinfo=IST) or target.weekday() == 6:
         return 0
     utc_now = now.astimezone(timezone.utc).replace(tzinfo=None)
-    reminder_utc = reminder_at.astimezone(timezone.utc).replace(tzinfo=None)
     count = 0
     with flow.lock, flow.sessions.begin() as session:
         contacts = source_contacts(session)
+        unsubscribed = flow.unsubscribed_numbers(session) if hasattr(flow, "unsubscribed_numbers") else {}
         waiting_replies = {json.loads(job.payload).get("from") for job in session.scalars(
             select(FlowJob).where(FlowJob.kind == "INBOUND", FlowJob.status.in_(("QUEUED", "PROCESSING")))
         )}
@@ -108,15 +127,18 @@ def queue_daily_reminders(flow: Any) -> int:
             original_key = hashlib.sha256(f"offer:{offer.token}".encode()).hexdigest()
             original = session.scalar(select(FlowJob).where(FlowJob.event_key == original_key))
             if (original is None or original.status != "SENT" or not original.message_id
-                    or original.delivery == "failed" or original.accepted_at is None
-                    or original.accepted_at >= reminder_utc):
+                    or original.delivery == "failed" or original.accepted_at is None):
                 continue
+            reminder_at = reminder_due(original.accepted_at, now.date())
+            if reminder_at is None or now < reminder_at:
+                continue  # Not due yet (checked again on a later tick), or too late.
             payload = json.loads(original.payload)
             if (payload.get("template_profile") != PROFILE or payload.get("reminder")
                     or payload.get("fields", {}).get("date") != target.isoformat()
                     or payload.get("recipient") != offer.recipient
                     or (contacts is not None and contacts.get(offer.patient_code) != offer.recipient)
                     or offer.recipient in waiting_replies
+                    or offer.recipient in unsubscribed
                     or not session.scalar(select(Patient.active).where(Patient.patient_code == offer.patient_code))):
                 continue
             try:
@@ -151,9 +173,40 @@ def prepare_template_job(flow: Any, session: Session, job: FlowJob, payload: dic
         job.status, job.error = "WAITING_FOR_ENABLE", "The timed therapy-template workflow is disabled"
         return False
     now = datetime.now(IST)
-    target = now.date() + timedelta(days=1)
-    if target.weekday() == 6 or payload.get("fields", {}).get("date") != target.isoformat():
-        job.status, job.error = "OBSOLETE", "This template applies only to tomorrow's non-Sunday appointments"
+    try:
+        target = date.fromisoformat(payload.get("fields", {}).get("date", ""))
+    except ValueError:
+        flow._terminal(session, job, "The offer has an invalid appointment date. Review the booking.")
+        return False
+    if target.weekday() == 6 or target < now.date():
+        flow._terminal(session, job, "The offer is for a past date or Sunday. Review the booking.")
+        return False
+    if target == now.date() and payload.get("reminder"):
+        # A delayed reminder says "confirm for tomorrow"; on the visit day that wording
+        # is wrong. Close it instead of scheduling a retry for yesterday.
+        job.status = "OBSOLETE"
+        job.error = ("Reminder not sent: it was delayed until the visit day, so its "
+                     "'tomorrow' wording no longer fits. The original offer stands.")
+        job.next_attempt_at = None
+        return False
+    if target == now.date() and not payload.get("reminder"):
+        # The approved daily template says tomorrow. Use dated session buttons
+        # only inside a verified contact window; never mislabel today's visit.
+        deadline = flow._session_deadline(session, payload["recipient"])
+        if deadline <= now.timestamp():
+            job.status, job.error = "WAITING_FOR_CONTACT", "Same-day offer needs a parent message to open the contact window."
+            flow._attention(session, job, "Same-day replacement needs contact", job.error)
+            return False
+        payload.update(session_override=True, session_expires_at=deadline)
+        return True
+    if target != now.date() + timedelta(days=1):
+        due = datetime.combine(target - timedelta(days=1), time(9), tzinfo=IST)
+        if due <= now:
+            # Never schedule a retry in the past; that would loop until a limit stops it.
+            flow._terminal(session, job, "The offer missed its sending time. Review the booking.")
+            return False
+        job.status, job.error = "RETRY_WAIT", "Offer retained until its valid sending day."
+        job.next_attempt_at = due.astimezone(timezone.utc).replace(tzinfo=None)
         return False
     if now.timestamp() < payload.get("not_before", 0):
         job.status = "RETRY_WAIT"

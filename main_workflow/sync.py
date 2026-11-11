@@ -30,16 +30,23 @@ def main() -> None:
             return
         reports = provider.fetch(None if args.reconcile else since, until)
         if args.apply:
-            result = api(config, "import", {"source": config.source_name, "reports": reports,
-                         "sourceTimezones": SOURCE_TIMEZONES, "syncWindow": {"from": since, "to": until},
-                         "fullSnapshot": args.reconcile})
+            body = {"source": config.source_name, "reports": reports,
+                    "sourceTimezones": SOURCE_TIMEZONES, "syncWindow": {"from": since, "to": until},
+                    "fullSnapshot": args.reconcile}
+            from main_workflow.thanal_sync import enabled as thanal_enabled
+            result = (api(config, "import", body, timeout=900) if thanal_enabled(config)
+                      else api(config, "import", body))
         else:
-            scenario = convert_reports(reports, fictional=provider.fictional, source=config.source_name)
-            result = {"mode": "VALIDATION ONLY", "patients": len(scenario["patients"]),
-                      "consultants": len(scenario["therapists"]), "messages_sent": 0}
+            from main_workflow.thanal_sync import enabled as thanal_enabled, prepare_snapshot
+            if thanal_enabled(config):
+                result = {"mode": "VALIDATION ONLY", **prepare_snapshot(reports)["summary"]}
+            else:
+                scenario = convert_reports(reports, fictional=provider.fictional, source=config.source_name)
+                result = {"mode": "VALIDATION ONLY", "patients": len(scenario["patients"]),
+                          "consultants": len(scenario["therapists"]), "messages_sent": 0}
         result["downloaded"] = {name: len(rows) for name, rows in reports.items()}
         print(json.dumps(result, indent=2))
-        if result.get("draftError"):
+        if result.get("draftError") or result.get("partial"):
             raise SystemExit(1)
     except ValueError as exc:
         print(f"Main source sync stopped: {exc}")

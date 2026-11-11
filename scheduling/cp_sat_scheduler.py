@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 from dataclasses import replace
 from datetime import timedelta
 from math import ceil
+from fractions import Fraction
 from time import monotonic
 
 from ortools.sat.python import cp_model
@@ -216,37 +217,40 @@ def _add_cadence_preferences(
             objective.append(-settings.cadence_deviation_penalty * deviation)
 
 
-def _location_partitions(problem: SchedulingProblem) -> list[SchedulingProblem] | None:
-    """Split a problem only when every child is assigned to one branch.
+def location_partitions(problem: SchedulingProblem) -> list[SchedulingProblem] | None:
+    """Split independent centres; shared patients or therapists join components."""
+    patient_locations, therapist_locations = defaultdict(set), defaultdict(set)
+    locations = set()
+    for item in [*problem.requirements, *problem.pinned]:
+        patient_locations[item.patient_id].add(item.location_id)
+        therapist_locations[item.therapist_id].add(item.location_id)
+        locations.add(item.location_id)
+    parents = {location: location for location in locations}
 
-    Branches have independent therapist and room capacity in the imported
-    master data.  Solving them separately avoids building one enormous model,
-    while the patient daily-visit rule remains valid because a child never
-    appears in more than one partition.  If that input assumption changes,
-    return ``None`` and retain the global model for correctness.
-    """
-    patient_locations = defaultdict(set)
-    requirements_by_location = defaultdict(list)
-    for requirement in problem.requirements:
-        patient_locations[requirement.patient_id].add(requirement.location_id)
-        requirements_by_location[requirement.location_id].append(requirement)
-    if len(requirements_by_location) < 2 or any(
-        len(locations) > 1 for locations in patient_locations.values()
-    ):
+    def root(location):
+        while parents[location] != location:
+            parents[location] = parents[parents[location]]
+            location = parents[location]
+        return location
+
+    for shared in [*patient_locations.values(), *therapist_locations.values()]:
+        ordered = sorted(shared)
+        for location in ordered[1:]:
+            parents[root(location)] = root(ordered[0])
+    components = defaultdict(set)
+    for location in sorted(locations):
+        components[root(location)].add(location)
+    if len(components) < 2:
         return None
-
     partitions = []
-    for location_id, requirements in sorted(requirements_by_location.items()):
-        requirement_ids = {item.id for item in requirements}
+    for group in components.values():
+        requirements = [r for r in problem.requirements if r.location_id in group]
+        requirement_ids = {r.id for r in requirements}
         partitions.append(replace(
-            problem,
-            requirements=requirements,
-            location_capacities={location_id: problem.location_capacities.get(location_id, 0)},
-            eligible_therapists={
-                requirement_id: problem.eligible_therapists.get(requirement_id, ())
-                for requirement_id in requirement_ids
-            },
-            pinned=[item for item in problem.pinned if item.location_id == location_id],
+            problem, requirements=requirements,
+            location_capacities={location: problem.location_capacities.get(location, 0) for location in group},
+            eligible_therapists={r: problem.eligible_therapists.get(r, ()) for r in requirement_ids},
+            pinned=[a for a in problem.pinned if a.location_id in group],
         ))
     return partitions
 
@@ -259,7 +263,9 @@ def _combined_partition_result(
     """Merge independent branch results and validate them against the full week."""
     appointments = [item for result in results for item in result.appointments]
     unmet = [item for result in results for item in result.unmet]
-    issues, validation = validate_schedule(problem, appointments)
+    blocked = [location for result in results for location in result.statistics.get("blocked_locations", [])]
+    healthy = [item for item in appointments if item.location_id not in blocked]
+    issues, validation = validate_schedule(problem, healthy)
     statuses = {result.status for result in results}
     if issues:
         status = "INVALID_SOLUTION"
@@ -281,6 +287,12 @@ def _combined_partition_result(
             "branches": sum(int(result.statistics.get("branches", 0)) for result in results),
             "conflicts": sum(int(result.statistics.get("conflicts", 0)) for result in results),
             "partitions": len(results),
+            "strategy": "cp_sat",
+            "centres": [{"locations": sorted(part.location_capacities), "status": result.status,
+                         "search_limit_seconds": result.statistics.get("search_limit_seconds"),
+                         "wall_time_seconds": result.statistics.get("wall_time_seconds")}
+                        for part, result in zip(location_partitions(problem), results)],
+            "blocked_locations": blocked,
             "wall_time_seconds": monotonic() - started,
         },
     )
@@ -292,7 +304,7 @@ def _week_bundles(problem: SchedulingProblem) -> tuple[list[TherapyBundle], int,
     pinned_counts = Counter()
     for item in problem.pinned:
         day_offset = (item.date - problem.week_start).days
-        if 0 <= day_offset < problem.horizon_days:
+        if item.counts_toward_requirement and 0 <= day_offset < problem.horizon_days:
             pinned_counts[(item.requirement_id, day_offset // 7)] += 1
     bundles = []
     used_bundle_ids = {item.bundle_id for item in problem.pinned}
@@ -343,10 +355,18 @@ def _greedy_appointments(
             frequency_by_patient_location[(bundle.patient_id, bundle.items[0].location_id)],
             bundle.occurrence_index + 1,
         )
+    booked_days = defaultdict(set)
+    targets = defaultdict(int)
+    for item in problem.pinned:
+        if item.counts_toward_requirement:
+            booked_days[item.patient_id].add(item.date)
+    for item in problem.requirements:
+        targets[item.patient_id] = max(targets[item.patient_id], item.sessions_per_week)
     for bundle in sorted(
         bundles,
         key=lambda item: (
             not any(part.requirement_id in problem.priority_requirement_ids for part in bundle.items),
+            Fraction(len(booked_days[item.patient_id]) + item.occurrence_index, max(1, targets[item.patient_id])),
             len(candidates[item.id]),
             item.occurrence_index,
             item.patient_id,
@@ -393,7 +413,7 @@ def _greedy_result(problem: SchedulingProblem, started: float) -> ScheduleResult
     bundles, requested, period_count = _week_bundles(problem)
     candidates, rejected = _candidate_placements(problem, bundles)
     appointments, selected_bundles = _greedy_appointments(problem, bundles, candidates)
-    scheduled_by_requirement = Counter(item.requirement_id for item in appointments)
+    scheduled_by_requirement = Counter(item.requirement_id for item in appointments if item.counts_toward_requirement)
     therapist_usage = Counter()
     location_usage = Counter()
     patient_days = set()
@@ -444,35 +464,31 @@ def generate_weekly_schedule(
     _allow_partitioning: bool = True,
 ) -> ScheduleResult:
     started = monotonic()
-    if (
-        mode == SolverMode.BEST_EFFORT
-        and settings.max_time_seconds <= 20
-        and len(problem.requirements) >= 100
-    ):
-        return _greedy_result(problem, started)
-    partitions = _location_partitions(problem) if _allow_partitioning else None
-    if partitions:
-        total_requested = sum(
-            sum(item.sessions_per_week for item in partition.requirements)
-            for partition in partitions
+    partitions = location_partitions(problem) if _allow_partitioning else None
+    pinned_issues, pinned_report = validate_schedule(problem, problem.pinned)
+    if pinned_issues and not partitions and problem.isolate_saved_failures:
+        # Preserve the saved records, but generate nothing in this unsafe component.
+        # Other independent branches can continue and staff get an explicit warning.
+        return ScheduleResult(
+            status="FEASIBLE" if mode == SolverMode.BEST_EFFORT else "INVALID_SOLUTION",
+            appointments=list(problem.pinned),
+            unmet=[UnmetRequirement(r.patient_id, r.id, r.department_id, r.sessions_per_week,
+                                    "SAVED_BOOKING_NEEDS_REVIEW") for r in problem.requirements if r.sessions_per_week],
+            requested_sessions=sum(r.sessions_per_week for r in problem.requirements),
+            scheduled_sessions=len(problem.pinned),
+            validation={key: 0 for key in pinned_report},
+            statistics={"blocked_locations": sorted(problem.location_capacities),
+                        "saved_validation": pinned_report, "wall_time_seconds": monotonic() - started},
         )
+    if partitions:
         results = []
         for partition in partitions:
-            partition_requested = sum(
-                item.sessions_per_week for item in partition.requirements
-            )
-            partition_seconds = settings.max_time_seconds * partition_requested / max(1, total_requested)
-            partition_settings = replace(
-                settings,
-                # Very small branches still need enough time to produce a
-                # first valid incumbent; below this threshold CP-SAT can
-                # return UNKNOWN despite readily available capacity.
-                max_time_seconds=max(0.5, partition_seconds),
-            )
+            # Each independent resource group gets its FULL budget. CP-SAT
+            # returns early when optimal/infeasible; no compulsory five-minute wait.
             results.append(generate_weekly_schedule(
                 partition,
                 mode=mode,
-                settings=partition_settings,
+                settings=settings,
                 _allow_partitioning=False,
             ))
         return _combined_partition_result(problem, results, started)
@@ -546,6 +562,13 @@ def generate_weekly_schedule(
         model.Add(sum(usage) + pinned_location[key] <= problem.location_capacities.get(location_id, 0))
 
     objective = []
+    booked_days = defaultdict(set)
+    targets = defaultdict(int)
+    for item in problem.pinned:
+        if item.counts_toward_requirement:
+            booked_days[item.patient_id].add(item.date)
+    for item in problem.requirements:
+        targets[item.patient_id] = max(targets[item.patient_id], item.sessions_per_week)
     for bundle in bundles:
         for day, start, therapist_ids in candidates[bundle.id]:
             variable = variables[(bundle.id, day, start, therapist_ids)]
@@ -557,6 +580,10 @@ def generate_weekly_schedule(
             # Avoiding unmet clinical sessions dominates every lower-priority preference.
             reward = (settings.unmet_bundle_penalty + settings.scheduled_session_reward) * len(bundle.items)
             reward += settings.preference_reward * preference
+            # Within equal capacity, favour the least-served children over IDs.
+            served = len(booked_days[bundle.patient_id]) + bundle.occurrence_index
+            target = max(1, targets[bundle.patient_id])
+            reward += settings.absence_priority_reward * max(0, target - served) // target
             if any(item.requirement_id in problem.priority_requirement_ids for item in bundle.items):
                 reward += settings.absence_priority_reward * len(bundle.items)
             objective.append(reward * variable)
@@ -570,6 +597,23 @@ def generate_weekly_schedule(
         settings,
     )
     model.Maximize(sum(objective))
+
+    # Seed the search with a quick placement, but ALWAYS run CP-SAT so its
+    # preference/cadence objectives also apply to large centres.
+    if mode == SolverMode.BEST_EFFORT:
+        hint_appointments, _ = _greedy_appointments(problem, bundles, candidates)
+        by_bundle = defaultdict(list)
+        pinned = set(problem.pinned)
+        for item in hint_appointments:
+            if item not in pinned:
+                by_bundle[item.bundle_id].append(item)
+        selected_keys = set()
+        for bundle_id, items in by_bundle.items():
+            ordered = sorted(items, key=lambda item: item.slot_index)
+            selected_keys.add((bundle_id, (ordered[0].date - problem.week_start).days,
+                               ordered[0].slot_index, tuple(a.therapist_id for a in ordered)))
+        for key, variable in variables.items():
+            model.AddHint(variable, int(key in selected_keys))
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = settings.max_time_seconds
@@ -607,7 +651,9 @@ def generate_weekly_schedule(
                 "invalid_slot_durations", "broken_consecutive_bundles",
                 "therapist_availability_conflicts", "patient_availability_conflicts",
             )},
-            statistics={"variables": len(variables), "wall_time_seconds": monotonic() - started},
+            statistics={"variables": len(variables), "strategy": "cp_sat",
+                        "search_limit_seconds": settings.max_time_seconds,
+                        "wall_time_seconds": monotonic() - started},
         )
 
     appointments = list(problem.pinned)
@@ -632,7 +678,7 @@ def generate_weekly_schedule(
                     )
 
     generated = [item for item in appointments if item not in problem.pinned]
-    scheduled_by_requirement = Counter(item.requirement_id for item in appointments)
+    scheduled_by_requirement = Counter(item.requirement_id for item in appointments if item.counts_toward_requirement)
     selected_therapist_usage = Counter()
     selected_location_usage = Counter()
     selected_patient_days = set()
@@ -692,6 +738,8 @@ def generate_weekly_schedule(
         validation=report,
         statistics={
             "variables": len(variables),
+            "strategy": "cp_sat",
+            "search_limit_seconds": settings.max_time_seconds,
             "branches": solver.NumBranches(),
             "conflicts": solver.NumConflicts(),
             "objective": solver.ObjectiveValue(),

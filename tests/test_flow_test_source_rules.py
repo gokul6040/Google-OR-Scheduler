@@ -175,9 +175,10 @@ def test_empty_entries_and_unrepresentable_dates_fail_without_erasing_data(flow,
     apply_reports(flow, reports)
     before = deepcopy(flow.scenario)
     reports["Plan_Report"][0]["Schedule"] = schedule
-    with pytest.raises(ValueError, match="Schedule entries|calendar duration"):
-        apply_reports(flow, reports)
-    assert flow.scenario == before
+    result = apply_reports(flow, reports)
+    assert result["partial"] and result["quarantined"] == ["TEST-H"]
+    assert [p for p in flow.scenario["patients"] if p["code"] != "TEST-H"] == [
+        p for p in before["patients"] if p["code"] != "TEST-H"]
 
 
 def test_five_long_therapy_names_fit_one_message_without_omission(flow, reports):
