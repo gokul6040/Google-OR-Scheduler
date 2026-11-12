@@ -1,8 +1,9 @@
 """Manual main-schedule finalisation/export; preview is the default."""
 
 import argparse
-from datetime import date
+from datetime import date, datetime, timedelta
 import json
+from zoneinfo import ZoneInfo
 
 from flow_test.zoho_push import run_push
 from main_workflow.client import api
@@ -12,12 +13,22 @@ from services.zoho_creator_service import refresh_access_token
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--date", required=True)
+    when = parser.add_mutually_exclusive_group(required=True)
+    when.add_argument("--date")
+    # Scheduled jobs: 23:00 IST pushes tomorrow; 07:00 IST re-pushes today's late changes.
+    when.add_argument("--day", choices=("today", "tomorrow"))
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     try:
         config, provider = workflow_connection()
-        target = date.fromisoformat(args.date)
+        if args.day:
+            today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+            target = today + timedelta(days=1 if args.day == "tomorrow" else 0)
+            if target.weekday() == 6:
+                print(json.dumps({"mode": "SKIPPED", "date": target.isoformat(), "reason": "Sunday is closed"}))
+                return
+        else:
+            target = date.fromisoformat(args.date)
         if args.apply:
             # The push runs inside the app, under the same database lock as the
             # Operations button, so two pushes can never overlap across app copies.

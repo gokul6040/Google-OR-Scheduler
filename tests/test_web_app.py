@@ -232,15 +232,18 @@ def test_overview_sessions_offer_branch_therapist_and_patient_filters():
     assert "renderTodaySessions" in app_script
 
 
-def test_calendar_is_a_fixed_monday_through_saturday_week():
+def test_calendar_shows_today_or_tomorrow_with_a_column_per_doctor():
+    # User decision (12 Nov 2026): the calendar is a Today | Tomorrow board, doctors as
+    # columns and times as rows; no week stepping, date picker or Doctors/Patients switch.
     index = Path("web/index.html").read_text(encoding="utf-8")
     app_script = Path("web/app.js").read_text(encoding="utf-8")
 
-    assert "data-calendar-view" not in index
-    assert "renderDayCalendar" not in app_script
-    assert "renderAgenda" not in app_script
-    assert "const days = 6;" in app_script
-    assert "direction * 7" in app_script
+    assert 'data-calendar-day="today"' in index and 'data-calendar-day="tomorrow"' in index
+    for removed in ("todayButton", "previousDate", "nextDate", "datePicker", "data-perspective", "perspectiveEntityPicker"):
+        assert removed not in index
+    assert "const days = 1;" in app_script and "direction * 7" not in app_script
+    assert "function renderDoctorCalendar" in app_script and "renderWeekCalendar" not in app_script
+    assert "NOT SCHEDULED YET" in app_script and "Closed on Sunday" in app_script
 
 
 def test_patient_preference_table_saves_day_level_availability(db_session, monkeypatch):
@@ -358,12 +361,27 @@ def test_schedule_payload_contains_display_ready_appointment(db_session, monkeyp
         source="test",
     )
     db_session.add(appointment)
+    speech = Department(name="Speech Therapy", active=True)
+    db_session.add(speech)
+    db_session.flush()
+    db_session.add_all([
+        TreatmentRequirement(patient_id=patient.id, department_id=speech.id,
+                             assigned_therapist_id=therapist.id,
+                             sessions_per_week=2, sequence_order=1, active=True),
+        TreatmentRequirement(patient_id=patient.id, department_id=department.id,
+                             assigned_therapist_id=therapist.id,
+                             sessions_per_week=5, sequence_order=0, active=False),
+    ])
     db_session.commit()
 
     monkeypatch.setattr(web_app, "SessionLocal", lambda: nullcontext(db_session))
     payload = web_app.schedule_payload(date(2026, 9, 7), 6)
 
     assert payload["patients"] == [{"id": patient.id, "code": "P-001", "name": "Demo Patient"}]
+    assert payload["patientPlans"] == {str(patient.id): [
+        {"therapy": "Occupational Therapy", "sessionsPerWeek": 1},
+        {"therapy": "Speech Therapy", "sessionsPerWeek": 2},
+    ]}
     assert payload["calendarBreaks"] == [{
         "afterSlot": 4, "start": "12:35", "end": "13:15", "label": "Lunch break",
     }]

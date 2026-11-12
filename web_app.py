@@ -1391,11 +1391,22 @@ def schedule_payload(start: date, days: int) -> dict[str, Any]:
         } for item in session.scalars(
             select(Patient).where(Patient.active.is_(True)).order_by(Patient.patient_code)
         )]
+        patient_plans: dict[str, list[dict[str, Any]]] = {}
+        for patient_id, therapy, frequency in session.execute(
+            select(TreatmentRequirement.patient_id, Department.name, TreatmentRequirement.sessions_per_week)
+            .join(Department, Department.id == TreatmentRequirement.department_id)
+            .where(TreatmentRequirement.active.is_(True))
+            .order_by(TreatmentRequirement.patient_id, TreatmentRequirement.sequence_order, TreatmentRequirement.id)
+        ):
+            patient_plans.setdefault(str(patient_id), []).append({
+                "therapy": therapy, "sessionsPerWeek": frequency,
+            })
     return {
         "start": start.isoformat(),
         "end": end.isoformat(),
         "days": days,
         "appointments": [serialize_appointment(row) for row in rows],
+        "patientPlans": patient_plans,
         "therapists": therapists,
         "patients": patients,
         "departments": departments,

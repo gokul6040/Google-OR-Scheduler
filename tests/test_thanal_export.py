@@ -143,6 +143,33 @@ def test_all_slots_use_clinic_local_time_and_exact_duration():
         assert values["Duration"] == 40
 
 
+def _mark_pushed(flow):
+    batch = prepare_export(flow, DAY)
+    records = [{"appointmentId": row["appointmentId"], "fingerprint": row["fingerprint"],
+                "recordId": f"9{index:05d}"} for index, row in enumerate(batch["changes"])]
+    acknowledge_export(flow, batch["id"], records[0]["appointmentId"], None, None, records=records)
+    finish_export(flow, batch["id"])
+
+
+def test_a_pushed_visit_declined_later_is_updated_to_cancelled_not_blocked(booked):
+    _mark_pushed(booked)
+    with booked.sessions.begin() as session:
+        declined = session.scalar(select(Appointment).order_by(Appointment.id))
+        declined.status = AppointmentStatus.NEEDS_RESCHEDULING
+        declined_id = declined.id
+    preview = export_preview(booked, DAY)
+    assert not preview["blockedReasons"]
+    assert [(row["appointmentId"], row["fields"]["Status"]) for row in preview["changes"]] == [(declined_id, "Cancelled")]
+
+
+def test_a_visit_released_before_any_push_is_never_exported(booked):
+    with booked.sessions.begin() as session:
+        session.scalar(select(Appointment).order_by(Appointment.id)).status = AppointmentStatus.NEEDS_RESCHEDULING
+    preview = export_preview(booked, DAY)
+    assert not preview["blockedReasons"]
+    assert [row["fields"]["Status"] for row in preview["changes"]] == ["Scheduled"]
+
+
 def test_schema_rejects_text_registration_and_additional_required_fields():
     fields = {name:{"type":12,"is_lookup_field":True} for name in thanal_export.LOOKUPS}
     fields.update(For_Parent={"type":16},Date_field={"type":10},Slot_Number={"type":5},

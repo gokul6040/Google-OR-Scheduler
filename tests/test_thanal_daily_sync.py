@@ -457,3 +457,76 @@ def test_daily_cli_import_route_queues_only_an_unsaved_draft(flow, reports, monk
     assert output["draftPending"] and output["downloaded"][PLANS] == 1
     from flow_test.planning_tasks import preview_status
     assert preview_status(instance, output["planning"]["jobId"])["status"] == "DONE"
+
+
+# --- User decisions, 11 November 2026: new / inactive / kept children and import status ---
+
+def test_new_child_with_a_complete_plan_starts_active(flow, reports):
+    result = apply_snapshot(flow, reports, window=FIRST)
+    assert result["status"] == "COMPLETED" and result["newInactive"] == []
+    with flow.sessions() as session:
+        assert session.scalar(select(Patient).where(Patient.patient_code == "FAKE-1")).active
+
+
+def test_new_child_with_a_broken_plan_is_saved_inactive_with_a_reason(flow, reports):
+    from services.patient_activation_service import activation_review
+    reports[PLANS][0]["Schedule"][0]["Consultant"] = {}
+    result = apply_snapshot(flow, reports, window=FIRST)
+    assert result["status"] == "COMPLETED_WITH_ISSUES" and result["newInactive"] == ["FAKE-1"]
+    assert "FAKE-1" in result["quarantined"]
+    with flow.sessions() as session:
+        patient = session.scalar(select(Patient).where(Patient.patient_code == "FAKE-1"))
+        assert patient is not None and not patient.active
+        review = activation_review(session, patient)
+        assert not review["canActivate"] and review["issues"]
+    assert count(flow, TreatmentRequirement) == 0
+
+
+def test_import_never_switches_an_inactive_child_on(flow, reports):
+    with flow.sessions.begin() as session:
+        session.add(Patient(patient_code="FAKE-1", name="Fictional child", active=False))
+    apply_snapshot(flow, reports, window=FIRST)  # Complete, valid plan.
+    apply_snapshot(flow, reports, window=SECOND)
+    with flow.sessions() as session:
+        assert not session.scalar(select(Patient).where(Patient.patient_code == "FAKE-1")).active
+
+
+def test_active_child_whose_new_plan_breaks_keeps_its_previous_plan(flow, reports):
+    apply_snapshot(flow, reports, window=FIRST)
+    before = count(flow, TreatmentRequirement)
+    newer = deepcopy(reports[PLANS][0])
+    newer.update(ID="399", Added_Time="10/11/2026 09:00:00")
+    newer["Schedule"][0]["Consultant"] = {}
+    reports[PLANS].append(newer)
+    result = apply_snapshot(flow, reports, window=SECOND)
+    assert result["status"] == "COMPLETED_WITH_ISSUES"
+    assert result["keptOnPreviousPlan"] == ["FAKE-1"] and "FAKE-1" not in result["quarantined"]
+    with flow.sessions() as session:
+        assert session.scalar(select(Patient).where(Patient.patient_code == "FAKE-1")).active
+        assert session.scalar(select(func.count(TreatmentRequirement.id)).where(
+            TreatmentRequirement.active.is_(True))) == before
+        assert "FAKE-1" not in json.loads(session.get(FlowSetting, "zoho_quarantined_patients").value)
+        scenario = json.loads(session.get(FlowSetting, "zoho_test_scenario").value)
+        assert any(p["code"] == "FAKE-1" and p.get("phone") for p in scenario["patients"])
+        assert session.scalar(select(FlowInbox).where(
+            FlowInbox.reason == "Latest Zoho plan has a problem — previous plan still in use"))
+
+
+def test_held_plans_do_not_make_the_nightly_import_fail(monkeypatch, capsys):
+    import main_workflow.sync as cli
+    held = {"partial": True, "status": "COMPLETED_WITH_ISSUES", "quarantined": ["X"], "checkpoint": None}
+    monkeypatch.setattr(cli, "workflow_connection", lambda: (SimpleNamespace(source_name="thanal/eic", plan_report=PLANS,
+        registration_report="All_Registrations", consultant_report="All_Consultants"), SimpleNamespace(
+        fetch=lambda since, until: {PLANS: [], "All_Registrations": [], "All_Consultants": []})))
+    from flow_test.zoho_import import SOURCE_TIMEZONES
+    monkeypatch.setattr(cli, "api", lambda config, operation, body=None, timeout=180: {
+        "source": "thanal/eic", "sourceTimezones": SOURCE_TIMEZONES, "checkpoint": None} if operation == "status" else dict(held))
+    monkeypatch.setattr("sys.argv", ["sync", "--apply"])
+    cli.main()  # No SystemExit: valid records were saved.
+    assert json.loads(capsys.readouterr().out)["status"] == "COMPLETED_WITH_ISSUES"
+    monkeypatch.setattr(cli, "api", lambda config, operation, body=None, timeout=180: {
+        "source": "thanal/eic", "sourceTimezones": SOURCE_TIMEZONES, "checkpoint": None} if operation == "status"
+        else {**held, "draftError": "draft failed"})
+    with pytest.raises(SystemExit) as stopped:
+        cli.main()
+    assert stopped.value.code == 1

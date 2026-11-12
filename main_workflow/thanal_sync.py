@@ -258,8 +258,44 @@ def apply_snapshot(flow: Any, reports: dict, *, window: dict) -> dict:
                 item["phone"] = reg["phone"]
             roster.append(item)
             imported.add(code)
-        quarantined = {i["code"] for i in data["issues"] if i["code"]}
-        missing_codes = {p["code"] for p in old_scenario["patients"]} - imported - quarantined
+        # User decisions (11 Nov 2026) for children whose latest Zoho plan has a problem:
+        # - a NEW child is saved but stays inactive; staff see the reason and decide;
+        # - an ACTIVE child with an earlier valid plan keeps being scheduled on that plan
+        #   (one Zoho typo must not stop therapy) and staff are told to fix Zoho;
+        # - anyone else is held from new bookings and offers until the plan is fixed.
+        # The import never switches an existing inactive child on; only staff can.
+        reg_by_code = {r["code"]: r for r in regs}
+        issue_codes = {i["code"] for i in data["issues"] if i["code"]}
+        held, kept, new_inactive = set(), set(), set()
+        for code in sorted(issue_codes):
+            reg = reg_by_code.get(code)
+            patient = local_patients.get(code)
+            if patient is None:
+                if reg is None or any(rid != reg["id"] and old_code == code for rid, old_code in identities.items()):
+                    held.add(code)
+                    continue
+                patient = Patient(patient_code=code, name=reg["name"], active=False)
+                session.add(patient)
+                session.flush()
+                local_patients[code] = patient
+                identities[reg["id"]] = code
+                new_inactive.add(code)
+                held.add(code)
+                continue
+            previous_plan = list(session.scalars(select(TreatmentRequirement).where(
+                TreatmentRequirement.patient_id == patient.id, TreatmentRequirement.active.is_(True),
+                TreatmentRequirement.source_plan_id.is_not(None))))
+            if not (patient.active and previous_plan):
+                held.add(code)
+                continue
+            kept.add(code)
+            item = {"code": code, "name": patient.name, "source_plan_id": previous_plan[0].source_plan_id,
+                    "initial_roster": True, "requirements": [{"weekly": r.sessions_per_week} for r in previous_plan]}
+            if reg and reg["phone"]:
+                item["phone"] = reg["phone"]
+            roster.append(item)
+        quarantined = set(held)
+        missing_codes = {p["code"] for p in old_scenario["patients"]} - imported - issue_codes
         quarantined |= missing_codes
         for code in missing_codes:
             flow._job_warning(session, "thanal-plan:missing:" + hashlib.sha256(code.encode()).hexdigest(),
@@ -267,8 +303,13 @@ def apply_snapshot(flow: Any, reports: dict, *, window: dict) -> dict:
                               "Previously imported child has no current valid Calicut plan. Existing bookings are retained.", code)
         for issue in data["issues"]:
             key = "thanal-plan:" + hashlib.sha256(issue["plan_id"].encode()).hexdigest()
-            flow._job_warning(session, key, "Therapy plan needs source correction",
-                              "Correct the latest source plan: " + issue["reason"], issue["code"])
+            if issue["code"] in kept:
+                flow._job_warning(session, key, "Latest Zoho plan has a problem — previous plan still in use",
+                                  "Correct the latest plan in Zoho (" + issue["reason"] + "). Until then this child "
+                                  "keeps being scheduled on their previous valid plan.", issue["code"])
+            else:
+                flow._job_warning(session, key, "Therapy plan needs source correction",
+                                  "Correct the latest source plan: " + issue["reason"], issue["code"])
         for code in imported:
             from flow_test.models import FlowInbox
             for warning in session.scalars(select(FlowInbox).where(
@@ -310,7 +351,10 @@ def apply_snapshot(flow: Any, reports: dict, *, window: dict) -> dict:
         if not partial:
             put_setting(session, CHECKPOINT_KEY, window["to"])
         result = {**data["summary"], "sourceProfile": PROFILE, "checkpoint": current if partial else window["to"],
-                  "partial": partial, "quarantined": sorted(quarantined), "changed": True}
+                  "partial": partial, "quarantined": sorted(quarantined), "changed": True,
+                  # Held plans are source-data issues for staff, not an import failure.
+                  "status": "COMPLETED_WITH_ISSUES" if partial else "COMPLETED",
+                  "keptOnPreviousPlan": sorted(kept), "newInactive": sorted(new_inactive)}
         put_setting(session, "zoho_test_sync", result)
         from services.patient_activation_service import prepare_activation_review, store_activation_review
         store_activation_review(session, prepare_activation_review(reports, data))

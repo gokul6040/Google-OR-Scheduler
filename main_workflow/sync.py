@@ -46,7 +46,9 @@ def main() -> None:
                           "consultants": len(scenario["therapists"]), "messages_sent": 0}
         result["downloaded"] = {name: len(rows) for name, rows in reports.items()}
         print(json.dumps(result, indent=2))
-        if result.get("draftError") or result.get("partial"):
+        # Held plans ("partial", status COMPLETED_WITH_ISSUES) are Zoho data for staff to fix,
+        # not a failed run: valid records were saved, so only a real failure exits non-zero.
+        if result.get("draftError"):
             raise SystemExit(1)
     except ValueError as exc:
         print(f"Main source sync stopped: {exc}")

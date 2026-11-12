@@ -26,9 +26,11 @@ reason. No master records are created or names guessed to repair a missing ID.
 Confirmed appointments export as Scheduled, including appointments confirmed by
 the existing manual unanswered-offer rule. The assumed/explicit reply distinction
 stays local. Completed and cancelled appointments retain Completed / Cancelled.
-NO_SHOW and NEEDS_RESCHEDULING are held pending approved destination semantics;
-they are never silently relabelled Scheduled. This change does not alter the
-existing unanswered-offer policy or make export automatic.
+A visit already pushed and later declined (NEEDS_RESCHEDULING) is updated to
+Cancelled on its existing Zoho row (user decision, 11 November 2026); a visit
+released before any push is never exported. NO_SHOW remains held pending approved
+destination semantics. Nothing is silently relabelled Scheduled. Automatic push
+times are defined under "Daily automation" below.
 
 The existing stable Scheduler_Key, durable batches and acknowledgements remain
 in use. Creator lookup objects are compared by ID when reconciling a lost write
@@ -56,6 +58,39 @@ Local release tests cover wrong-target rejection, credential isolation, bounded
 roster encoding and clinical row preservation during additive schema migration.
 See DEPLOY_THANAL.md for commands, backup/restore details and failure behaviour.
 
+## Daily automation — user decisions, 11 November 2026
+
+Every day's work prepares **tomorrow** (Asia/Kolkata). Times are IST.
+
+| Time | Step | Command |
+|---|---|---|
+| 00:00 | Import Zoho (existing `thanaljob`) | `main_workflow.sync --apply` |
+| 02:00 | Plan tomorrow, check it and save it; offers are only queued | `main_workflow.daily_plan` |
+| 09:00 | Worker sends the queued offers (timed templates) | existing worker |
+| 14:00 | One reminder to parents who have not replied (16:00 / +1 h for later sends) | existing worker |
+| 23:00 | Finalise unanswered sent offers as accepted (R-31) and push tomorrow to Zoho | `main_workflow.push --day tomorrow --apply` |
+| 07:00 | Re-push today's late changes (e.g. a late No becomes Cancelled) | `main_workflow.push --day today --apply` |
+
+- **02:00 auto-save without staff review** when every check passes. A failed check
+  saves nothing and leaves a "Night plan failed — nothing saved" staff alert; an
+  incomplete save (held centre/children) leaves a "needs review" alert. Inputs that
+  change mid-search are planned again once. A run that already saved tomorrow does
+  nothing. Live messaging without timed templates is refused, so offers can never go
+  out at 02:00. The job never sends a message.
+- **Weekend:** Sunday is closed. The Saturday-night plan and the Saturday 23:00 /
+  Sunday 07:00 pushes do nothing. Sunday's 02:00 run plans Monday, so Monday's
+  parents are messaged on Sunday from 09:00.
+- **Unanswered at 23:00:** sent offers without a reply count as accepted and are
+  pushed as Scheduled (existing R-31 rule; unsubscribed or undelivered ones stay for
+  staff).
+- **Late changes:** the 07:00 push updates the same Zoho rows; it never duplicates.
+- Replies, replacements (staff-chosen) and messaging rules are unchanged.
+
+Implemented in `main_workflow/daily_plan.py` and `main_workflow/push.py --day`; covered
+by `tests/test_daily_automation.py` and `tests/test_thanal_export.py`. The Azure
+timers and WhatsApp cutover are deployment steps (DEPLOY_THANAL.md); until they are
+enabled these remain manual.
+
 ## Thanal daily import operation — 11 November 2026
 
 The separately configured `thanaljob` imports through the running app's
@@ -69,9 +104,30 @@ no WhatsApp messages are sent, and no appointments are written to Zoho by the
 timer. Live messaging remains disabled and its worker remains stopped.
 
 A cloud verification run committed 443 valid plans / 758 therapy requirements,
-with 273 plans held for source corrections and zero messages sent. Partial imports
-retain their checkpoint and return a nonzero CLI exit status; Azure consequently
-labels that execution Failed even when its valid import transaction committed.
+with 273 plans held for source corrections and zero messages sent.
+
+**Patients and held plans (user decisions, 11 November 2026).** Every night pulls all
+records. A **new** child with a complete plan (valid consultant, therapy, phone, active
+consultant) starts **active**; a new child whose plan has a problem is still saved, but
+**inactive**, and the status dialog lists what to fix in Zoho. The import **never switches
+an existing inactive child on** — only staff can, whatever the reason they are inactive.
+An **active** child whose latest Zoho plan breaks keeps being scheduled on their previous
+valid plan, with a "Latest Zoho plan has a problem — previous plan still in use" staff
+item; other children with problem plans are held from new bookings and offers until
+corrected. A run with held plans reports `COMPLETED_WITH_ISSUES` and exits 0 (Azure shows
+it as succeeded); only a real failure (Zoho unreachable, invalid source, draft error)
+exits non-zero. Held runs still retain their checkpoint, so the next run re-reads all.
+Covered by `tests/test_thanal_daily_sync.py`.
+
+**Refresh from Zoho (user decision, 12 November 2026).** The Patients page has a
+"Refresh from Zoho" button that runs this same import immediately, in the background,
+so a child corrected in Zoho can be marked active the same day instead of after the
+next 00:00 run. It applies exactly the rules above (it never switches an inactive child
+on; staff still press Mark active), sends no message and changes no booking. One refresh
+runs at a time, with a five-minute cool-down between refreshes (each uses Zoho API calls)
+and none between 23:45 and 00:30 IST, when the nightly import runs. The page shows the
+outcome: new active, new inactive, inactive children now ready to activate, and how many
+still need fixing in Zoho. Covered by `tests/test_manual_refresh.py`.
 This does not bypass any validation or change scheduling constraints. The
 structured import/preservation rules remain covered by
 `tests/test_thanal_daily_sync.py`; this operation was checked against the live

@@ -246,6 +246,18 @@ def dispatch(request: Any, *, prefix: str = "/workflow") -> None:
         request.send_json({"error": "This action is unavailable in main operations"}, 404)
         return
     instance = instance if password_free else runtime()
+    if relative == "/api/zoho/refresh" and request.command in {"GET", "POST"}:
+        # Staff "Refresh from Zoho": the nightly import, run now in the background.
+        from main_workflow.refresh import read_status, start_refresh
+        if request.command == "GET":
+            request.send_json(read_status(instance.flow))
+            return
+        request.read_json()
+        try:
+            request.send_json(start_refresh(instance), 202)
+        except ValueError as exc:
+            request.send_json({"error": str(exc)}, 409)
+        return
     if getattr(instance.flow, "remote_worker", False):
         instance.flow.refresh_source()
         if request.command == "POST" and relative == "/api/process":

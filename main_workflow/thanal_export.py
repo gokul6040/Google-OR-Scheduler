@@ -18,7 +18,11 @@ FIELDS = frozenset({"Branch", "Registration", "For_Parent", "Date_field", "Depar
 LOOKUPS = frozenset({"Branch", "Registration", "Department", "Consultation_Type", "Consultant",
                       "Appointment_Time_Slot"})
 STATUSES = {"CONFIRMED": "Scheduled", "COMPLETED": "Completed",
-            "CANCELLED_PATIENT": "Cancelled", "CANCELLED_OTHER": "Cancelled"}
+            "CANCELLED_PATIENT": "Cancelled", "CANCELLED_OTHER": "Cancelled",
+            # A visit already in Zoho that is later declined (released for rescheduling)
+            # is withdrawn there by the 07:00 re-push (user decision, 11 Nov 2026).
+            # Never-pushed released visits are not exported at all.
+            "NEEDS_RESCHEDULING": "Cancelled"}
 
 
 def enabled(flow: Any) -> bool:

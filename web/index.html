@@ -55,10 +55,6 @@
         <button class="nav-item" data-view="generator"><span>Schedule generator</span></button>
       </nav>
       <div class="sidebar-spacer"></div>
-      <div class="system-card">
-        <div class="system-line"><span class="status-dot"></span><span>Scheduling engine ready</span></div>
-        <p>Deterministic rules · 40-minute sessions</p>
-      </div>
       <div class="user-chip">
         <span class="avatar">GM</span>
         <span><strong>Operations Manager</strong><small>Local workspace</small></span>
@@ -93,20 +89,11 @@
           </div>
 
           <div class="schedule-toolbar">
-            <div class="perspective-switcher" role="group" aria-label="Schedule perspective">
-              <button data-perspective="therapist" class="active"><svg><use href="#i-team"/></svg>Doctors</button>
-              <button data-perspective="patient"><svg><use href="#i-patients"/></svg>Patients</button>
+            <div class="perspective-switcher day-switcher" role="group" aria-label="Choose day">
+              <button data-calendar-day="today" class="active" aria-pressed="true">Today</button>
+              <button data-calendar-day="tomorrow" aria-pressed="false">Tomorrow</button>
             </div>
-            <label class="perspective-picker"><span id="perspectivePickerLabel">Doctor</span><select id="perspectiveEntityPicker" aria-label="Choose doctor"><option value="">All doctors</option></select></label>
-            <div class="date-nav">
-              <button class="ghost-button" id="todayButton">Today</button>
-              <div class="stepper">
-                <button class="icon-button" id="previousDate" aria-label="Previous period"><svg><use href="#i-chevron-left"/></svg></button>
-                <button class="icon-button" id="nextDate" aria-label="Next period"><svg><use href="#i-chevron-right"/></svg></button>
-              </div>
-              <button class="date-display" id="dateDisplay" aria-label="Choose date">—</button>
-              <input class="visually-hidden" type="date" id="datePicker">
-            </div>
+            <span class="date-display day-display" id="dateDisplay">—</span>
           </div>
 
           <div class="active-filter-row" id="activeFilters" hidden></div>

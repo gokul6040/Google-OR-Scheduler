@@ -1,11 +1,5 @@
 /* Authentication for opt-in main operations; no test keys or fixture setup. */
 const workspaceInfo = window.therapyWorkspace || {apiPrefix:'/workflow', dataSource:'main'};
-const marker = document.createElement('div');
-marker.className = 'test-workspace-marker';
-marker.textContent = workspaceInfo.dataSource === 'test'
-  ? `Main application · Existing test database · Messaging ${workspaceInfo.live ? 'enabled' : 'OFF'}`
-  : 'Main application · Daily operations';
-document.getElementById('mainContent').prepend(marker);
 if (workspaceInfo.localNoAuth || workspaceInfo.requiresAccessKey === false) {
   sessionStorage.removeItem('mainWorkflowAdminToken');
 } else {

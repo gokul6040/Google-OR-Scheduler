@@ -8,6 +8,7 @@ const state = {
   patients: [],
   patientPage: 1,
   patientQuery: "",
+  patientStatusFilter: "all",
   latestPreview: null,
   showPreview: false,
   assistantSessionId: null,
@@ -297,39 +298,11 @@ function bindShellEvents() {
       if (!picker.contains(event.target)) closeSearchableSelect(picker);
     });
   });
-  $("#todayButton").addEventListener("click", async () => {
-    state.currentDate = parseLocalDate(state.overview.today);
-    await loadSchedule();
-  });
-  $("#previousDate").addEventListener("click", () => stepDate(-1));
-  $("#nextDate").addEventListener("click", () => stepDate(1));
-  $("#dateDisplay").addEventListener("click", () => {
-    const picker = $("#datePicker");
-    picker.value = isoDate(state.currentDate);
-    if (picker.showPicker) picker.showPicker(); else picker.click();
-  });
-  $("#datePicker").addEventListener("change", async (event) => {
-    if (!event.target.value) return;
-    state.currentDate = parseLocalDate(event.target.value);
-    await loadSchedule();
-  });
-  $$('[data-perspective]').forEach((button) => button.addEventListener("click", async () => {
-    state.perspective = button.dataset.perspective;
-    $$('[data-perspective]').forEach((item) => item.classList.toggle("active", item === button));
-    if (state.perspective === "patient") {
-      if (!state.filters.patient && state.schedule?.appointments.length) {
-        state.filters.patient = String(state.schedule.appointments[0].patientId);
-      }
-    }
-    populatePerspectivePicker();
+  // The calendar shows exactly one of two days: today (default) or tomorrow.
+  $$('[data-calendar-day]').forEach((button) => button.addEventListener("click", async () => {
+    state.currentDate = calendarDay(button.dataset.calendarDay);
     await loadSchedule();
   }));
-  $("#perspectiveEntityPicker").addEventListener("change", (event) => {
-    state.filters[state.perspective] = event.target.value;
-    const drawerSelect = state.perspective === "therapist" ? $("#therapistFilter") : $("#patientFilter");
-    drawerSelect.value = event.target.value;
-    renderSchedule();
-  });
   $("#applyFilters").addEventListener("click", (event) => { event.preventDefault(); readFilters(); closeDrawers(); renderSchedule(); });
   $("#clearFilters").addEventListener("click", (event) => { event.preventDefault(); clearFilters(); closeDrawers(); renderSchedule(); });
   $("#globalSearch").addEventListener("keydown", (event) => {
@@ -359,20 +332,30 @@ function bindShellEvents() {
     if (state.activeView !== "schedule") return;
     const shortcut = event.key.toLowerCase();
     if (shortcut === "t") {
-      state.currentDate = parseLocalDate(state.overview.today);
+      state.currentDate = calendarDay("today");
       await loadSchedule();
     }
   });
 }
 
-async function stepDate(direction) {
-  state.currentDate = addDays(state.currentDate, direction * 7);
-  await loadSchedule();
+function calendarDay(which) {
+  const today = parseLocalDate(state.overview.today);
+  return which === "tomorrow" ? addDays(today, 1) : today;
 }
 
 async function loadSchedule() {
-  const start = startOfWeek(state.currentDate);
-  const days = 6;
+  // Only today or tomorrow; anything else (e.g. an old preview date) falls back to today.
+  if (!["today", "tomorrow"].some((which) => sameDate(calendarDay(which), state.currentDate))) {
+    state.currentDate = calendarDay("today");
+  }
+  const showingTomorrow = sameDate(calendarDay("tomorrow"), state.currentDate);
+  $$('[data-calendar-day]').forEach((button) => {
+    const active = (button.dataset.calendarDay === "tomorrow") === showingTomorrow;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  const start = state.currentDate;
+  const days = 1;
   $("#calendarSurface").innerHTML = `<div class="loading-state"><span class="spinner"></span>Loading the practice schedule…</div>`;
   try {
     state.schedule = await api(`/api/schedule?start=${isoDate(start)}&days=${days}`);
@@ -413,22 +396,6 @@ function populateFilterOptions() {
   makeSearchableSelect($("#patientFilter"), "Search patients");
   makeSearchableSelect($("#departmentFilter"), "Search therapies");
   makeSearchableSelect($("#locationFilter"), "Search branches");
-  populatePerspectivePicker();
-}
-
-function populatePerspectivePicker() {
-  if (!state.schedule) return;
-  const picker = $("#perspectiveEntityPicker");
-  const label = $("#perspectivePickerLabel");
-  const showingTherapists = state.perspective === "therapist";
-  const entities = showingTherapists
-    ? state.schedule.therapists.filter((item) => item.active)
-    : state.schedule.patients;
-  label.textContent = showingTherapists ? "Doctor" : "Patient";
-  picker.setAttribute("aria-label", showingTherapists ? "Choose doctor" : "Choose patient");
-  picker.innerHTML = `<option value="">All ${showingTherapists ? "doctors" : "patients"}</option>${entities.map((item) => `<option value="${item.id}">${escapeHtml(item.name)} · ${escapeHtml(item.code)}</option>`).join("")}`;
-  picker.value = state.filters[state.perspective];
-  makeSearchableSelect(picker, `Search ${showingTherapists ? "doctors" : "patients"}`);
 }
 
 function readFilters() {
@@ -488,26 +455,18 @@ function renderFilterChips() {
 function renderSchedule() {
   if (!state.schedule) return;
   const appointments = filteredAppointments();
-  const visibleEntities = new Set(appointments.map((item) => (
-    state.perspective === "therapist" ? item.therapistId : item.patientId
-  )));
+  const visibleDoctors = new Set(appointments.map((item) => item.therapistId));
   $("#visibleAppointmentCount").textContent = appointments.length.toLocaleString("en-IN");
-  $("#visibleTherapistCount").textContent = visibleEntities.size.toLocaleString("en-IN");
-  $("#visibleEntityLabel").textContent = state.perspective === "therapist" ? "doctors scheduled" : "patients scheduled";
+  $("#visibleTherapistCount").textContent = visibleDoctors.size.toLocaleString("en-IN");
+  $("#visibleEntityLabel").textContent = "doctors scheduled";
   $("#previewBanner").hidden = !(state.showPreview && state.latestPreview);
   renderFilterChips();
   updateDateDisplay();
-  renderWeekCalendar(appointments);
+  renderDoctorCalendar(appointments);
 }
 
 function updateDateDisplay() {
-  const display = $("#dateDisplay");
-  const start = startOfWeek(state.currentDate);
-  const end = addDays(start, 5);
-  const sameMonth = start.getMonth() === end.getMonth();
-  display.textContent = sameMonth
-    ? `${start.getDate()}–${formatDate(end, { day: "numeric", month: "long", year: "numeric" })}`
-    : `${formatDate(start, { day: "numeric", month: "short" })} – ${formatDate(end, { day: "numeric", month: "short", year: "numeric" })}`;
+  $("#dateDisplay").textContent = formatDate(state.currentDate, { weekday: "long", day: "numeric", month: "long", year: "numeric" });
 }
 
 function calendarBreakRow(afterSlot, view) {
@@ -517,19 +476,45 @@ function calendarBreakRow(afterSlot, view) {
     .join("");
 }
 
-function renderWeekCalendar(appointments) {
-  const start = startOfWeek(state.currentDate);
-  const days = Array.from({ length: 6 }, (_, index) => addDays(start, index));
-  const today = parseLocalDate(state.overview.today);
-  const headers = days.map((day) => `<div class="day-header ${sameDate(day, today) ? "is-today" : ""}"><span>${formatDate(day, { weekday: "short" })}</span><strong>${day.getDate()}</strong></div>`).join("");
+function calendarDoctors(appointments) {
+  // Columns: every active doctor (busy ones first), plus any doctor holding a visit that day.
+  // A doctor filter shows that doctor; patient, therapy, status or search shows only doctors with matches.
+  const booked = new Set(appointments.map((item) => item.therapistId));
+  const narrowedToVisits = Boolean(state.filters.patient || state.filters.department || state.filters.status || state.filters.search);
+  return state.schedule.therapists.filter((doctor) => {
+    if (state.filters.therapist) return String(doctor.id) === state.filters.therapist;
+    if (booked.has(doctor.id)) return true;
+    if (narrowedToVisits || !doctor.active) return false;
+    return !state.filters.location || String(doctor.locationId) === state.filters.location;
+  }).sort((a, b) => (booked.has(b.id) - booked.has(a.id)) || a.name.localeCompare(b.name));
+}
+
+function renderDoctorCalendar(appointments) {
+  const day = isoDate(state.currentDate);
+  const saved = state.schedule.appointments.filter((item) => !item.preview);
+  if (state.currentDate.getDay() === 0) {
+    $("#calendarSurface").innerHTML = `<div class="empty-state calendar-day-notice"><span class="empty-state-icon">${icon("calendar")}</span><h3>Closed on Sunday</h3><p>There are no therapy sessions on Sundays.</p></div>`;
+    return;
+  }
+  const isTomorrow = sameDate(calendarDay("tomorrow"), state.currentDate);
+  if (isTomorrow && !saved.length && !(state.showPreview && state.latestPreview)) {
+    $("#calendarSurface").innerHTML = `<div class="empty-state calendar-day-notice not-scheduled"><span class="empty-state-icon">${icon("calendar")}</span><h3>NOT SCHEDULED YET</h3><p>Tomorrow's schedule appears here once it is planned and saved (automatically at 2:00 AM, or with Plan tomorrow).</p></div>`;
+    return;
+  }
+  const doctors = calendarDoctors(appointments);
+  if (!doctors.length) {
+    $("#calendarSurface").innerHTML = emptySchedule();
+    return;
+  }
+  const headers = doctors.map((doctor) => `<div class="doctor-header${doctor.active ? "" : " is-inactive"}" title="${escapeHtml(doctor.name)}">${escapeHtml(doctor.name)}</div>`).join("");
   const rows = state.schedule.slotLabels.map((label, slot) => {
-    const cells = days.map((day) => {
-      const items = appointments.filter((item) => item.slot === slot && item.date === isoDate(day));
-      return `<div class="week-cell" ${!items.length ? emptySlotAttributes(isoDate(day), slot, state.filters.therapist || null) : ""}>${items.map(appointmentCard).join("")}</div>`;
+    const cells = doctors.map((doctor) => {
+      const items = appointments.filter((item) => item.slot === slot && item.therapistId === doctor.id);
+      return `<div class="doctor-cell" ${!items.length ? emptySlotAttributes(day, slot, doctor.id) : ""}>${items.map(appointmentCard).join("")}</div>`;
     }).join("");
-    return `<div class="week-grid-row"><div class="time-label">${escapeHtml(label.split("–")[0])}</div>${cells}</div>${calendarBreakRow(slot, "week")}`;
+    return `<div class="doctor-grid-row"><div class="time-label">${escapeHtml(label.split("–")[0])}</div>${cells}</div>${calendarBreakRow(slot, "doctor")}`;
   }).join("");
-  $("#calendarSurface").innerHTML = `<div class="week-calendar"><div class="week-grid-header"><div class="time-corner">Time</div>${headers}</div>${rows}</div>`;
+  $("#calendarSurface").innerHTML = `<div class="doctor-calendar" style="--doctor-columns:${doctors.length}"><div class="doctor-grid-header"><div class="time-corner">Time</div>${headers}</div>${rows}</div>`;
   bindAppointmentCards();
   bindEmptySlots();
 }
@@ -561,8 +546,8 @@ function bindEmptySlots() {
 }
 
 function appointmentCard(item) {
-  const primary = state.perspective === "therapist" ? item.patientName : item.therapistName;
-  const secondary = state.perspective === "therapist" ? item.patientCode : item.therapistCode;
+  const primary = item.patientName;
+  const secondary = item.patientCode;
   return `<button class="appointment-card ${therapyClass(item.therapy)} status-${item.status.toLowerCase()}" data-appointment-id="${item.id}"><strong>${escapeHtml(primary)}</strong><small>${escapeHtml(secondary)} · ${escapeHtml(item.therapy)}</small><span class="card-time">${escapeHtml(item.time.split("–")[0])}</span></button>`;
 }
 
@@ -575,7 +560,7 @@ function bindAppointmentCards() {
 
 function emptySchedule() {
   const filtersActive = Object.values(state.filters).some(Boolean);
-  const perspective = state.perspective === "therapist" ? "doctor" : "patient";
+  const perspective = "doctor";
   return `<div class="empty-state"><span class="empty-state-icon">${icon(filtersActive ? "filter" : "calendar")}</span><h3>${filtersActive ? `No ${perspective} schedules match these filters` : "This schedule is ready to plan"}</h3><p>${filtersActive ? "Clear or adjust the calendar filters to broaden the view." : "Generate tomorrow’s draft to place patient sessions into available clinician time."}</p><button class="${filtersActive ? "secondary-button" : "primary-button"}" id="emptyAction">${filtersActive ? "Clear filters" : "Plan tomorrow"}</button></div>`;
 }
 
@@ -673,41 +658,120 @@ function metricCard(label, value, note, style = "") {
   return `<article class="metric-card ${style}"><span class="metric-label">${escapeHtml(label)}</span><div class="metric-value">${Number(value).toLocaleString("en-IN")}</div><span class="metric-note">${escapeHtml(note)}</span></article>`;
 }
 
+let patientDirectoryRequest = 0;
+let zohoRefreshTimer = null;
+
+// "Refresh from Zoho": runs the nightly import now (server-side, in the background), then reloads the list.
+function showZohoRefresh(status) {
+  const line = $("#patientZohoRefreshStatus"), button = $("#patientZohoRefresh");
+  if (!line || !button) return;
+  const running = status.state === "RUNNING";
+  button.disabled = running;
+  button.innerHTML = `${icon("activity")}${running ? "Refreshing…" : "Refresh from Zoho"}`;
+  const when = (value) => value ? new Date(value).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "numeric", month: "short", hour: "numeric", minute: "2-digit" }) : "";
+  if (running) {
+    line.textContent = "Refreshing from Zoho… this takes about 1–2 minutes. You can keep working.";
+  } else if (status.state === "FAILED") {
+    line.textContent = `Last refresh failed (${when(status.finishedAt)}): ${status.error} Nothing was changed.`;
+  } else if (status.state === "DONE") {
+    const s = status.summary || {};
+    line.textContent = `Updated from Zoho ${when(status.finishedAt)} · ${(s.newActive || []).length} new active · `
+      + `${(s.newInactive || []).length} new inactive · ${(s.readyToActivate || []).length} inactive ready to activate · `
+      + `${s.stillNeedFixing ?? 0} need fixing in Zoho.`;
+  } else {
+    line.textContent = "";
+  }
+}
+
+async function pollZohoRefresh(reloadWhenDone = true) {
+  window.clearTimeout(zohoRefreshTimer);
+  try {
+    const status = await api("/api/zoho/refresh");
+    showZohoRefresh(status);
+    if (status.state === "RUNNING") {
+      zohoRefreshTimer = window.setTimeout(() => pollZohoRefresh(true), 3000);
+    } else if (reloadWhenDone && status.state === "DONE") {
+      await loadPatientsView();
+      toast("Patients updated", "The latest Zoho data is loaded. Inactive patients still need Mark active.");
+    } else if (reloadWhenDone && status.state === "FAILED") {
+      toast("Refresh didn’t finish", status.error, "error");
+    }
+  } catch (_) { /* Status is optional; the list and button keep working. */ }
+}
+
+async function startZohoRefresh() {
+  try {
+    showZohoRefresh(await api("/api/zoho/refresh", { method: "POST", body: "{}" }));
+    zohoRefreshTimer = window.setTimeout(() => pollZohoRefresh(true), 3000);
+  } catch (error) {
+    toast("Couldn’t refresh", error.message, "error");
+  }
+}
+
 async function loadPatientsView() {
   const root = $("#view-patients");
-  root.innerHTML = `<div class="loading-state"><span class="spinner"></span>Loading patient directory…</div>`;
+  const request = ++patientDirectoryRequest;
+  if (!$("#patientSearch", root)) {
+    root.innerHTML = `<div class="loading-state"><span class="spinner"></span>Loading patient directory…</div>`;
+  }
   try {
-    const payload = await api(`/api/patients?q=${encodeURIComponent(state.patientQuery)}`);
+    const payload = await api("/api/patients");
+    if (request !== patientDirectoryRequest) return;
     state.patients = payload.patients;
-    state.patientPage = 1;
     renderPatientsView();
-  } catch (error) { root.innerHTML = errorState(error.message); }
+  } catch (error) {
+    if (request !== patientDirectoryRequest) return;
+    if ($("#patientSearch", root)) toast("Couldn’t refresh patients", error.message, "error");
+    else root.innerHTML = errorState(error.message);
+  }
 }
 
 function renderPatientsView() {
   const root = $("#view-patients");
+  const query = state.patientQuery.trim().toLowerCase();
+  const patients = state.patients.filter(item =>
+    (!query || `${item.name} ${item.code}`.toLowerCase().includes(query)) &&
+    (state.patientStatusFilter === "all" || item.active === (state.patientStatusFilter === "active")));
   const pageSize = 25;
-  const pages = Math.max(1, Math.ceil(state.patients.length / pageSize));
-  state.patientPage = Math.min(state.patientPage, pages);
+  const pages = Math.max(1, Math.ceil(patients.length / pageSize));
+  state.patientPage = Math.max(1, Math.min(state.patientPage, pages));
   const start = (state.patientPage - 1) * pageSize;
-  const rows = state.patients.slice(start, start + pageSize);
-  root.innerHTML = `${pageHeading("Care directory", "Patients")}
-    <div class="directory-toolbar"><label class="search-field">${icon("search")}<input id="patientSearch" type="search" value="${escapeHtml(state.patientQuery)}" placeholder="Search by patient name or code" aria-label="Search patients"></label><span class="soft-pill">${state.patients.length.toLocaleString("en-IN")} patients</span></div>
-    <div class="table-shell"><table class="data-table"><thead><tr><th>Patient ID</th><th>Patient</th><th>Preference day</th><th>Preferred time</th><th>Status</th><th></th></tr></thead><tbody>
-      ${rows.map((item) => `<tr><td><strong>${escapeHtml(item.code)}</strong></td><td><div class="person-cell"><span class="avatar">${escapeHtml(initials(item.name === "Name not provided" ? item.code : item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${item.therapies} active therap${item.therapies === 1 ? "y" : "ies"}</small></span></div></td><td>${escapeHtml(item.preferenceDay)}</td><td>${escapeHtml(item.preferencePeriod)}</td><td><button class="status-pill patient-status-button ${item.active ? "status-confirmed" : "status-needs_rescheduling"}" type="button" data-patient-status="${item.id}" aria-haspopup="dialog" aria-label="${item.active ? "Active" : "Inactive"} — change scheduling status for ${escapeHtml(item.code)}">${item.active ? "Active" : "Inactive"} ${icon("chevron-right")}</button></td><td><button class="ghost-button" type="button" data-patient-preferences="${item.id}">Edit</button></td></tr>`).join("")}
-    </tbody></table><div class="table-footer"><span>Showing ${state.patients.length ? start + 1 : 0}–${Math.min(start + pageSize, state.patients.length)} of ${state.patients.length.toLocaleString("en-IN")}</span><div><button class="ghost-button" id="patientPrev" ${state.patientPage === 1 ? "disabled" : ""}>Previous</button><button class="ghost-button" id="patientNext" ${state.patientPage === pages ? "disabled" : ""}>Next</button></div></div></div>`;
-  let searchTimer;
-  $("#patientSearch").addEventListener("input", (event) => {
-    window.clearTimeout(searchTimer);
-    searchTimer = window.setTimeout(() => { state.patientQuery = event.target.value.trim(); loadPatientsView(); }, 280);
-  });
-  $("#patientPrev").addEventListener("click", () => { state.patientPage--; renderPatientsView(); });
-  $("#patientNext").addEventListener("click", () => { state.patientPage++; renderPatientsView(); });
+  const rows = patients.slice(start, start + pageSize);
+  if (!$("#patientSearch", root)) {
+    root.innerHTML = `${pageHeading("Care directory", "Patients")}
+    <div class="directory-toolbar patient-directory-toolbar"><label class="search-field">${icon("search")}<input id="patientSearch" type="search" value="${escapeHtml(state.patientQuery)}" placeholder="Search by patient name or code" aria-label="Search patients"></label><label class="patient-status-filter">Status<select id="patientStatusFilter"><option value="all">All</option><option value="active">Active</option><option value="inactive">Inactive</option></select></label><span class="soft-pill" id="patientMatchCount" role="status" aria-live="polite"></span>${mainWorkflowWorkspace ? `<button type="button" class="secondary-button" id="patientZohoRefresh">${icon("activity")}Refresh from Zoho</button>` : ""}</div>${mainWorkflowWorkspace ? '<p class="zoho-refresh-status" id="patientZohoRefreshStatus" role="status" aria-live="polite"></p>' : ""}
+    <div class="table-shell patient-directory-table"><table class="data-table"><thead><tr><th>Patient ID</th><th>Patient</th><th>Preference day</th><th>Preferred time</th><th>Status</th><th></th></tr></thead><tbody>
+    </tbody></table><div class="table-footer"><span id="patientPageSummary"></span><div><button class="ghost-button" id="patientPrev">Previous</button><button class="ghost-button" id="patientNext">Next</button></div></div></div>`;
+    $("#patientSearch", root).addEventListener("input", event => {
+      state.patientQuery = event.target.value;
+      state.patientPage = 1;
+      renderPatientsView();
+    });
+    $("#patientStatusFilter", root).addEventListener("change", event => {
+      state.patientStatusFilter = event.target.value;
+      state.patientPage = 1;
+      renderPatientsView();
+    });
+    $("#patientPrev", root).addEventListener("click", () => { state.patientPage--; renderPatientsView(); });
+    $("#patientNext", root).addEventListener("click", () => { state.patientPage++; renderPatientsView(); });
+    if ($("#patientZohoRefresh", root)) {
+      $("#patientZohoRefresh", root).addEventListener("click", startZohoRefresh);
+      pollZohoRefresh(false);  // Show the last refresh, or resume watching one already running.
+    }
+  }
+  const search = $("#patientSearch", root);
+  if (search.value !== state.patientQuery) search.value = state.patientQuery;
+  $("#patientStatusFilter", root).value = state.patientStatusFilter;
+  $("#patientMatchCount", root).textContent = `${patients.length.toLocaleString("en-IN")} patients`;
+  $("#patientPageSummary", root).textContent = `Showing ${patients.length ? start + 1 : 0}–${Math.min(start + pageSize, patients.length)} of ${patients.length.toLocaleString("en-IN")}`;
+  $("#patientPrev", root).disabled = state.patientPage === 1;
+  $("#patientNext", root).disabled = state.patientPage === pages;
+  $("tbody", root).innerHTML = rows.length ? rows.map((item) => `<tr><td><strong>${escapeHtml(item.code)}</strong></td><td><div class="person-cell"><span class="avatar">${escapeHtml(initials(item.name === "Name not provided" ? item.code : item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${item.therapies} active therap${item.therapies === 1 ? "y" : "ies"}</small></span></div></td><td>${escapeHtml(item.preferenceDay)}</td><td>${escapeHtml(item.preferencePeriod)}</td><td><button class="status-pill patient-status-button ${item.active ? "status-confirmed" : "status-needs_rescheduling"}" type="button" data-patient-status="${item.id}" aria-haspopup="dialog" aria-label="${item.active ? "Active" : "Inactive"} — change scheduling status for ${escapeHtml(item.code)}">${item.active ? "Active" : "Inactive"} ${icon("chevron-right")}</button></td><td><button class="ghost-button" type="button" data-patient-preferences="${item.id}">Edit</button></td></tr>`).join("") : '<tr><td colspan="6">No patients match your search and status filter.</td></tr>';
   $$("[data-patient-status]", root).forEach(button => button.addEventListener("click", () => {
     const patient = rows.find(item => String(item.id) === button.dataset.patientStatus);
     openPatientStatusDialog(patient, () => {
       renderPatientsView();
-      $(`[data-patient-status="${patient.id}"]`, root)?.focus();
+      ($(`[data-patient-status="${patient.id}"]`, root) || $("#patientStatusFilter", root)).focus();
     });
   }));
   $$('[data-patient-preferences]', root).forEach((button) => button.addEventListener("click", () => {
@@ -876,18 +940,58 @@ function openPatientStatusDialog(patient, onSaved) {
   if (active) checkActivation();
 }
 
+const teamFilters = { query: "", status: "all", department: "", location: "" };
+let teamDirectory = null;
+
 async function loadTeamView() {
   const root = $("#view-team");
   root.innerHTML = `<div class="loading-state"><span class="spinner"></span>Loading clinical team…</div>`;
   try {
     const week = isoDate(startOfWeek(state.currentDate));
-    const payload = await api(`/api/therapists?start=${week}`);
+    teamDirectory = await api(`/api/therapists?start=${week}`);
+    const departments = [...new Set(teamDirectory.therapists.map((item) => item.department))].sort((a, b) => a.localeCompare(b));
+    const locations = [...new Set(teamDirectory.therapists.map((item) => item.location))].sort((a, b) => a.localeCompare(b));
+    if (!departments.includes(teamFilters.department)) teamFilters.department = "";
+    if (!locations.includes(teamFilters.location)) teamFilters.location = "";
+    const options = (values, all) => `<option value="">${all}</option>${values.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("")}`;
+    // The toolbar is built once; typing and filters only re-render the rows, so focus is never lost.
     root.innerHTML = `${pageHeading("Capacity & coverage", "Clinical team", `<button class="secondary-button" data-team-calendar>${icon("calendar")}View team calendar</button>`)}
-      <div class="table-shell"><table class="data-table"><thead><tr><th>Clinician</th><th>Department</th><th>Location</th><th>Weekly workload</th><th>Status</th></tr></thead><tbody>
-      ${payload.therapists.map((item) => { const capacityLabel = item.capacity == null ? "Not supplied" : item.capacity; const utilization = item.capacity ? Math.min(100, Math.round(item.appointments / item.capacity * 100)) : 0; return `<tr><td><div class="person-cell"><span class="avatar">${escapeHtml(initials(item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.code)}</small></span></div></td><td>${escapeHtml(item.department)}</td><td>${escapeHtml(item.location)}</td><td><div style="display:flex;align-items:center;gap:10px"><div class="progress-track"><div class="progress-fill" style="width:${utilization}%"></div></div><span>${item.appointments} / ${capacityLabel}</span></div></td><td><span class="status-pill ${item.active ? "status-confirmed" : "status-needs_rescheduling"}">${item.active ? "Active" : "Inactive"}</span></td></tr>`; }).join("")}
-      </tbody></table><div class="table-footer"><span>${payload.therapists.length} therapists · week of ${formatDate(parseLocalDate(payload.weekStart), { day: "numeric", month: "long", year: "numeric" })}</span><span>Capacity assumes 10 daily slots</span></div></div>`;
-    $('[data-team-calendar]').addEventListener("click", () => setView("schedule"));
+      <div class="directory-toolbar patient-directory-toolbar">
+        <label class="search-field">${icon("search")}<input id="teamSearch" type="search" placeholder="Search by clinician name or code" aria-label="Search clinicians"></label>
+        <label class="patient-status-filter">Status <select id="teamStatusFilter" aria-label="Filter by status"><option value="all">All</option><option value="active">Active</option><option value="inactive">Inactive</option></select></label>
+        <label class="patient-status-filter">Department <select id="teamDepartmentFilter" aria-label="Filter by department">${options(departments, "All departments")}</select></label>
+        <label class="patient-status-filter">Location <select id="teamLocationFilter" aria-label="Filter by location">${options(locations, "All locations")}</select></label>
+        <span class="soft-pill" id="teamMatchCount"></span>
+      </div>
+      <div class="table-shell patient-directory-table"><table class="data-table"><thead><tr><th>Clinician</th><th>Department</th><th>Location</th><th>Weekly workload</th><th>Status</th></tr></thead><tbody></tbody></table>
+      <div class="table-footer"><span id="teamFooter"></span><span>Capacity assumes 10 daily slots</span></div></div>`;
+    $("#teamSearch", root).value = teamFilters.query;
+    $("#teamStatusFilter", root).value = teamFilters.status;
+    $("#teamDepartmentFilter", root).value = teamFilters.department;
+    $("#teamLocationFilter", root).value = teamFilters.location;
+    $("#teamSearch", root).addEventListener("input", (event) => { teamFilters.query = event.target.value; renderTeamView(); });
+    [["#teamStatusFilter", "status"], ["#teamDepartmentFilter", "department"], ["#teamLocationFilter", "location"]].forEach(([selector, key]) => {
+      $(selector, root).addEventListener("change", (event) => { teamFilters[key] = event.target.value; renderTeamView(); });
+    });
+    $('[data-team-calendar]', root).addEventListener("click", () => setView("schedule"));
+    renderTeamView();
   } catch (error) { root.innerHTML = errorState(error.message); }
+}
+
+function renderTeamView() {
+  const root = $("#view-team");
+  if (!teamDirectory || !$("#teamSearch", root)) return;
+  const query = teamFilters.query.trim().toLowerCase();
+  const rows = teamDirectory.therapists.filter((item) =>
+    (!query || `${item.name} ${item.code}`.toLowerCase().includes(query)) &&
+    (teamFilters.status === "all" || item.active === (teamFilters.status === "active")) &&
+    (!teamFilters.department || item.department === teamFilters.department) &&
+    (!teamFilters.location || item.location === teamFilters.location));
+  const total = teamDirectory.therapists.length;
+  $("#teamMatchCount", root).textContent = `${rows.length.toLocaleString("en-IN")} clinician${rows.length === 1 ? "" : "s"}`;
+  $("#teamFooter", root).textContent = `${rows.length.toLocaleString("en-IN")} of ${total.toLocaleString("en-IN")} clinicians · week of ${formatDate(parseLocalDate(teamDirectory.weekStart), { day: "numeric", month: "long", year: "numeric" })}`;
+  $("tbody", root).innerHTML = rows.length ? rows.map((item) => { const capacityLabel = item.capacity == null ? "Not supplied" : item.capacity; const utilization = item.capacity ? Math.min(100, Math.round(item.appointments / item.capacity * 100)) : 0; return `<tr><td><div class="person-cell"><span class="avatar">${escapeHtml(initials(item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.code)}</small></span></div></td><td>${escapeHtml(item.department)}</td><td>${escapeHtml(item.location)}</td><td><div style="display:flex;align-items:center;gap:10px"><div class="progress-track"><div class="progress-fill" style="width:${utilization}%"></div></div><span>${item.appointments} / ${capacityLabel}</span></div></td><td><span class="status-pill ${item.active ? "status-confirmed" : "status-needs_rescheduling"}">${item.active ? "Active" : "Inactive"}</span></td></tr>`; }).join("")
+    : '<tr><td colspan="5">No clinicians match your search and filters.</td></tr>';
 }
 
 function renderReleasedAppointments(operations) {
@@ -1253,14 +1357,15 @@ async function openAppointment(item) {
   }
   const drawer = ensureAppointmentDrawer();
   const canChange = !item.preview && ["PROPOSED", "PENDING_CONFIRMATION", "CONFIRMED"].includes(item.status);
+  const plan = state.schedule?.patientPlans?.[String(item.patientId)] || [];
   drawer.innerHTML = `<div class="drawer-header"><div><p class="eyebrow">Appointment details</p><h2 id="appointmentDrawerTitle">${formatDate(parseLocalDate(item.date), { weekday: "long", day: "numeric", month: "long" })}</h2></div><button class="icon-button" data-close-appointment aria-label="Close appointment">${icon("close")}</button></div>
     <div class="drawer-body"><div class="appointment-hero"><span class="status-pill status-${item.status.toLowerCase()}">${escapeHtml(formatStatus(item.status))}</span><h3>${escapeHtml(item.patientName)}</h3><p>${escapeHtml(item.patientCode)} · ${escapeHtml(item.therapy)}</p></div>
-      <div class="detail-list">
-        <div class="detail-item"><span>${icon("clock")}</span><div><small>Time</small><strong>${escapeHtml(item.time)}</strong></div></div>
-        <div class="detail-item"><span>${icon("user")}</span><div><small>Clinician</small><strong>${escapeHtml(item.therapistName)} · ${escapeHtml(item.therapistCode)}</strong></div></div>
-        <div class="detail-item"><span>${icon("location")}</span><div><small>Location</small><strong>${escapeHtml(item.location)}</strong></div></div>
-        <div class="detail-item"><span>${icon("activity")}</span><div><small>Schedule source</small><strong>${escapeHtml(item.source)}${item.bundle ? ` · bundle ${escapeHtml(item.bundle)}` : ""}</strong></div></div>
-      </div>
+      <dl class="appointment-facts">
+        <div><dt>Time</dt><dd>${escapeHtml(item.time)}</dd></div>
+        <div><dt>Clinician</dt><dd>${escapeHtml(item.therapistName)}</dd></div>
+        <div><dt>Location</dt><dd>${escapeHtml(item.location)}</dd></div>
+        <div><dt>Plan</dt><dd>${plan.length ? `<ul class="appointment-plan">${plan.map(therapy => `<li><span>${escapeHtml(therapy.therapy)}</span><span>${escapeHtml(therapy.sessionsPerWeek)} ${therapy.sessionsPerWeek === 1 ? "session" : "sessions"}/week</span></li>`).join("")}</ul>` : '<span class="appointment-plan-empty">No active plan recorded.</span>'}</dd></div>
+      </dl>
       ${canChange ? `<section class="drawer-section"><h3>Move this visit</h3><form class="form-grid" id="moveAppointmentForm"><label>New date<input type="date" id="moveDate" value="${item.date}" required></label><label>New starting time<select id="moveSlot">${state.overview.slotLabels.map((label, index) => `<option value="${index}" ${index === item.slot ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></label><button class="secondary-button" type="submit">Validate and move</button></form></section><div class="drawer-actions"><button class="danger-button" id="cancelAppointment">Record patient cancellation</button></div>` : ""}
     </div>`;
   $('[data-close-appointment]', drawer).addEventListener("click", closeDrawers);
@@ -1286,15 +1391,6 @@ async function openAppointment(item) {
     });
   }
   openDrawer("appointmentDrawer");
-  if (workflowWorkspace && !item.preview) {
-    const section = document.createElement("section");
-    section.className = "drawer-section";
-    $(".detail-list", drawer).after(section);
-    window.therapyWhatsapp.mountAppointment({
-      root: section, item, api,
-      onChanged: () => refreshAfterWhatsapp(item.id),
-    });
-  }
 }
 
 function showReplacementCandidates(groups) {
