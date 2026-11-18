@@ -88,16 +88,28 @@ def verify_target(settings: ZohoCreatorSettings) -> None:
         raise ValueError("Schedule exports are restricted to the authorized test-gokul Scheduler form")
 
 
+def workflow_options(settings: ZohoCreatorSettings) -> dict:
+    """Skip Zoho's form workflows and schedules only for Thanal's trial form when the switch is on.
+
+    Thanal's form workflow refuses rows that overlap its main schedule and, on success, creates
+    session records in other reports. With the switch on, rows land in the trial form only.
+    """
+    from main_workflow.thanal_export import matches
+    enabled = os.getenv("MAIN_WORKFLOW_ZOHO_SKIP_WORKFLOW", "false").strip().lower() == "true"
+    return {"skip_workflow": ["form_workflow", "schedules"]} if enabled and matches(settings) else {}
+
+
 def write_record(settings: ZohoCreatorSettings, access_token: str, fields: dict, record_id: str | None,
                  *, verify: Callable = verify_target, key_prefix: str = "test-") -> str:
-    """POST a new unique key or PATCH the same owned row; never disable workflows."""
+    """POST a new unique key or PATCH the same owned row; workflows run unless ``workflow_options`` skips them."""
     verify(settings)
     validate_payload(settings, fields, key_prefix)
     if record_id is not None and not record_id.isdigit():
         raise ValueError("Invalid Scheduler record ID")
     suffix = f"report/{settings.report_link_name}/{record_id}" if record_id else f"form/{settings.form_link_name}"
     request = Request(f"{settings.api_url}/creator/v2.1/data/{settings.account_owner}/{settings.app_link_name}/{suffix}",
-                      data=json.dumps({"data": fields}).encode(), method="PATCH" if record_id else "POST",
+                      data=json.dumps({"data": fields, **workflow_options(settings)}).encode(),
+                      method="PATCH" if record_id else "POST",
                       headers={"Authorization": f"Zoho-oauthtoken {access_token}", "Content-Type": "application/json"})
     try:
         with open_zoho_request(request, timeout=30) as response:
@@ -212,7 +224,8 @@ def write_records(settings, token, fields, *, verify=verify_target, key_prefix="
         validate_payload(settings, row, key_prefix)
     request = Request(
         f"{settings.api_url}/creator/v2.1/data/{settings.account_owner}/{settings.app_link_name}/form/{settings.form_link_name}",
-        data=json.dumps({"data": fields, "result": {"fields": ["Scheduler_Key"]}}).encode(), method="POST",
+        data=json.dumps({"data": fields, "result": {"fields": ["Scheduler_Key"]},
+                         **workflow_options(settings)}).encode(), method="POST",
         headers={"Authorization": f"Zoho-oauthtoken {token}", "Content-Type": "application/json"})
     with open_zoho_request(request, timeout=60) as response:
         payload = json.load(response)
@@ -283,7 +296,8 @@ def write_updates(settings, token, changes, existing, *, verify=verify_target, e
         request = Request(
             f"{settings.api_url}/creator/v2.1/data/{settings.account_owner}/{settings.app_link_name}/report/{settings.report_link_name}",
             data=json.dumps({"criteria": " || ".join(f"ID == {identifier}" for identifier in by_id),
-                             "data": json.loads(encoded), "result": {"fields": ["Scheduler_Key"]}}).encode(),
+                             "data": json.loads(encoded), "result": {"fields": ["Scheduler_Key"]},
+                             **workflow_options(settings)}).encode(),
             method="PATCH", headers={"Authorization": f"Zoho-oauthtoken {token()}", "Content-Type": "application/json"})
         try:
             with open_zoho_request(request, timeout=60) as response:

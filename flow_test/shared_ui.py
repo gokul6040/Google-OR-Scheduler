@@ -26,7 +26,8 @@ POST_ROUTES = (
     r"/api/absences",
     r"/api/patients/\d+/preferences",
     r"/api/patients/\d+/status",
-    r"/api/appointments/\d+/(cancel|move|reservation-preview|reserve)",
+    r"/api/therapists/\d+/status",
+    r"/api/appointments/\d+/(cancel|staff-cancel|move|reservation-preview|reserve)",
     r"/api/calendar/(reservation-preview|reserve)",
     r"/api/schedules/generate",
     r"/api/schedules/[0-9a-f-]+/save",
@@ -124,20 +125,74 @@ def save_daily_preview(request, instance, preview_id: str) -> None:
     request.send_json(response)
 
 
+ASSISTANT_ROUTES = {
+    ("GET", "/api/assistant/status"),
+    ("POST", "/api/assistant/messages"),
+    ("POST", "/api/assistant/memory/clear"),
+}
+
+
+def assistant_enabled() -> bool:
+    """Opt-in per deployment (Thanal, 13 Nov 2026); other apps keep the assistant off."""
+    import os
+    return os.getenv("SCHEDULING_ASSISTANT_ENABLED", "false").strip().lower() == "true"
+
+
+def run_assistant(request, instance, prefix: str) -> None:
+    """Answer scheduling questions from this workflow's database, read-only.
+
+    Runs WITHOUT the workflow lock: it only reads, and an AI reply can take
+    seconds, which must not hold up offers, imports or other screens. With
+    portal sign-in on, only signed-in admins may use it (not the jobs' key).
+    """
+    import web_app
+    from services.portal_auth import enabled as portal_enabled
+
+    user = getattr(request, "portal_user", None)
+    if portal_enabled() and not (user and user.get("role") == "admin"):
+        request.close_connection = True
+        request.send_json({"error": "The scheduling assistant is available to signed-in admins."}, 403)
+        return
+    if not hasattr(instance, "previews"):
+        instance.previews = {}
+    context = web_app.WORKSPACE_CONTEXT.set({
+        "sessions": instance.flow.sessions, "previews": instance.previews,
+        "admin_user": (user or {}).get("email", getattr(instance.flow, "admin_id", "scheduler_manager")),
+        "flow": instance.flow, "assistant_read_only": True,
+    })
+    adapter = web_app.TherapySchedulerHandler.__new__(web_app.TherapySchedulerHandler)
+    adapter.__dict__.update(request.__dict__)
+    adapter.path = request.path.removeprefix(prefix)
+    adapter._headers_buffer = []
+    try:
+        adapter.do_GET() if request.command == "GET" else adapter.do_POST()
+    finally:
+        web_app.WORKSPACE_CONTEXT.reset(context)
+        request.close_connection = adapter.close_connection
+
+
 def dispatch_shared_api(request, instance, *, prefix: str = "/test") -> bool:
     """Allow local UI workflows with a request-scoped session and previews."""
     path = urlsplit(request.path).path.removeprefix(prefix)
     patterns = GET_ROUTES if request.command == "GET" else POST_ROUTES
     local_route = any(re.fullmatch(pattern, path) for pattern in patterns)
     assistant_status = path == "/api/assistant/status" and request.command == "GET"
-    if not local_route and not assistant_status:
+    assistant_route = assistant_enabled() and (request.command, path) in ASSISTANT_ROUTES
+    if not local_route and not assistant_status and not assistant_route:
         return False
     if not secrets.compare_digest(request.headers.get("Authorization", ""), f"Bearer {instance.token}"):
         request.close_connection = True
         request.send_json({"error": "Enter the test admin key to open this workspace."}, 401)
         return True
+    if assistant_route:
+        run_assistant(request, instance, prefix)
+        return True
     if assistant_status:
         request.send_json({"configured": False})
+        return True
+    if request.command == "POST" and re.fullmatch(r"/api/appointments/\d+/cancel", path):
+        request.read_json()
+        request.send_json({"error": "Refresh the app and use Cancel appointment with a scope and reason."}, 409)
         return True
     import web_app
 
@@ -170,14 +225,16 @@ def dispatch_shared_api(request, instance, *, prefix: str = "/test") -> bool:
         getattr(instance, "calendar_push", dispatch_calendar_push)(request, instance)
         return True
 
-    status_change = request.command == "POST" and re.fullmatch(r"/api/patients/\d+/status", path)
+    status_change = request.command == "POST" and (
+        re.fullmatch(r"/api/(patients|therapists)/\d+/status", path)
+        or re.fullmatch(r"/api/appointments/\d+/staff-cancel", path))
     # Match the worker's lock order so a send is settled before deciding how to handle its offer.
     with (instance.flow.sender_lock if status_change else nullcontext()), instance.flow.lock:
         if not hasattr(instance, "previews"):
             instance.previews = {}
         context = web_app.WORKSPACE_CONTEXT.set({
             "sessions": instance.flow.sessions, "previews": instance.previews,
-            "admin_user": getattr(instance.flow, "admin_id", "scheduler_manager"),
+            "admin_user": (getattr(request, "portal_user", None) or {}).get("email", getattr(instance.flow, "admin_id", "scheduler_manager")),
             "flow": instance.flow,
         })
         adapter = web_app.TherapySchedulerHandler.__new__(web_app.TherapySchedulerHandler)

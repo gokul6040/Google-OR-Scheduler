@@ -120,7 +120,8 @@ def test_activation_review_reports_all_problems_and_refreshes_after_correction(f
         result = activation_review(session, patient)
         assert not result["canActivate"]
         message = " ".join(result["issues"])
-        assert "phone" in message and "inactive" in message and "weekly sessions" in message
+        # The plan is invalid here, so no requirement links the (inactive) consultant yet.
+        assert "phone" in message and "weekly sessions" in message
     reports["All_Registrations"][0]["Phone_Number"] = "919999999999"
     reports["All_Consultants"][0]["Status"] = "Active"
     reports[PLANS][0]["Schedule"][0]["Per_Week"] = "2"
@@ -128,6 +129,15 @@ def test_activation_review_reports_all_problems_and_refreshes_after_correction(f
     with flow.sessions() as session:
         patient = session.scalar(select(Patient))
         assert not patient.active
+        # Zoho's Active does not switch an existing consultant on; staff do that in our app.
+        result = activation_review(session, patient)
+        assert not result["canActivate"] and result["issues"]
+        assert all("Clinical team" in issue for issue in result["issues"])  # One per therapy.
+    from services.therapist_status_service import change_therapist_status
+    with flow.sessions.begin() as session:
+        change_therapist_status(session, session.scalar(select(Therapist)), True, "", "staff")
+    with flow.sessions() as session:
+        patient = session.scalar(select(Patient))
         assert activation_review(session, patient)["canActivate"]
 
 
@@ -186,7 +196,8 @@ def test_daily_import_updates_all_sources_and_is_idempotent(flow, reports):
     apply_snapshot(flow, reports, window=SECOND)
     with flow.sessions() as session:
         assert session.scalar(select(Patient.name)) == "Renamed fictional child"
-        assert not session.scalar(select(Therapist.active))
+        # Staff own an existing consultant's status; Zoho's Inactive does not change it.
+        assert session.scalar(select(Therapist.active))
         assert len(list(session.scalars(select(TreatmentRequirement)))) == 2
         assert {r.sessions_per_week for r in session.scalars(select(TreatmentRequirement))} == {2, 3}
     assert flow.recipients["FAKE-1"] == "918888888888"
@@ -316,10 +327,12 @@ def test_new_registration_and_plan_are_adopted_on_the_next_run(flow, reports):
 
 
 def test_inactive_consultant_holds_an_existing_unsent_scheduled_offer(flow, reports):
+    from services.therapist_status_service import change_therapist_status
     apply_snapshot(flow, reports, window=FIRST)
     flow.generate(flow.next_offer_date())
     flow.publish(flow.next_offer_date())
-    reports["All_Consultants"][0]["Status"] = "Inactive"
+    with flow.sessions.begin() as session:  # Staff mark the consultant inactive in our app.
+        change_therapist_status(session, session.scalar(select(Therapist)), False, "On leave", "staff")
     apply_snapshot(flow, reports, window=SECOND)
     assert flow.process_one()
     with flow.sessions() as session:

@@ -18,7 +18,9 @@ from database.models import (
     TherapistAbsence, TherapistAvailability, TherapistCapability,
     TherapistLocation, TreatmentRequirement,
 )
-from database.repository import ACTIVE_SCHEDULE_STATUSES, _plan_end_date
+from database.repository import (
+    ACTIVE_SCHEDULE_STATUSES, _plan_end_date, course_session_counts, course_target,
+)
 from scheduling.slot_config import SLOTS, valid_consecutive_block
 from services.patient_status_service import lock_patient
 
@@ -189,9 +191,16 @@ def _preview_reservation(
                 warn("BRANCH_MISMATCH", "The slot is at a different branch from the treatment plan.")
             if requirement.plan_start_date and source.date < requirement.plan_start_date:
                 warn("PLAN_NOT_STARTED", "The treatment plan has not started on this date.")
-            end = _plan_end_date(requirement.plan_start_date, requirement.duration_months)
-            if end and source.date > end:
-                warn("PLAN_ENDED", "The treatment plan has ended before this date.")
+            target = course_target(requirement.sessions_per_week, requirement.duration_months)
+            if target is not None:
+                # Courses end at their session total, not on a calendar date.
+                done = course_session_counts(session, [requirement.id])[requirement.id]
+                if done >= target:
+                    warn("COURSE_COMPLETE", f"This therapy course already has all {target} sessions booked or done.")
+            else:
+                end = _plan_end_date(requirement.plan_start_date, requirement.duration_months)
+                if end and source.date > end:
+                    warn("PLAN_ENDED", "The treatment plan has ended before this date.")
         current = [item for item in appointments if (
             item.date, item.slot_index, item.therapist_id
         ) == (source.date, source.slot_index, source.therapist_id)

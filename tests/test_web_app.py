@@ -268,9 +268,149 @@ def test_patient_preference_table_saves_day_level_availability(db_session, monke
         PatientAvailability.patient_id == patient.id
     )))
     assert len(rows) == 60
-    assert all(item.available and item.preference_score == 100 for item in rows if item.day_of_week == 0 and item.slot_index < 5)
-    assert all(item.preference_score == 0 for item in rows if item.day_of_week != 0 or item.slot_index >= 5)
-    assert captured["payload"]["preference"] == {"day": 0, "period": "morning"}
+    # An older single "day" + "period" request: one picked day (bonus 300) with the five morning times.
+    scores = {item.slot_index: item.preference_score for item in rows if item.day_of_week == 0}
+    assert all(item.available for item in rows)
+    assert [scores[slot] for slot in range(10)] == [400] * 5 + [380, 360, 340, 320, 300]
+    assert all(item.preference_score == 0 for item in rows if item.day_of_week != 0)
+    assert captured["payload"]["preference"] == {
+        "days": [0], "times": ["09:00", "09:40", "10:35", "11:15", "11:55"]}
+    row = next(item for item in web_app.patients_payload()["patients"] if item["code"] == "P-PREFERENCE")
+    assert (row["preferenceDay"], row["preferencePeriod"]) == ("Mon", "Morning")
+
+
+def test_exact_preferred_time_without_a_day_applies_every_day(db_session, monkeypatch):
+    patient = Patient(patient_code="P-EXACT", name="Exact Child", active=True)
+    db_session.add(patient)
+    db_session.commit()
+    captured = {}
+
+    class FakeHandler:
+        def send_json(self, payload, status=None):
+            captured["payload"] = payload
+
+    monkeypatch.setattr(web_app, "SessionLocal", lambda: nullcontext(db_session))
+    save = web_app.TherapySchedulerHandler.save_patient_preferences
+    with pytest.raises(web_app.ApiError, match="valid preferred time"):
+        save(FakeHandler(), patient.id, {"days": [], "times": ["09:41"]})
+    with pytest.raises(web_app.ApiError, match="valid preferred days"):
+        save(FakeHandler(), patient.id, {"days": [6], "times": []})
+    save(FakeHandler(), patient.id, {"days": [], "times": ["09:40"]})
+
+    scores = {(item.day_of_week, item.slot_index): item.preference_score for item in db_session.scalars(
+        select(PatientAvailability).where(PatientAvailability.patient_id == patient.id))}
+    for day in range(6):
+        assert [scores[(day, slot)] for slot in range(10)] == [80, 100, 80, 60, 40, 20, 0, 0, 0, 0]
+    assert captured["payload"]["preference"] == {"days": [], "times": ["09:40"]}
+    assert "09:40" in captured["payload"]["startTimes"]
+    row = next(item for item in web_app.patients_payload()["patients"] if item["code"] == "P-EXACT")
+    assert (row["preferenceDay"], row["preferencePeriod"]) == ("Every day", "Starts 9:40 AM")
+
+    save(FakeHandler(), patient.id, {"day": 4, "period": "15:30"})  # older single-value request
+    assert captured["payload"]["preference"] == {"days": [4], "times": ["15:30"]}
+    save(FakeHandler(), patient.id, {"days": [], "times": []})
+    assert captured["payload"]["preference"] == {"days": [], "times": []}
+
+
+def test_several_preferred_start_times_score_the_nearest_chosen_time(db_session, monkeypatch):
+    patient = Patient(patient_code="P-TIMES", name="Times Child", active=True)
+    db_session.add(patient)
+    db_session.commit()
+    captured = {}
+
+    class FakeHandler:
+        def send_json(self, payload, status=None):
+            captured["payload"] = payload
+
+    monkeypatch.setattr(web_app, "SessionLocal", lambda: nullcontext(db_session))
+    web_app.TherapySchedulerHandler.save_patient_preferences(
+        FakeHandler(), patient.id, {"days": [], "times": ["14:35", "13:15", "13:55"]})
+
+    scores = {(item.day_of_week, item.slot_index): item.preference_score for item in db_session.scalars(
+        select(PatientAvailability).where(PatientAvailability.patient_id == patient.id))}
+    assert [scores[(2, slot)] for slot in range(10)] == [0, 20, 40, 60, 80, 100, 100, 100, 80, 60]
+    assert captured["payload"]["preference"] == {"days": [], "times": ["13:15", "13:55", "14:35"]}
+    assert db_session.get(Patient, patient.id).preferred_time == "slots:5,6,7"
+    row = next(item for item in web_app.patients_payload()["patients"] if item["code"] == "P-TIMES")
+    assert (row["preferenceDay"], row["preferencePeriod"]) == ("Every day", "Starts 1:15 PM, 1:55 PM, 2:35 PM")
+
+    web_app.TherapySchedulerHandler.save_patient_preferences(
+        FakeHandler(), patient.id, {"days": [], "times": ["09:00", "10:35", "13:15", "15:30"]})
+    row = next(item for item in web_app.patients_payload()["patients"] if item["code"] == "P-TIMES")
+    assert row["preferencePeriod"] == "Starts 9:00 AM +3 more"
+
+
+def test_any_number_of_preferred_days_can_be_picked(db_session, monkeypatch):
+    department = Department(name="Psychology", active=True)
+    location = Location(name="Clinic", capacity=2, active=True)
+    patient = Patient(patient_code="P-DAYS", name="Days Child", active=True)
+    db_session.add_all([department, location, patient])
+    db_session.flush()
+    clinician = Therapist(therapist_code="ZC-DAYS", name="Days Clinician", department_id=department.id,
+                          location_id=location.id, active=True)
+    db_session.add(clinician)
+    db_session.flush()
+    # 3 + 2 sessions a week -> the child comes 3 times a week.
+    for frequency in (3, 2):
+        db_session.add(TreatmentRequirement(patient_id=patient.id, department_id=department.id,
+                                            assigned_therapist_id=clinician.id, sessions_per_week=frequency,
+                                            sequence_order=0, active=True))
+    db_session.commit()
+    captured = {}
+
+    class FakeHandler:
+        def send_json(self, payload, status=None):
+            captured["payload"] = payload
+
+    monkeypatch.setattr(web_app, "SessionLocal", lambda: nullcontext(db_session))
+    save = web_app.TherapySchedulerHandler.save_patient_preferences
+    # More days than the 3 weekly visits is fine: the scheduler chooses among them.
+    save(FakeHandler(), patient.id, {"days": [0, 1, 2, 3], "times": []})
+    assert captured["payload"]["preference"] == {"days": [0, 1, 2, 3], "times": []}
+    save(FakeHandler(), patient.id, {"days": [4, 0, 2], "times": []})
+
+    assert captured["payload"]["visitsPerWeek"] == 3
+    assert captured["payload"]["preference"] == {"days": [0, 2, 4], "times": []}
+    scores = {(item.day_of_week, item.slot_index): item.preference_score for item in db_session.scalars(
+        select(PatientAvailability).where(PatientAvailability.patient_id == patient.id))}
+    assert {day for (day, _), score in scores.items() if score} == {0, 2, 4}
+    assert all(score == 300 for (day, _), score in scores.items() if day in {0, 2, 4})
+    row = next(item for item in web_app.patients_payload()["patients"] if item["code"] == "P-DAYS")
+    assert (row["preferenceDay"], row["preferencePeriod"]) == ("Mon, Wed, Fri", "Any time")
+
+    save(FakeHandler(), patient.id, {"days": [1, 3], "times": ["09:40", "13:15"]})
+    assert captured["payload"]["preference"] == {"days": [1, 3], "times": ["09:40", "13:15"]}
+    row = next(item for item in web_app.patients_payload()["patients"] if item["code"] == "P-DAYS")
+    assert (row["preferenceDay"], row["preferencePeriod"]) == ("Tue, Thu", "Starts 9:40 AM, 1:15 PM")
+
+
+def test_patient_details_show_current_plan_and_assigned_clinician(db_session, monkeypatch):
+    department = Department(name="Speech Therapy", active=True)
+    location = Location(name="Clinic", capacity=2, active=True)
+    patient = Patient(patient_code="P-PLAN", name="Plan Child", active=False)
+    other = Patient(patient_code="P-OTHER", name="Other Child", active=True)
+    db_session.add_all([department, location, patient, other])
+    db_session.flush()
+    clinician = Therapist(therapist_code="ZC-INTERNAL", name="Assigned Clinician",
+                          department_id=department.id, location_id=location.id, active=True)
+    db_session.add(clinician)
+    db_session.flush()
+    for child, active, frequency in [(patient, True, 2), (patient, False, 5), (other, True, 4)]:
+        db_session.add(TreatmentRequirement(
+            patient_id=child.id, department_id=department.id, assigned_therapist_id=clinician.id,
+            sessions_per_week=frequency, duration_months=3, sequence_order=0, active=active,
+        ))
+    db_session.add(PatientAvailability(patient_id=patient.id, day_of_week=2, slot_index=5,
+                                       available=True, preference_score=100))
+    db_session.commit()
+    monkeypatch.setattr(web_app, "SessionLocal", lambda: nullcontext(db_session))
+    payload = web_app.patient_preferences_payload(patient.id)
+    assert payload["plan"] == [{"therapy": "Speech Therapy", "clinician": "Assigned Clinician",
+                                "sessionsPerWeek": 2, "durationMonths": 3,
+                                "sessions": 0, "target": 24, "complete": False}]
+    # Oldest saves stored no time: the band comes from the scores.
+    assert payload["preference"] == {"days": [2], "times": ["13:15", "13:55", "14:35", "15:30", "16:10"]}
+    assert payload["patient"]["active"] is False
 
 
 def test_generate_schedule_uses_tomorrow_and_one_day_slots(monkeypatch):
@@ -377,6 +517,8 @@ def test_schedule_payload_contains_display_ready_appointment(db_session, monkeyp
     monkeypatch.setattr(web_app, "SessionLocal", lambda: nullcontext(db_session))
     payload = web_app.schedule_payload(date(2026, 9, 7), 6)
 
+    # Without Thanal's Zoho bindings there is no real department to show; the calendar stays usable.
+    assert payload["therapists"] and all(row["zohoDepartment"] is None for row in payload["therapists"])
     assert payload["patients"] == [{"id": patient.id, "code": "P-001", "name": "Demo Patient"}]
     assert payload["patientPlans"] == {str(patient.id): [
         {"therapy": "Occupational Therapy", "sessionsPerWeek": 1},
@@ -979,3 +1121,51 @@ def test_assistant_memory_answers_pronoun_follow_up_for_single_listed_patient(db
         "outcome": "patient_detail",
         "message": "Memory patient's therapist for 2026-09-29 is Memory therapist.",
     }
+
+
+def test_clinical_team_weekly_capacity_is_ten_slots_times_six_days(db_session, monkeypatch):
+    """Weekly workload is booked sessions out of 60 (10 daily slots x Monday-Saturday)."""
+    from database.models import Appointment, AppointmentStatus, Department, Location, Patient, Therapist, TreatmentRequirement
+    department, location = Department(name="Speech"), Location(name="Centre", capacity=2)
+    therapist = Therapist(therapist_code="T1", name="Dr T", department=department, location=location)
+    patient = Patient(patient_code="P1", name="Child", active=True)
+    db_session.add_all([therapist, patient])
+    db_session.flush()
+    requirement = TreatmentRequirement(patient_id=patient.id, department_id=department.id, assigned_therapist_id=therapist.id,
+                                       location_id=location.id, sessions_per_week=2, sequence_order=0)
+    db_session.add(requirement)
+    db_session.flush()
+    monday = date(2026, 11, 9)
+    for day, status in enumerate([AppointmentStatus.CONFIRMED] * 10 + [AppointmentStatus.CANCELLED_PATIENT]):
+        db_session.add(Appointment(patient_id=patient.id, treatment_requirement_id=requirement.id, therapist_id=therapist.id,
+                                   department_id=department.id, location_id=location.id, date=monday + __import__("datetime").timedelta(days=day % 6),
+                                   slot_index=day // 6, status=status, bundle_id=f"b{day}", source="test"))
+    db_session.commit()
+    monkeypatch.setattr(web_app, "SessionLocal", lambda: nullcontext(db_session))
+    row = web_app.therapists_payload(monday)["therapists"][0]
+    assert (row["appointments"], row["capacity"]) == (10, 60)  # cancelled sessions do not count
+
+
+def test_assistant_reads_a_doctor_name_as_a_therapist_when_no_patient_matches(db_session):
+    department = Department(name="Speech")
+    location = Location(name="Clinic A", capacity=2)
+    child = Patient(patient_code="P-ANNA01", name="Anna Child")
+    db_session.add_all([department, location, child])
+    db_session.flush()
+    therapist = Therapist(
+        therapist_code="T-RAVI", name="Ravi Kumar",
+        department_id=department.id, location_id=location.id,
+    )
+    db_session.add(therapist)
+    db_session.commit()
+
+    doctor = web_app.assistant_person_scope(db_session, {
+        "action": "patient_summary", "entity_query": "Dr. Ravi Kumar"})
+    patient = web_app.assistant_person_scope(db_session, {
+        "action": "patient_summary", "entity_query": "Anna Child"})
+    unknown = web_app.assistant_person_scope(db_session, {
+        "action": "patient_summary", "entity_query": "Nobody Here"})
+
+    assert doctor == {"action": "therapist_summary", "entity_query": "Ravi Kumar"}
+    assert patient["action"] == "patient_summary"
+    assert unknown == {"action": "patient_summary", "entity_query": "Nobody Here"}

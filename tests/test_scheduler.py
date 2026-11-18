@@ -32,6 +32,48 @@ def test_patient_preference_prioritizes_a_preferred_monday_morning(base_problem)
     assert result.appointments[0].slot_index < 5
 
 
+def exact_time_preference(problem, patient, chosen_slot):
+    """Scores the patient page saves for an exact start time on every day."""
+    for day in range(6):
+        for slot in range(10):
+            problem.patient_preferences[(patient, day, slot)] = max(0, 100 - 20 * abs(slot - chosen_slot))
+
+
+def test_exact_preferred_time_is_the_visit_start(base_problem):
+    problem = base_problem([req(1, 1, 1, 1, order=0), req(2, 1, 2, 2, order=1), req(3, 1, 3, 3, order=2)])
+    exact_time_preference(problem, 1, 1)  # 9:40
+
+    result = generate_weekly_schedule(problem)
+
+    assert_valid(result)
+    assert sorted(item.slot_index for item in result.appointments) == [1, 2, 3]
+
+
+def test_exact_preferred_time_falls_back_to_the_nearest_start(base_problem):
+    problem = base_problem([req(1, 1, 1, 1)])
+    problem.therapist_availability = {key for key in problem.therapist_availability if key[2] != 1}
+    exact_time_preference(problem, 1, 1)
+
+    result = generate_weekly_schedule(problem)
+
+    assert_valid(result)
+    assert result.appointments[0].slot_index in {0, 2}
+
+
+def test_several_preferred_start_times_use_any_free_one(base_problem):
+    problem = base_problem([req(1, 1, 1, 1)])
+    # 9:40 or 1:15 chosen (scores as the patient page saves them); 9:40 is never free.
+    for day in range(6):
+        for slot in range(10):
+            problem.patient_preferences[(1, day, slot)] = max(0, 100 - 20 * min(abs(slot - 1), abs(slot - 5)))
+    problem.therapist_availability = {key for key in problem.therapist_availability if key[2] != 1}
+
+    result = generate_weekly_schedule(problem)
+
+    assert_valid(result)
+    assert result.appointments[0].slot_index == 5
+
+
 def test_scheduler_never_places_new_visits_before_the_run_day(base_problem):
     problem = base_problem([req(1, 1, 1, 1)])
     problem.planning_start_date = date(2026, 9, 10)

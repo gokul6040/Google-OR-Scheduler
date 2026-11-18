@@ -21,6 +21,8 @@ class RequirementInput:
     sequence_order: int
     plan_start_date: date | None = None
     plan_end_date: date | None = None
+    # Total sessions for a fixed course; None means weekly-only (legacy) demand.
+    course_target: int | None = None
 
 
 @dataclass(frozen=True)

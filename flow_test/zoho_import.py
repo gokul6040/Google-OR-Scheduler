@@ -521,13 +521,9 @@ def _apply_reports_locked(flow, reports: dict, plan_start: date | None, *, windo
             elif (therapist.department_id != departments[therapy_key].id
                   or therapist.location_id != location.id):
                 raise ValueError("Consultant capability changes require staff review")
-            if therapist.active != row["active"] and session.scalar(select(Appointment.id).where(
-                    Appointment.therapist_id == therapist.id).limit(1)) is not None:
-                key = f"zoho-consultant-status:{therapist.id}:{row['active']}"
-                if session.scalar(select(FlowInbox.id).where(FlowInbox.event_key == key)) is None:
-                    session.add(FlowInbox(event_key=key, reason="Consultant status changed — review bookings",
-                        text="Consultant status was updated. Saved history and appointments were retained; review future visits. Inactive staff receive no new generated bookings."))
-            therapist.name, therapist.active = row["name"], row["active"]
+            # Zoho's status seeds a NEW consultant only; staff own Active/Inactive afterwards
+            # (Clinical team page), so an existing consultant keeps their status.
+            therapist.name = row["name"]
         for code, therapist in therapists.items():
             if is_test and code not in source_codes:
                 therapist.active = False

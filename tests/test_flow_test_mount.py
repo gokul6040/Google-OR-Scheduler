@@ -143,7 +143,7 @@ def test_shared_screens_and_preferences_use_test_rows_only(mounted, db_session, 
     assert {p["code"] for p in json.loads(request("/api/patients")[1])["patients"]} == {"MAIN-CONTROL"}
     test_id = test_people[0]["id"]
     assert request(f"/test/api/patients/{test_id}/preferences", {"day": 2, "period": "morning"})[0] == 200
-    assert json.loads(request(f"/test/api/patients/{test_id}/preferences")[1])["preference"]["day"] == 2
+    assert json.loads(request(f"/test/api/patients/{test_id}/preferences")[1])["preference"]["days"] == [2]
     assert not list(db_session.scalars(select(PatientAvailability)))
     assert web_app.WORKSPACE_CONTEXT.get() is None
 

@@ -184,7 +184,8 @@ def dispatch(request: Any, *, prefix: str = "/workflow") -> None:
         request.send_json({"error": "The main daily workflow is disabled"}, 404)
         return
     if request.command == "GET" and path in {"/workflow", "/workflow/"}:
-        if not requires_access_key():
+        from services.portal_auth import enabled as portal_enabled
+        if portal_enabled() or not requires_access_key():
             request.send_response(302)
             request.send_header("Location", "/")
             request.send_header("Content-Length", "0")
@@ -211,8 +212,9 @@ def dispatch(request: Any, *, prefix: str = "/workflow") -> None:
         request.close_connection = True
         request.send_json({"error": "Workflow route not found"}, 404)
         return
-    local_password_free = not prefix and local_no_auth()
-    password_free = not prefix and (local_no_auth() or not requires_access_key())
+    portal_authorized = bool(getattr(request, "portal_user", None) or getattr(request, "portal_machine", False))
+    local_password_free = not portal_authorized and not prefix and local_no_auth()
+    password_free = portal_authorized or (not prefix and (local_no_auth() or not requires_access_key()))
     if local_password_free and not local_request_allowed(request):
         request.close_connection = True
         request.send_json({"error": "Local access only"}, 403)
@@ -355,8 +357,9 @@ def dispatch_root(request: Any) -> bool:
         if path == "/main-workflow-config.js":
             import json
 
+            from services.portal_auth import enabled as portal_enabled
             content = ("window.therapyWorkspace=" + json.dumps({"apiPrefix": "", "dataSource": data_source(), "localNoAuth": local_no_auth(),
-                       "requiresAccessKey": requires_access_key() and not local_no_auth(),
+                       "requiresAccessKey": requires_access_key() and not local_no_auth() and not portal_enabled(),
                        "live": getattr(runtime().flow, "messaging_enabled", runtime().flow.live)}) + ";").encode()
         else:
             content = assets[path].read_bytes()

@@ -75,6 +75,19 @@ def test_main_root_serves_full_app_and_existing_test_database(root_main, monkeyp
     assert payload(f"/test/api/state?date={DAY}")[1] == state
 
 
+def test_main_calendar_staff_cancel_uses_its_bound_store(root_main, monkeypatch):
+    import web_app
+    monkeypatch.setattr(web_app, "ProductionSessionLocal", lambda: pytest.fail("Unselected main storage was opened"))
+    with root_main.flow.sessions() as session:
+        identifier = session.scalar(select(Appointment.id).where(Appointment.date == DAY))
+    status, result = payload(f"/api/appointments/{identifier}/staff-cancel",
+                             {"scope": "session", "reason": "Staff received a cancellation"})
+    assert status == 200 and result["cancelledIds"] == [identifier]
+    status, calendar = payload(f"/api/schedule?start={DAY}&days=1")
+    assert status == 200 and calendar["staffCancellationEnabled"]
+    assert next(a for a in calendar["appointments"] if a["id"] == identifier)["status"] == "CANCELLED_PATIENT"
+
+
 def test_patient_status_requires_reason_and_survives_sync(root_main):
     patient = payload("/api/patients?q=TEST-A")[1]["patients"][0]
     path = f"/api/patients/{patient['id']}/status"

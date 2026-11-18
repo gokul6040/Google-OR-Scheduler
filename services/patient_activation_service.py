@@ -7,7 +7,7 @@ import json
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from database.models import AuditLog, Patient
+from database.models import AuditLog, Department, Patient, Therapist, TreatmentRequirement
 from services.thanal_source_reader import prescription
 
 ACTION = "patient_activation_review"
@@ -67,8 +67,7 @@ def prepare_activation_review(reports: dict, snapshot: dict | None = None) -> di
             elif doctor is None:
                 problems.append(f"{label}: the assigned consultant's details are incomplete. Check their name, centre, status and therapies in Zoho Consultants.")
             else:
-                if not doctor["active"]:
-                    problems.append(f"{label}: {doctor['name']} is inactive. Activate the consultant or assign an active consultant in Zoho.")
+                # Consultant Active/Inactive is staff-owned locally; activation_review checks it live.
                 if doctor["branch"]["id"] != plan["Branch"]["ID"]:
                     problems.append(f"{label}: {doctor['name']} belongs to another centre. Assign a consultant from the Calicut centre in Zoho.")
                 if therapy.get("ID") not in {t["id"] for t in doctor["therapies"]}:
@@ -101,6 +100,20 @@ def store_activation_review(session: Session, review: dict) -> None:
                          new_value=json.dumps(review)))
 
 
+def inactive_consultant_issues(session: Session, patient: Patient) -> list[str]:
+    """The child's current plan names a consultant whom staff marked inactive in our app."""
+    rows = session.execute(
+        select(Department.name, Therapist.name)
+        .select_from(TreatmentRequirement)
+        .join(Therapist, Therapist.id == TreatmentRequirement.assigned_therapist_id)
+        .join(Department, Department.id == TreatmentRequirement.department_id)
+        .where(TreatmentRequirement.patient_id == patient.id, TreatmentRequirement.active.is_(True),
+               Therapist.active.is_(False))
+        .order_by(Department.name, Therapist.name))
+    return [f"{therapy}: {doctor} is inactive. Mark them active on the Clinical team page, "
+            "or assign an active consultant in Zoho." for therapy, doctor in rows]
+
+
 def activation_review(session: Session, patient: Patient) -> dict:
     """Use the latest complete source check, never the spreadsheet as an allowlist."""
     row = session.scalar(select(AuditLog).where(AuditLog.action == ACTION, AuditLog.entity == ENTITY)
@@ -115,5 +128,6 @@ def activation_review(session: Session, patient: Patient) -> dict:
     issues = list(review["issues"].get(patient.patient_code, []))
     if patient.patient_code not in review["planCodes"]:
         issues.insert(0, NO_PLAN)
+    issues += inactive_consultant_issues(session, patient)
     return {"canActivate": not issues, "issues": issues, "checkedAt": review["checkedAt"],
             "required": True, "nextStep": "Correct these details in Zoho, run the Zoho sync, then try Mark active again."}

@@ -59,6 +59,7 @@ from services.admin_reservation_service import (
     preview_empty_slot, reserve_admin_slot, reserved_source_ids,
 )
 from services.cancellation_service import cancel_patient_appointment
+from services.course_progress import CANCELLATION_STREAK_WARNING, cancellation_streaks, course_progress
 from services.patient_status_service import change_patient_status, lock_patient
 from services.replacement_service import find_pull_forward_candidates, find_replacement_candidates
 from services.whatsapp_button_service import record_button_clicks
@@ -109,6 +110,102 @@ PREFERENCE_PERIOD_LABELS = {
     "morning": "Morning",
     "afternoon": "Afternoon",
 }
+# An exact preferred time is the visit's START time ("09:40"); later therapies follow on.
+PREFERENCE_START_TIMES = {slot.start_time.strftime("%H:%M"): slot.slot_index for slot in SLOTS}
+# Each slot away from the chosen start time scores this much less, so the nearest time wins.
+PREFERENCE_DISTANCE_STEP = 20
+# Every slot of a picked day gets this on top of its time score, so picked days outweigh
+# even spacing (cadence penalty) while still ranking below meeting the weekly plan.
+PREFERRED_DAY_BONUS = 300
+PREFERENCE_ANY_TIME = "Any time"
+
+
+PREFERENCE_SLOTS_PREFIX = "slots:"  # patients.preferred_time, e.g. "slots:5,6,7"
+SLOT_START_TIMES = list(PREFERENCE_START_TIMES)  # index -> "HH:MM"
+
+
+def preference_slot_scores(slots: set[int]) -> dict[int, int]:
+    """Score each slot for a set of chosen start slots: 100 on a chosen one, 20 less per slot away
+    from the nearest chosen one, so the nearest free time wins when all chosen times are taken."""
+    if not slots:
+        return {}
+    return {slot.slot_index: max(0, PREFERRED_AVAILABILITY_SCORE - PREFERENCE_DISTANCE_STEP
+                                 * min(abs(slot.slot_index - chosen) for chosen in slots)) for slot in SLOTS}
+
+
+def preferred_slots_from_request(times: Any, period: Any) -> set[int]:
+    """Read start times ("HH:MM" list); older clients send one "period" (band or "HH:MM")."""
+    if times is None:
+        times = [] if period in (None, "") else [period]
+    if not isinstance(times, list):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Choose valid preferred times")
+    slots: set[int] = set()
+    for value in times:
+        if value in PREFERENCE_PERIODS:
+            slots.update(PREFERENCE_PERIODS[value])
+        elif value in PREFERENCE_START_TIMES:
+            slots.add(PREFERENCE_START_TIMES[value])
+        else:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Choose a valid preferred time")
+    return slots
+
+
+def stored_preferred_slots(patient: Patient, rows: list[PatientAvailability]) -> set[int]:
+    """Chosen start slots from patients.preferred_time (current and older formats)."""
+    stored = (patient.preferred_time or "").strip()
+    if stored.startswith(PREFERENCE_SLOTS_PREFIX):
+        return {int(item) for item in stored[len(PREFERENCE_SLOTS_PREFIX):].split(",") if item.isdigit()}
+    if stored in PREFERENCE_START_TIMES:
+        return {PREFERENCE_START_TIMES[stored]}
+    if stored.lower() in PREFERENCE_PERIODS:
+        return set(PREFERENCE_PERIODS[stored.lower()])
+    if stored == PREFERENCE_ANY_TIME or not rows:
+        return set()
+    # Oldest saves stored nothing: take the stronger morning/afternoon band from the scores.
+    band_scores = {band: sum(item.preference_score for item in rows if item.slot_index in slots)
+                   for band, slots in PREFERENCE_PERIODS.items()}
+    return set(PREFERENCE_PERIODS[max(band_scores, key=band_scores.get)])
+
+
+def summarize_preference(patient: Patient, rows: list[PatientAvailability]) -> tuple[list[int], list[str]]:
+    """Return (picked days, [] meaning every day or none; chosen start times "HH:MM") from saved scores."""
+    if not rows:
+        return [], []
+    if max(item.preference_score for item in rows) > PREFERRED_AVAILABILITY_SCORE:
+        days = sorted({item.day_of_week for item in rows if item.preference_score > PREFERRED_AVAILABILITY_SCORE})
+    else:
+        # No day bonus: times on every day, or an older single-day preference.
+        days = sorted({item.day_of_week for item in rows})
+        if len(days) == len(PREFERENCE_DAY_LABELS):
+            days = []
+    return days, [SLOT_START_TIMES[slot] for slot in sorted(stored_preferred_slots(patient, rows))]
+
+
+def preference_labels(days: list[int], times: list[str]) -> tuple[str, str]:
+    """Short table labels: ("Mon, Wed, Fri" | "Every day" | "Not set", "Morning" | "Starts 9:40 AM" | ...)."""
+    if days:
+        day_label = ", ".join(PREFERENCE_DAY_LABELS[day][:3] for day in days)
+    else:
+        day_label = "Every day" if times else "Not set"
+    slots = {PREFERENCE_START_TIMES[time] for time in times}
+    band = next((label for key, label in PREFERENCE_PERIOD_LABELS.items() if slots == set(PREFERENCE_PERIODS[key])),
+                None)
+    if not times:
+        time_label = PREFERENCE_ANY_TIME if days else "Not set"
+    elif len(times) == len(SLOTS):
+        time_label = PREFERENCE_ANY_TIME
+    elif band:
+        time_label = band
+    else:
+        short = [SLOTS[PREFERENCE_START_TIMES[time]].start_time.strftime("%I:%M %p").lstrip("0") for time in times]
+        time_label = "Starts " + (", ".join(short) if len(short) <= 3 else f"{short[0]} +{len(short) - 1} more")
+    return day_label, time_label
+
+
+def visits_per_week(session, patient_id: int) -> int:
+    """A child comes in as often as their most frequent active therapy (others join those visits)."""
+    return int(session.scalar(select(func.max(TreatmentRequirement.sessions_per_week)).where(
+        TreatmentRequirement.patient_id == patient_id, TreatmentRequirement.active.is_(True))) or 0)
 PREVIEWS: dict[str, dict[str, Any]] = {}
 WORKSPACE_CONTEXT: ContextVar[dict | None] = ContextVar("workspace_context", default=None)
 
@@ -216,7 +313,21 @@ def azure_openai_settings() -> dict[str, str] | None:
         "deployment": deployment,
         "api_version": os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21"),
         "responses_url": os.getenv("AZURE_OPENAI_RESPONSES_URL", "").strip(),
+        # gpt-5.4-mini rejects "minimal" (accepts none/low/medium/high); "low" works across gpt-5 models.
+        "reasoning_effort": os.getenv("AZURE_OPENAI_REASONING_EFFORT", "low").strip() or "low",
     }
+
+
+def assistant_read_only() -> bool:
+    """Thanal runs the assistant for questions only; changes go through the app's own screens."""
+    return bool((WORKSPACE_CONTEXT.get() or {}).get("assistant_read_only"))
+
+
+ASSISTANT_READ_ONLY_REPLY = {
+    "message": "I can answer scheduling questions only. To cancel a session, open it on the calendar; "
+               "to record an absence, use Record an absence.",
+    "outcome": "not_executed",
+}
 
 
 def relative_date_from_message(message: str, reference_date: date) -> date | None:
@@ -418,6 +529,23 @@ def matching_therapists(session, entity_query: str) -> list[Therapist]:
     return [item for item in therapists if therapist_display_name(item.name).casefold() == requested]
 
 
+def assistant_person_scope(session, action: dict[str, Any]) -> dict[str, Any]:
+    """Treat a name the model read as a patient as a therapist when only a therapist matches.
+
+    "Show <doctor>'s sessions" is often interpreted as a patient question; a patient match
+    always wins, so this never redirects a real patient query.
+    """
+    if action.get("action") != "patient_summary":
+        return action
+    query = str(action.get("entity_query", "")).strip()
+    if not query or matching_patients(session, query):
+        return action
+    for candidate in (query, re.sub(r"^(?:dr\.?|doctor)\s+", "", query, flags=re.IGNORECASE).strip()):
+        if candidate and matching_therapists(session, candidate):
+            return {**action, "action": "therapist_summary", "entity_query": candidate}
+    return action
+
+
 def matching_patients(session, entity_query: str) -> list[Patient]:
     """Resolve an exact patient code or displayed patient name without partial matching."""
     requested = entity_query.casefold().strip()
@@ -447,7 +575,8 @@ def interpret_chat_action(message: str, today: date | None = None) -> dict[str, 
             HTTPStatus.SERVICE_UNAVAILABLE,
             "Scheduling assistant is not configured. Add the Azure OpenAI endpoint, key, and deployment.",
         )
-    reference_date = today or date.today()
+    # "Today" is the clinic's day (India), not the server's UTC date.
+    reference_date = today or datetime.now(ZoneInfo("Asia/Kolkata")).date()
     relative_date = relative_date_from_message(message, reference_date)
     instructions = (
         "You translate one therapy-scheduler operator message into JSON. "
@@ -481,7 +610,7 @@ def interpret_chat_action(message: str, today: date | None = None) -> dict[str, 
         # GPT-5 models use part of the response budget for reasoning. Leave
         # enough room for both that and the small structured action payload.
         "max_output_tokens": 700,
-        "reasoning": {"effort": "minimal"},
+        "reasoning": {"effort": settings.get("reasoning_effort", "low")},
         "text": {"format": {"type": "json_schema", **AZURE_CHAT_ACTION_SCHEMA}},
     }
     url = settings["responses_url"] or (
@@ -522,7 +651,9 @@ def interpret_chat_action(message: str, today: date | None = None) -> dict[str, 
         "patient_query": str(action.get("patient_query", "")).strip(),
         "entity_query": str(action.get("entity_query", "")).strip(),
         "absence_kind": str(action.get("absence_kind", "unknown")).strip(),
-        "date": relative_date.isoformat() if relative_date else str(action.get("date", "")).strip(),
+        # The model sometimes omits the date; the instructions say "today when no date is specified".
+        "date": (relative_date.isoformat() if relative_date
+                 else str(action.get("date", "")).strip() or reference_date.isoformat()),
         "reply": professional_assistant_text(
             str(action.get("reply", "I could not understand that request."))
         ),
@@ -1332,7 +1463,7 @@ def overview_payload(today: date | None = None) -> dict[str, Any]:
             Appointment.status.in_(ACTIVE_STATUSES),
         )) or 0
         attention_count = session.scalar(select(func.count(Appointment.id)).where(
-            Appointment.status == AppointmentStatus.NEEDS_RESCHEDULING,
+            Appointment.status.in_((AppointmentStatus.NEEDS_RESCHEDULING, AppointmentStatus.CANCELLED_PATIENT)),
             Appointment.id.notin_(reserved_source_ids()),
         )) or 0
         # The isolated fixture has no import staging tables or import workflow.
@@ -1358,22 +1489,36 @@ def overview_payload(today: date | None = None) -> dict[str, Any]:
     }
 
 
+def calendar_department_names(session: Any) -> dict[int, str]:
+    """Zoho department names for the calendar; empty when no Thanal bindings exist."""
+    try:
+        from main_workflow.thanal_export import department_names
+        return department_names(session)
+    except Exception:  # noqa: BLE001 - a display label must never break the calendar
+        session.rollback()
+        return {}
+
+
 def schedule_payload(start: date, days: int) -> dict[str, Any]:
     """Return appointments and filter data for a date range."""
     end = start + timedelta(days=days - 1)
     with SessionLocal() as session:
         rows = list(session.execute(appointment_query(start, end).where(
             Appointment.status.in_(ACTIVE_STATUSES) | (
-                (Appointment.status == AppointmentStatus.NEEDS_RESCHEDULING)
+                (Appointment.status.in_((AppointmentStatus.NEEDS_RESCHEDULING,
+                                        AppointmentStatus.CANCELLED_PATIENT, AppointmentStatus.CANCELLED_OTHER)))
                 & Appointment.id.notin_(reserved_source_ids())
             )
         )))
+        zoho_departments = calendar_department_names(session)
         therapists = [{
             "id": item.id,
             "code": item.therapist_code,
             "name": item.name,
             "department": item.department.name,
             "departmentId": item.department_id,
+            # Zoho's real Department (for example "Physiotherapy"), not the consultation.
+            "zohoDepartment": zoho_departments.get(item.department_id),
             "location": item.location.name,
             "locationId": item.location_id,
             "active": item.active,
@@ -1407,6 +1552,7 @@ def schedule_payload(start: date, days: int) -> dict[str, Any]:
         "days": days,
         "appointments": [serialize_appointment(row) for row in rows],
         "patientPlans": patient_plans,
+        "staffCancellationEnabled": True,
         "therapists": therapists,
         "patients": patients,
         "departments": departments,
@@ -1433,51 +1579,59 @@ def patients_payload(query: str = "") -> dict[str, Any]:
             .group_by(TreatmentRequirement.patient_id)
         ).all())
         patients = list(session.scalars(select(Patient).order_by(Patient.patient_code)))
-        preference_scores: dict[int, dict[str, dict[int | str, int]]] = {}
+        preference_rows: dict[int, list[PatientAvailability]] = {}
         for item in session.scalars(select(PatientAvailability).where(
             PatientAvailability.available.is_(True),
             PatientAvailability.preference_score > 0,
         )):
-            scores = preference_scores.setdefault(item.patient_id, {"days": {}, "periods": {}})
-            scores["days"][item.day_of_week] = scores["days"].get(item.day_of_week, 0) + item.preference_score
-            period = "morning" if item.slot_index in PREFERENCE_PERIODS["morning"] else "afternoon"
-            scores["periods"][period] = scores["periods"].get(period, 0) + item.preference_score
+            preference_rows.setdefault(item.patient_id, []).append(item)
+        streaks = cancellation_streaks(session, datetime.now(ZoneInfo("Asia/Kolkata")).date())
     rows = []
     for patient in patients:
         searchable = f"{patient.patient_code} {patient.name or ''}".lower()
         if query and query not in searchable:
             continue
-        scores = preference_scores.get(patient.id, {"days": {}, "periods": {}})
-        preferred_day = max(scores["days"], key=scores["days"].get) if scores["days"] else None
-        preferred_period = max(scores["periods"], key=scores["periods"].get) if scores["periods"] else None
+        day_label, time_label = preference_labels(*summarize_preference(patient, preference_rows.get(patient.id, [])))
         rows.append({
             "id": patient.id,
             "code": patient.patient_code,
             "name": patient.name or "Name not provided",
             "schoolGoing": patient.school_going,
-            "preferenceDay": PREFERENCE_DAY_LABELS[preferred_day] if preferred_day is not None else "Not set",
-            "preferencePeriod": PREFERENCE_PERIOD_LABELS.get(preferred_period, patient.preferred_time or "Not set"),
+            "preferenceDay": day_label,
+            "preferencePeriod": time_label,
             "active": patient.active,
             "therapies": requirement_counts.get(patient.id, 0),
+            "cancelStreak": streaks.get(patient.id, 0),
         })
-    return {"patients": rows, "total": len(rows)}
+    return {"patients": rows, "total": len(rows),
+            "cancelStreakWarning": CANCELLATION_STREAK_WARNING}
 
 
 def serialize_patient_preferences(session, patient: Patient) -> dict[str, Any]:
-    """Return one patient's preferred weekly day and time band."""
+    """Return one patient's preferences and current prescribed therapy plan."""
     availability = list(session.scalars(select(PatientAvailability).where(
         PatientAvailability.patient_id == patient.id,
         PatientAvailability.available.is_(True),
         PatientAvailability.preference_score > 0,
     )))
-    day_scores: dict[int, int] = {}
-    period_scores: dict[str, int] = {}
-    for item in availability:
-        day_scores[item.day_of_week] = day_scores.get(item.day_of_week, 0) + item.preference_score
-        period = "morning" if item.slot_index in PREFERENCE_PERIODS["morning"] else "afternoon"
-        period_scores[period] = period_scores.get(period, 0) + item.preference_score
-    preferred_day = max(day_scores, key=day_scores.get) if day_scores else None
-    preferred_period = max(period_scores, key=period_scores.get) if period_scores else None
+    preferred_days, preferred_times = summarize_preference(patient, availability)
+    progress = {item["requirementId"]: item for item in course_progress(session, [patient.id]).get(patient.id, [])}
+    plan = [{
+        "therapy": therapy,
+        "clinician": clinician,
+        "sessionsPerWeek": frequency,
+        "durationMonths": duration,
+        "sessions": progress.get(requirement_id, {}).get("sessions", 0),
+        "target": progress.get(requirement_id, {}).get("target"),
+        "complete": progress.get(requirement_id, {}).get("complete", False),
+    } for requirement_id, therapy, clinician, frequency, duration in session.execute(
+        select(TreatmentRequirement.id, Department.name, Therapist.name, TreatmentRequirement.sessions_per_week,
+               TreatmentRequirement.duration_months)
+        .join(TreatmentRequirement, TreatmentRequirement.department_id == Department.id)
+        .outerjoin(Therapist, Therapist.id == TreatmentRequirement.assigned_therapist_id)
+        .where(TreatmentRequirement.patient_id == patient.id, TreatmentRequirement.active.is_(True))
+        .order_by(TreatmentRequirement.sequence_order, TreatmentRequirement.id)
+    )]
     return {
         "patient": {
             "id": patient.id,
@@ -1486,9 +1640,16 @@ def serialize_patient_preferences(session, patient: Patient) -> dict[str, Any]:
             "active": patient.active,
         },
         "preference": {
-            "day": preferred_day,
-            "period": preferred_period,
+            "days": preferred_days,
+            "times": preferred_times,
         },
+        "startTimes": list(PREFERENCE_START_TIMES),
+        # For reference beside the day picker: the child comes this many times a week.
+        "visitsPerWeek": visits_per_week(session, patient.id),
+        "plan": plan,
+        "cancelStreak": cancellation_streaks(
+            session, datetime.now(ZoneInfo("Asia/Kolkata")).date(), [patient.id]).get(patient.id, 0),
+        "cancelStreakWarning": CANCELLATION_STREAK_WARNING,
     }
 
 
@@ -1522,7 +1683,8 @@ def therapists_payload(start: date) -> dict[str, Any]:
             "department": item.department.name,
             "location": item.location.name,
             "appointments": counts.get(item.id, 0),
-            "capacity": None,
+            # A clinician can see one child per slot: 10 slots x 6 working days = 60 a week.
+            "capacity": len(SLOTS) * SCHEDULING_WEEK_DAYS,
             "active": item.active,
         } for item in therapists]
     return {"therapists": rows, "weekStart": start.isoformat()}
@@ -1588,15 +1750,53 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
 
+    def handle_one_request(self) -> None:
+        # A handler may serve several HTTP/1.1 requests. Never reuse an identity.
+        self.portal_checked = False
+        self.portal_user = None
+        self.portal_machine = False
+        self.portal_cookie = None
+        super().handle_one_request()
+
     def log_message(self, format_string: str, *args) -> None:
         safe_args = list(args)
         if safe_args and isinstance(safe_args[0], str):
             safe_args[0] = sanitized_request_line(safe_args[0])
         print(f"[{self.log_date_time_string()}] {format_string % tuple(safe_args)}")
 
+    def end_headers(self) -> None:
+        cookie = getattr(self, "portal_cookie", None)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+            self.portal_cookie = None
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "same-origin")
+        super().end_headers()
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        from services.portal_auth import enabled
+        if enabled():
+            self.send_response(405)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        super().do_HEAD()
+
     def send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
+        # Authorization may reject a POST before its body has been read. Never
+        # interpret that leftover body as the next request on a reused socket.
+        rejected_post = self.command == "POST" and status >= 400
+        if rejected_post:
+            self.close_connection = True
+        identity = getattr(self, "portal_user", None)
+        if identity and self.command == "POST" and 200 <= status < 300:
+            from services.portal_access import accounts
+            accounts().audit(identity["email"], "POST " + urlparse(self.path).path[:190])
         encoded = json.dumps(payload, default=self.json_default).encode("utf-8")
         self.send_response(status)
+        if rejected_post:
+            self.send_header("Connection", "close")
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
@@ -1604,6 +1804,9 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def send_html(self, body: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+        identity = getattr(self, "portal_user", None)
+        if identity and identity["role"] == "admin" and 'id="sidebar"' in body and 'src="/portal.js"' not in body:
+            body = body.replace("</head>", '<link rel="stylesheet" href="/portal.css"><script src="/portal.js" defer></script></head>')
         encoded = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1722,6 +1925,9 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
         parsed = urlparse(self.path)
         try:
+            from services.portal_access import dispatch as portal_dispatch
+            if portal_dispatch(self):
+                return
             if WORKSPACE_CONTEXT.get() is None:
                 from main_workflow.mount import dispatch_root
 
@@ -1807,6 +2013,9 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             if parsed.path.startswith("/api/"):
                 raise ApiError(HTTPStatus.NOT_FOUND, "API route not found")
             if parsed.path in ("/", "/index.html"):
+                if getattr(self, "portal_user", None):
+                    self.send_html((WEB_DIR / "index.html").read_text(encoding="utf-8"))
+                    return
                 self.path = "/index.html"
             elif not (WEB_DIR / parsed.path.lstrip("/")).is_file():
                 self.path = "/index.html"
@@ -1827,6 +2036,9 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         parsed = urlparse(self.path)
         try:
+            from services.portal_access import dispatch as portal_dispatch
+            if portal_dispatch(self):
+                return
             if WORKSPACE_CONTEXT.get() is None:
                 from main_workflow.mount import dispatch_root
 
@@ -1864,6 +2076,10 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             if match:
                 self.save_patient_status(int(match.group(1)), body)
                 return
+            match = re.fullmatch(r"/api/therapists/(\d+)/status", parsed.path)
+            if match:
+                self.save_therapist_status(int(match.group(1)), body)
+                return
             match = re.fullmatch(r"/api/patients/(\d+)/preferences", parsed.path)
             if match:
                 self.save_patient_preferences(int(match.group(1)), body)
@@ -1871,6 +2087,10 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             match = re.fullmatch(r"/api/appointments/(\d+)/cancel", parsed.path)
             if match:
                 self.cancel_appointment(int(match.group(1)))
+                return
+            match = re.fullmatch(r"/api/appointments/(\d+)/staff-cancel", parsed.path)
+            if match:
+                self.staff_cancel_appointment(int(match.group(1)), body)
                 return
             match = re.fullmatch(r"/api/appointments/(\d+)/move", parsed.path)
             if match:
@@ -1973,23 +2193,48 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             session.commit()
         self.send_json({"active": active})
 
+    def save_therapist_status(self, therapist_id: int, body: dict[str, Any]) -> None:
+        """Staff set a clinician Active (gets new bookings) or Inactive (gets none)."""
+        from zoneinfo import ZoneInfo
+        from services.therapist_status_service import (change_therapist_status, lock_therapist,
+                                                        upcoming_bookings)
+
+        active = body.get("active")
+        if type(active) is not bool:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Choose Active or Inactive")
+        reason = body.get("reason")
+        reason = reason.strip() if isinstance(reason, str) else ""
+        if not active and not 1 <= len(reason) <= 1000:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Enter a reason of 1 to 1,000 characters")
+        context = WORKSPACE_CONTEXT.get() or {}
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        with SessionLocal() as session:
+            therapist = lock_therapist(session, therapist_id)
+            if therapist is None:
+                raise ApiError(HTTPStatus.NOT_FOUND, "Clinician not found")
+            change_therapist_status(session, therapist, active, reason,
+                                    context.get("admin_user", "scheduler_manager"))
+            upcoming = upcoming_bookings(session, therapist.id, today)
+            session.commit()
+        self.send_json({"active": active, "upcomingBookings": upcoming})
+
     def save_patient_preferences(self, patient_id: int, body: dict[str, Any]) -> None:
-        """Store one recurring preferred day and morning/afternoon time band."""
-        day = body.get("day")
-        period = body.get("period")
-        if day in (None, "") and period in (None, ""):
-            preferred_day = None
-            preferred_period = None
-        else:
-            try:
-                preferred_day = int(day)
-            except (TypeError, ValueError) as exc:
-                raise ApiError(HTTPStatus.BAD_REQUEST, "Choose a preferred day") from exc
-            if preferred_day not in range(len(PREFERENCE_DAY_LABELS)):
-                raise ApiError(HTTPStatus.BAD_REQUEST, "Choose a valid preferred day")
-            if period not in PREFERENCE_PERIODS:
-                raise ApiError(HTTPStatus.BAD_REQUEST, "Choose morning or afternoon")
-            preferred_period = period
+        """Store any number of picked days and any number of preferred start times.
+
+        Days without times mean any time on those days; times without days apply every day.
+        """
+        raw_days = body.get("days")
+        if raw_days is None:  # Older clients send one "day".
+            raw_days = [] if body.get("day") in (None, "") else [body.get("day")]
+        if not isinstance(raw_days, list):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Choose valid preferred days")
+        try:
+            picked_days = sorted({int(day) for day in raw_days})
+        except (TypeError, ValueError) as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Choose valid preferred days") from exc
+        if any(day not in range(len(PREFERENCE_DAY_LABELS)) for day in picked_days):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Choose valid preferred days")
+        preferred_slots = preferred_slots_from_request(body.get("times"), body.get("period"))
         with SessionLocal() as session:
             patient = session.get(Patient, patient_id)
             if patient is None:
@@ -2000,7 +2245,13 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
                     PatientAvailability.patient_id == patient.id
                 ))
             }
-            preferred_slots = set(PREFERENCE_PERIODS.get(preferred_period, ()))
+            slot_scores = preference_slot_scores(preferred_slots)
+            if picked_days:
+                # Picked days: every slot gets the day bonus, plus the time score when times are set.
+                slot_scores = {slot: PREFERRED_DAY_BONUS + slot_scores.get(slot, 0) for slot in range(len(SLOTS))}
+                preferred_days = set(picked_days)
+            else:
+                preferred_days = set(range(len(PREFERENCE_DAY_LABELS))) if preferred_slots else set()
             for day_index in range(len(PREFERENCE_DAY_LABELS)):
                 for slot in range(len(SLOTS)):
                     availability = existing.get((day_index, slot))
@@ -2013,11 +2264,12 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
                         )
                         session.add(availability)
                     availability.preference_score = (
-                        PREFERRED_AVAILABILITY_SCORE
-                        if availability.available and day_index == preferred_day and slot in preferred_slots
-                        else 0
+                        slot_scores.get(slot, 0) if availability.available and day_index in preferred_days else 0
                     )
-            patient.preferred_time = PREFERENCE_PERIOD_LABELS.get(preferred_period)
+            if preferred_slots:
+                patient.preferred_time = PREFERENCE_SLOTS_PREFIX + ",".join(map(str, sorted(preferred_slots)))
+            else:
+                patient.preferred_time = PREFERENCE_ANY_TIME if picked_days else None
             session.commit()
             payload = serialize_patient_preferences(session, patient)
         self.send_json({"message": "Patient availability preferences saved", **payload})
@@ -2134,6 +2386,28 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             payload = cancellation_payload(session, appointment)
         self.send_json(payload)
 
+    def staff_cancel_appointment(self, appointment_id: int, body: dict) -> None:
+        """Atomically release staff-selected sessions without automatic replacement."""
+        from services.cancellation_service import cancel_saved_visit
+        from services.admin_reservation_service import is_reserved_source
+
+        context = WORKSPACE_CONTEXT.get() or {}
+        with SessionLocal() as session:
+            if session.get(Appointment, appointment_id) is None:
+                raise ApiError(HTTPStatus.NOT_FOUND, "Appointment not found")
+            try:
+                result = cancel_saved_visit(session, appointment_id, scope=body.get("scope"),
+                    reason=body.get("reason"), actor=context.get("admin_user", "scheduler_manager"),
+                    flow=context.get("flow"))
+                groups = [replacement_group(session, item, []) for item in result.pop("appointments")
+                          if not is_reserved_source(session, item.id)]
+                session.commit()
+            except ValueError as exc:
+                session.rollback()
+                raise ApiError(HTTPStatus.CONFLICT, str(exc)) from exc
+        self.send_json({**result, "replacementGroups": groups,
+                        "message": "Already cancelled" if result["alreadyCancelled"] else "Cancellation recorded"})
+
     def handle_assistant_message(self, body: dict[str, Any]) -> None:
         """Execute a constrained assistant request using short-lived browser context."""
         message = str(body.get("message", "")).strip()
@@ -2218,6 +2492,10 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             self.send_json(payload)
             return
         chosen_absence = assistant_absence_choice(context, message)
+        if chosen_absence is not None and assistant_read_only():
+            context.pop("pending_absence", None)
+            self.send_json(dict(ASSISTANT_READ_ONLY_REPLY))
+            return
         if chosen_absence is not None:
             try:
                 absence_date = parse_date(context["pending_absence"]["date"], "absence date")
@@ -2247,6 +2525,9 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             return
 
         action = interpret_chat_action(message)
+        if action["action"] in {"mark_absent", "cancel_appointment"} and assistant_read_only():
+            self.send_json(dict(ASSISTANT_READ_ONLY_REPLY))
+            return
         summary_actions = {
             "day_summary", "centre_summary", "therapist_summary", "therapy_summary",
             "patient_summary",
@@ -2262,6 +2543,7 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
                 return
             with SessionLocal() as session:
                 if action["action"] in summary_actions:
+                    action = assistant_person_scope(session, action)
                     payload = assistant_summary_payload(
                         session, action["action"], summary_date, action["entity_query"]
                     )
@@ -2837,6 +3119,18 @@ def run_response_demo(port: int = 8766) -> None:
 def run(host: str = "127.0.0.1", port: int = 8765, *, local_ui_only: bool = False) -> None:
     """Start the local therapy scheduler web application."""
     from main_workflow.config import enabled as main_workflow_enabled, local_no_auth
+
+    from services.portal_auth import enabled as portal_enabled
+    if portal_enabled():
+        import ipaddress
+        if os.getenv("PORTAL_LOCAL_HTTP", "false").lower() == "true" and not ipaddress.ip_address(host).is_loopback:
+            raise ValueError("PORTAL_LOCAL_HTTP requires a loopback-only server")
+        from services.portal_access import accounts
+        from services.portal_auth import Control, User
+        with accounts().sessions() as account_session:
+            if account_session.get(Control, 1) is None or account_session.scalar(
+                    select(User.id).where(User.role == "admin", User.active.is_(True))) is None:
+                raise ValueError("Prepare portal storage and create the first admin before enabling login")
 
     if local_no_auth():
         import ipaddress

@@ -63,6 +63,7 @@ output/
 
 # Local documentation
 *.md
+!PORTAL_LOGIN.md
 /Therapy_Scheduler_OR_Tools_Management_Overview.docx
 
 # Editor and operating-system files

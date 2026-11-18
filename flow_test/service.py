@@ -1958,7 +1958,11 @@ class FlowTest(Reliability):
                                  for number, entry in sorted(self.unsubscribed_numbers(session).items())],
                 "inbox": [{"id": i.id, "patient": i.patient_code, "reason": i.reason,
                            "text": i.text, "resolved": bool(i.resolved)}
-                          for i in session.scalars(select(FlowInbox).order_by(FlowInbox.id.desc()).limit(100))],
+                          for i in session.scalars(select(FlowInbox).where(or_(
+                              FlowInbox.resolved == 0,
+                              FlowInbox.id.in_(select(FlowInbox.id).where(FlowInbox.resolved != 0)
+                                  .order_by(FlowInbox.id.desc()).limit(100)),
+                          )).order_by(FlowInbox.id.desc()))],
                 "audit": [{"action": a.action, "entity": a.entity,
                            "time": f"{a.timestamp.isoformat()}Z"}
                           for a in session.scalars(select(AuditLog).order_by(AuditLog.id.desc()).limit(40))],

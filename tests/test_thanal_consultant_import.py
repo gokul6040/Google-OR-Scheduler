@@ -64,7 +64,7 @@ def test_incomplete_master_blocks_atomic_apply(flow):
         assert session.scalar(select(func.count()).select_from(Location)) == 0
 
 
-def test_renamed_consultant_keeps_identity_and_inactive_is_preserved(flow):
+def test_renamed_consultant_keeps_identity_and_staff_owned_status(flow):
     data = rows()
     sync_consultants(flow, data, apply=True)
     with flow.sessions() as session:
@@ -73,7 +73,22 @@ def test_renamed_consultant_keeps_identity_and_inactive_is_preserved(flow):
     sync_consultants(flow, data, apply=True)
     with flow.sessions() as session:
         doctor = session.get(Therapist, ident)
-        assert doctor.name == "Renamed fictional clinician" and not doctor.active
+        # Zoho's status seeds a new consultant only; existing status belongs to staff.
+        assert doctor.name == "Renamed fictional clinician" and doctor.active
+    with flow.sessions.begin() as session:
+        session.get(Therapist, ident).active = False  # Staff mark inactive in our app.
+    data[0]["Status"] = "Active"
+    sync_consultants(flow, data, apply=True)
+    with flow.sessions() as session:
+        assert not session.get(Therapist, ident).active
+
+
+def test_new_consultant_starts_with_zoho_status(flow):
+    data = rows()
+    data[0]["Status"] = "Inactive"
+    sync_consultants(flow, data, apply=True)
+    with flow.sessions() as session:
+        assert not session.scalar(select(Therapist.active))
 
 
 def test_missing_rows_are_not_deletions_and_capacity_counts_people(flow):

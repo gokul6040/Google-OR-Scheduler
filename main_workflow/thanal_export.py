@@ -93,6 +93,41 @@ def export_context(session: Any, requirement_ids: list[int]) -> dict:
                 TreatmentRequirement.id.in_(requirement_ids))))}
 
 
+def department_names(session: Any) -> dict[int, str]:
+    """Map each local therapy (a Zoho consultation) to Zoho's real Department name.
+
+    First uses each consultation's department as recorded in Thanal's own Zoho
+    schedules (``consultation_department_names``), then the verified export
+    bindings. Unknown therapies are left out rather than guessed.
+    """
+    catalog = default_catalog()
+    by_consultation = catalog.get("consultation_department_names", {})
+    source = read_setting(session, MAP_KEY, {})
+    result: dict[int, str] = {}
+    for consultation_id, therapy in source.get("therapies", {}).items():
+        name = by_consultation.get(str(consultation_id))
+        local_id = therapy.get("local_id") if isinstance(therapy, dict) else None
+        if name and isinstance(local_id, int):
+            result[local_id] = name
+    names = catalog.get("department_names", {})
+    overrides = read_setting(session, LOOKUP_KEY, None)
+    if overrides is not None:
+        branches = [overrides]
+    else:
+        branches = []
+        for branch in source.get("branches", {}):
+            try:
+                branches.append(bindings_from_catalog(source, branch, catalog))
+            except ValueError:
+                continue
+    for bindings in branches:
+        for local_id, department_id in bindings.get("departments", {}).items():
+            name = names.get(str(department_id))
+            if name and str(local_id).isdigit():
+                result.setdefault(int(local_id), name)
+    return result
+
+
 def appointment_fields(session: Any, item: Any, patient: Any, doctor: Any, namespace: str,
                        *, context: dict | None = None) -> dict:
     """Build exactly the approved fields; never resolve identities from names."""

@@ -143,7 +143,11 @@ async function api(path, options = {}) {
   }
   let payload = {};
   try { payload = await response.json(); } catch { /* response guard */ }
-  if (!response.ok) throw new Error(payload.error || "Something went wrong. Please try again.");
+  if (!response.ok) {
+    const error = new Error(payload.error || "Something went wrong. Please try again.");
+    error.status = response.status;
+    throw error;
+  }
   return payload;
 }
 
@@ -253,10 +257,11 @@ function toast(title, message, type = "success") {
 }
 
 function pageHeading(eyebrow, title, action = "") {
-  return `<div class="page-heading"><div><p class="eyebrow">${escapeHtml(eyebrow)}</p><h1>${escapeHtml(title)}</h1></div>${action ? `<div class="heading-actions">${action}</div>` : ""}</div>`;
+  return `<div class="page-heading"><div>${eyebrow ? `<p class="eyebrow">${escapeHtml(eyebrow)}</p>` : ""}<h1>${escapeHtml(title)}</h1></div>${action ? `<div class="heading-actions">${action}</div>` : ""}</div>`;
 }
 
 function setView(view, options = {}) {
+  if (view === "generator") view = "schedule";
   state.activeView = view;
   if (view === "operations") state.operationsTab = options.operationsTab || "assistant";
   $$(".view").forEach((item) => item.classList.toggle("active", item.id === `view-${view}`));
@@ -279,6 +284,8 @@ async function initialize() {
     badge.textContent = state.overview.needsAttention;
     badge.hidden = !state.overview.needsAttention;
     await loadSchedule();
+    const requestedView = new URLSearchParams(location.search).get("view");
+    if (["overview", "patients", "team", "operations"].includes(requestedView)) setView(requestedView);
   } catch (error) {
     $("#calendarSurface").innerHTML = errorState(error.message);
   }
@@ -455,8 +462,9 @@ function renderFilterChips() {
 function renderSchedule() {
   if (!state.schedule) return;
   const appointments = filteredAppointments();
-  const visibleDoctors = new Set(appointments.map((item) => item.therapistId));
-  $("#visibleAppointmentCount").textContent = appointments.length.toLocaleString("en-IN");
+  const booked = appointments.filter(item => ["PROPOSED", "PENDING_CONFIRMATION", "CONFIRMED", "COMPLETED"].includes(item.status));
+  const visibleDoctors = new Set(booked.map((item) => item.therapistId));
+  $("#visibleAppointmentCount").textContent = booked.length.toLocaleString("en-IN");
   $("#visibleTherapistCount").textContent = visibleDoctors.size.toLocaleString("en-IN");
   $("#visibleEntityLabel").textContent = "doctors scheduled";
   $("#previewBanner").hidden = !(state.showPreview && state.latestPreview);
@@ -498,7 +506,7 @@ function renderDoctorCalendar(appointments) {
   }
   const isTomorrow = sameDate(calendarDay("tomorrow"), state.currentDate);
   if (isTomorrow && !saved.length && !(state.showPreview && state.latestPreview)) {
-    $("#calendarSurface").innerHTML = `<div class="empty-state calendar-day-notice not-scheduled"><span class="empty-state-icon">${icon("calendar")}</span><h3>NOT SCHEDULED YET</h3><p>Tomorrow's schedule appears here once it is planned and saved (automatically at 2:00 AM, or with Plan tomorrow).</p></div>`;
+    $("#calendarSurface").innerHTML = `<div class="empty-state calendar-day-notice not-scheduled"><span class="empty-state-icon">${icon("calendar")}</span><h3>NOT SCHEDULED YET</h3><p>Tomorrow's schedule appears here after automatic planning saves it.</p></div>`;
     return;
   }
   const doctors = calendarDoctors(appointments);
@@ -506,7 +514,7 @@ function renderDoctorCalendar(appointments) {
     $("#calendarSurface").innerHTML = emptySchedule();
     return;
   }
-  const headers = doctors.map((doctor) => `<div class="doctor-header${doctor.active ? "" : " is-inactive"}" title="${escapeHtml(doctor.name)}">${escapeHtml(doctor.name)}</div>`).join("");
+  const headers = doctors.map((doctor) => `<div class="doctor-header${doctor.active ? "" : " is-inactive"}" title="${escapeHtml(doctor.zohoDepartment ? `${doctor.name} · ${doctor.zohoDepartment}` : doctor.name)}"><span class="doctor-header-name">${escapeHtml(doctor.name)}</span>${doctor.zohoDepartment ? `<span class="doctor-header-department">${escapeHtml(doctor.zohoDepartment)}</span>` : ""}</div>`).join("");
   const rows = state.schedule.slotLabels.map((label, slot) => {
     const cells = doctors.map((doctor) => {
       const items = appointments.filter((item) => item.slot === slot && item.therapistId === doctor.id);
@@ -561,7 +569,7 @@ function bindAppointmentCards() {
 function emptySchedule() {
   const filtersActive = Object.values(state.filters).some(Boolean);
   const perspective = "doctor";
-  return `<div class="empty-state"><span class="empty-state-icon">${icon(filtersActive ? "filter" : "calendar")}</span><h3>${filtersActive ? `No ${perspective} schedules match these filters` : "This schedule is ready to plan"}</h3><p>${filtersActive ? "Clear or adjust the calendar filters to broaden the view." : "Generate tomorrow’s draft to place patient sessions into available clinician time."}</p><button class="${filtersActive ? "secondary-button" : "primary-button"}" id="emptyAction">${filtersActive ? "Clear filters" : "Plan tomorrow"}</button></div>`;
+  return `<div class="empty-state"><span class="empty-state-icon">${icon(filtersActive ? "filter" : "calendar")}</span><h3>${filtersActive ? `No ${perspective} schedules match these filters` : "No sessions scheduled"}</h3><p>${filtersActive ? "Clear or adjust the calendar filters to broaden the view." : "Saved sessions appear here after automatic planning."}</p>${filtersActive ? '<button class="secondary-button" id="emptyAction">Clear filters</button>' : ''}</div>`;
 }
 
 function errorState(message) {
@@ -573,7 +581,6 @@ function bindEmptyAction() {
   if (!action) return;
   action.addEventListener("click", () => {
     if (Object.values(state.filters).some(Boolean)) { clearFilters(); renderSchedule(); }
-    else { setView("generator"); }
   });
 }
 
@@ -590,7 +597,7 @@ async function loadOverviewView() {
     const filterOptions = (field) => [...new Set(todayAppointments.map((item) => item[field]).filter(Boolean))]
       .sort((left, right) => left.localeCompare(right))
       .map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("");
-    root.innerHTML = `${pageHeading("Practice pulse", "Today at EIC", `<button class="primary-button" data-overview-schedule>${icon("calendar")}Open calendar</button>`)}
+    root.innerHTML = `${pageHeading("", "Today at EIC", `<button class="primary-button" data-overview-schedule>${icon("calendar")}Open calendar</button>`)}
       <div class="metric-grid">
         ${metricCard("Appointments today", state.overview.appointmentsToday, "Across the clinical team")}
         ${metricCard("Active patients", state.overview.patients, `${state.overview.activeRequirements.toLocaleString("en-IN")} active therapy requirements`)}
@@ -613,11 +620,9 @@ async function loadOverviewView() {
             <div class="detail-item"><span>${icon("team")}</span><div><small>Active therapists</small><strong>${state.overview.therapists.toLocaleString("en-IN")} available</strong></div></div>
             <div class="detail-item"><span>${icon("activity")}</span><div><small>Import warnings</small><strong>${state.overview.importWarnings.toLocaleString("en-IN")} recorded for review</strong></div></div>
           </div>
-          <button class="primary-button" data-overview-generate style="width:100%;margin-top:18px">Plan tomorrow</button>
         </div></aside>
       </div>`;
     $('[data-overview-schedule]').addEventListener("click", () => setView("schedule"));
-    $('[data-overview-generate]').addEventListener("click", () => setView("generator"));
     makeSearchableSelect($("#overviewBranchFilter", root), "Search branches");
     makeSearchableSelect($("#overviewTherapistFilter", root), "Search therapists");
     makeSearchableSelect($("#overviewPatientFilter", root), "Search patients");
@@ -661,26 +666,77 @@ function metricCard(label, value, note, style = "") {
 let patientDirectoryRequest = 0;
 let zohoRefreshTimer = null;
 
-// "Refresh from Zoho": runs the nightly import now (server-side, in the background), then reloads the list.
-function showZohoRefresh(status) {
-  const line = $("#patientZohoRefreshStatus"), button = $("#patientZohoRefresh");
-  if (!line || !button) return;
-  const running = status.state === "RUNNING";
-  button.disabled = running;
-  button.innerHTML = `${icon("activity")}${running ? "Refreshing…" : "Refresh from Zoho"}`;
-  const when = (value) => value ? new Date(value).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "numeric", month: "short", hour: "numeric", minute: "2-digit" }) : "";
-  if (running) {
-    line.textContent = "Refreshing from Zoho… this takes about 1–2 minutes. You can keep working.";
-  } else if (status.state === "FAILED") {
-    line.textContent = `Last refresh failed (${when(status.finishedAt)}): ${status.error} Nothing was changed.`;
-  } else if (status.state === "DONE") {
-    const s = status.summary || {};
-    line.textContent = `Updated from Zoho ${when(status.finishedAt)} · ${(s.newActive || []).length} new active · `
-      + `${(s.newInactive || []).length} new inactive · ${(s.readyToActivate || []).length} inactive ready to activate · `
-      + `${s.stillNeedFixing ?? 0} need fixing in Zoho.`;
-  } else {
-    line.textContent = "";
+// "Refresh from Zoho" (Patients and Clinical team pages): runs the nightly import now
+// (server-side, in the background), then reloads whichever list is open.
+// The last-refresh summary sits behind an (i) beside the button: shown on hover, focus or click.
+function zohoRefreshControls(scope) {
+  return `<span class="zoho-refresh-group"><button type="button" class="primary-button" data-zoho-refresh>${icon("activity")}Refresh from Zoho</button>`
+    + `<span class="zoho-info" data-zoho-info hidden><button type="button" class="zoho-info-button" aria-label="Last refresh from Zoho" aria-expanded="false">${icon("info")}</button>`
+    + `<span class="zoho-info-tip" role="status" aria-live="polite" data-zoho-refresh-status="${scope}"></span></span></span>`;
+}
+
+// Open the popover toward whichever side has room (the toolbar wraps on narrow screens).
+function placeZohoInfo(info) {
+  const tip = $(".zoho-info-tip", info);
+  const room = info.getBoundingClientRect().right - ($("#mainContent")?.getBoundingClientRect().left || 0);
+  info.classList.toggle("tip-right", room < tip.offsetWidth + 16);
+}
+["mouseover", "focusin"].forEach((type) => document.addEventListener(type, (event) => {
+  const info = event.target.closest?.("[data-zoho-info]");
+  if (info) placeZohoInfo(info);
+}));
+
+document.addEventListener("click", (event) => {
+  const button = event.target.closest(".zoho-info-button");
+  $$("[data-zoho-info].open").forEach((info) => {
+    if (!button || info !== button.parentElement) {
+      info.classList.remove("open");
+      $(".zoho-info-button", info).setAttribute("aria-expanded", "false");
+    }
+  });
+  if (button) {
+    placeZohoInfo(button.parentElement);
+    const open = button.parentElement.classList.toggle("open");
+    button.setAttribute("aria-expanded", String(open));
   }
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  $$("[data-zoho-info].open").forEach((info) => {
+    info.classList.remove("open");
+    $(".zoho-info-button", info).setAttribute("aria-expanded", "false");
+  });
+});
+
+function showZohoRefresh(status) {
+  const running = status.state === "RUNNING";
+  const when = (value) => value ? new Date(value).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "numeric", month: "short", hour: "numeric", minute: "2-digit" }) : "";
+  $$("[data-zoho-refresh]").forEach((button) => {
+    button.disabled = running;
+    button.innerHTML = `${icon("activity")}${running ? "Refreshing…" : "Refresh from Zoho"}`;
+  });
+  $$("[data-zoho-refresh-status]").forEach((line) => {
+    if (running) {
+      line.textContent = "Refreshing from Zoho… this takes about 1–2 minutes. You can keep working.";
+    } else if (status.state === "FAILED") {
+      line.textContent = `Last refresh failed (${when(status.finishedAt)}): ${status.error} Nothing was changed.`;
+    } else if (status.state === "DONE" && line.dataset.zohoRefreshStatus === "team") {
+      line.textContent = `Updated from Zoho ${when(status.finishedAt)} · New clinicians are added with their Zoho status; `
+        + "existing clinicians keep the Active/Inactive set here.";
+    } else if (status.state === "DONE") {
+      const s = status.summary || {};
+      line.textContent = `Updated from Zoho ${when(status.finishedAt)} · ${(s.newActive || []).length} new active · `
+        + `${(s.newInactive || []).length} new inactive · ${(s.readyToActivate || []).length} inactive ready to activate · `
+        + `${s.stillNeedFixing ?? 0} need fixing in Zoho.`;
+    } else {
+      line.textContent = "";
+    }
+    const info = line.closest("[data-zoho-info]");
+    if (info) {
+      info.hidden = !line.textContent;
+      info.classList.toggle("failed", status.state === "FAILED");
+    }
+  });
 }
 
 async function pollZohoRefresh(reloadWhenDone = true) {
@@ -691,8 +747,12 @@ async function pollZohoRefresh(reloadWhenDone = true) {
     if (status.state === "RUNNING") {
       zohoRefreshTimer = window.setTimeout(() => pollZohoRefresh(true), 3000);
     } else if (reloadWhenDone && status.state === "DONE") {
-      await loadPatientsView();
-      toast("Patients updated", "The latest Zoho data is loaded. Inactive patients still need Mark active.");
+      const onTeam = state.activeView === "team";
+      if ($("#patientSearch")) await loadPatientsView();
+      if ($("#teamSearch")) await loadTeamView();
+      toast(onTeam ? "Clinicians updated" : "Patients updated", onTeam
+        ? "The latest Zoho data is loaded. New clinicians start with their Zoho status."
+        : "The latest Zoho data is loaded. Inactive patients still need Mark active.");
     } else if (reloadWhenDone && status.state === "FAILED") {
       toast("Refresh didn’t finish", status.error, "error");
     }
@@ -718,12 +778,23 @@ async function loadPatientsView() {
     const payload = await api("/api/patients");
     if (request !== patientDirectoryRequest) return;
     state.patients = payload.patients;
+    if (payload.cancelStreakWarning) state.cancelStreakWarning = payload.cancelStreakWarning;
     renderPatientsView();
   } catch (error) {
     if (request !== patientDirectoryRequest) return;
     if ($("#patientSearch", root)) toast("Couldn’t refresh patients", error.message, "error");
     else root.innerHTML = errorState(error.message);
   }
+}
+
+// "6/16 sessions": saved sessions count until cancelled, declined or marked no-show.
+function courseLabel(course) {
+  if (course.target == null) return `${course.sessions} ${course.sessions === 1 ? "session" : "sessions"}`;
+  return `${course.sessions}/${course.target} sessions${course.complete ? " · complete" : ""}`;
+}
+
+function cancelStreakBadge(count) {
+  return count && count >= (state.cancelStreakWarning || 4) ? `<span class="cancel-streak-warning" title="The last ${count} sessions were cancelled, declined or missed. Please check with the family.">${icon("alert")}${count} cancelled in a row</span>` : "";
 }
 
 function renderPatientsView() {
@@ -739,7 +810,7 @@ function renderPatientsView() {
   const rows = patients.slice(start, start + pageSize);
   if (!$("#patientSearch", root)) {
     root.innerHTML = `${pageHeading("Care directory", "Patients")}
-    <div class="directory-toolbar patient-directory-toolbar"><label class="search-field">${icon("search")}<input id="patientSearch" type="search" value="${escapeHtml(state.patientQuery)}" placeholder="Search by patient name or code" aria-label="Search patients"></label><label class="patient-status-filter">Status<select id="patientStatusFilter"><option value="all">All</option><option value="active">Active</option><option value="inactive">Inactive</option></select></label><span class="soft-pill" id="patientMatchCount" role="status" aria-live="polite"></span>${mainWorkflowWorkspace ? `<button type="button" class="secondary-button" id="patientZohoRefresh">${icon("activity")}Refresh from Zoho</button>` : ""}</div>${mainWorkflowWorkspace ? '<p class="zoho-refresh-status" id="patientZohoRefreshStatus" role="status" aria-live="polite"></p>' : ""}
+    <div class="directory-toolbar patient-directory-toolbar"><label class="search-field">${icon("search")}<input id="patientSearch" type="search" value="${escapeHtml(state.patientQuery)}" placeholder="Search by patient name or code" aria-label="Search patients"></label><label class="patient-status-filter">Status<select id="patientStatusFilter"><option value="all">All</option><option value="active">Active</option><option value="inactive">Inactive</option></select></label><span class="soft-pill" id="patientMatchCount" role="status" aria-live="polite"></span>${mainWorkflowWorkspace ? zohoRefreshControls("patients") : ""}</div>
     <div class="table-shell patient-directory-table"><table class="data-table"><thead><tr><th>Patient ID</th><th>Patient</th><th>Preference day</th><th>Preferred time</th><th>Status</th><th></th></tr></thead><tbody>
     </tbody></table><div class="table-footer"><span id="patientPageSummary"></span><div><button class="ghost-button" id="patientPrev">Previous</button><button class="ghost-button" id="patientNext">Next</button></div></div></div>`;
     $("#patientSearch", root).addEventListener("input", event => {
@@ -754,8 +825,8 @@ function renderPatientsView() {
     });
     $("#patientPrev", root).addEventListener("click", () => { state.patientPage--; renderPatientsView(); });
     $("#patientNext", root).addEventListener("click", () => { state.patientPage++; renderPatientsView(); });
-    if ($("#patientZohoRefresh", root)) {
-      $("#patientZohoRefresh", root).addEventListener("click", startZohoRefresh);
+    if ($("[data-zoho-refresh]", root)) {
+      $("[data-zoho-refresh]", root).addEventListener("click", startZohoRefresh);
       pollZohoRefresh(false);  // Show the last refresh, or resume watching one already running.
     }
   }
@@ -766,7 +837,12 @@ function renderPatientsView() {
   $("#patientPageSummary", root).textContent = `Showing ${patients.length ? start + 1 : 0}–${Math.min(start + pageSize, patients.length)} of ${patients.length.toLocaleString("en-IN")}`;
   $("#patientPrev", root).disabled = state.patientPage === 1;
   $("#patientNext", root).disabled = state.patientPage === pages;
-  $("tbody", root).innerHTML = rows.length ? rows.map((item) => `<tr><td><strong>${escapeHtml(item.code)}</strong></td><td><div class="person-cell"><span class="avatar">${escapeHtml(initials(item.name === "Name not provided" ? item.code : item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${item.therapies} active therap${item.therapies === 1 ? "y" : "ies"}</small></span></div></td><td>${escapeHtml(item.preferenceDay)}</td><td>${escapeHtml(item.preferencePeriod)}</td><td><button class="status-pill patient-status-button ${item.active ? "status-confirmed" : "status-needs_rescheduling"}" type="button" data-patient-status="${item.id}" aria-haspopup="dialog" aria-label="${item.active ? "Active" : "Inactive"} — change scheduling status for ${escapeHtml(item.code)}">${item.active ? "Active" : "Inactive"} ${icon("chevron-right")}</button></td><td><button class="ghost-button" type="button" data-patient-preferences="${item.id}">Edit</button></td></tr>`).join("") : '<tr><td colspan="6">No patients match your search and status filter.</td></tr>';
+  $("tbody", root).innerHTML = rows.length ? rows.map((item) => `<tr data-open-patient="${item.id}"><td><strong>${escapeHtml(item.code)}</strong></td><td><button type="button" class="patient-open-button person-cell" data-patient-preferences="${item.id}" aria-label="View plan and preferences for ${escapeHtml(item.name)}"><span class="avatar">${escapeHtml(initials(item.name === "Name not provided" ? item.code : item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${item.therapies} active therap${item.therapies === 1 ? "y" : "ies"}</small>${cancelStreakBadge(item.cancelStreak)}</span></button></td><td>${escapeHtml(item.preferenceDay)}</td><td>${escapeHtml(item.preferencePeriod)}</td><td><button class="status-pill patient-status-button ${item.active ? "status-confirmed" : "status-needs_rescheduling"}" type="button" data-patient-status="${item.id}" aria-haspopup="dialog" aria-label="${item.active ? "Active" : "Inactive"} — change scheduling status for ${escapeHtml(item.code)}">${item.active ? "Active" : "Inactive"} ${icon("chevron-right")}</button></td><td><button class="ghost-button" type="button" data-patient-preferences="${item.id}">Edit</button></td></tr>`).join("") : '<tr><td colspan="6">No patients match your search and status filter.</td></tr>';
+  $$("[data-open-patient]", root).forEach(row => row.addEventListener("click", event => {
+    if (event.target.closest("button, a, input, select, textarea")) return;
+    const patient = rows.find(item => String(item.id) === row.dataset.openPatient);
+    if (patient) openPatientPreferences(patient);
+  }));
   $$("[data-patient-status]", root).forEach(button => button.addEventListener("click", () => {
     const patient = rows.find(item => String(item.id) === button.dataset.patientStatus);
     openPatientStatusDialog(patient, () => {
@@ -778,6 +854,30 @@ function renderPatientsView() {
     const patient = state.patients.find((item) => String(item.id) === button.dataset.patientPreferences);
     if (patient) openPatientPreferences(patient);
   }));
+}
+
+function pickedPreferenceDays(root) {
+  return $$("#patientPreferenceDays input:checked", root).map((input) => Number(input.value));
+}
+
+function pickedPreferenceTimes(root) {
+  return $$("#patientPreferenceTimes input:checked", root).map((input) => input.value);
+}
+
+// Morning / Afternoon / Clear quickly tick or untick a group of start times.
+function wirePreferenceTimeShortcuts(root) {
+  $$("[data-time-shortcut]", root).forEach((button) => button.addEventListener("click", () => {
+    const boxes = $$("#patientPreferenceTimes input", root);
+    const group = button.dataset.timeShortcut === "clear" ? [] : boxes.filter((box) => (box.value < "12:45") === (button.dataset.timeShortcut === "morning"));
+    if (button.dataset.timeShortcut === "clear") boxes.forEach((box) => { box.checked = false; });
+    else { const on = !group.every((box) => box.checked); group.forEach((box) => { box.checked = on; }); }
+  }));
+}
+
+// "09:40" -> "9:40 AM"
+function preferenceTimeLabel(time) {
+  const [hours, minutes] = time.split(":").map(Number);
+  return `${hours % 12 || 12}:${String(minutes).padStart(2, "0")} ${hours < 12 ? "AM" : "PM"}`;
 }
 
 function ensurePatientPreferencesDrawer() {
@@ -805,9 +905,16 @@ async function openPatientPreferences(patient) {
         <div><h3>Scheduling status</h3><span id="patientCurrentStatus">${payload.patient.active ? "Active" : "Inactive"}</span></div>
         <button class="secondary-button" id="patientStatusAction" type="button">${payload.patient.active ? "Mark inactive" : "Reactivate"}</button>
       </section>
-      <form class="preference-form" id="patientPreferencesForm"><p class="candidate-intro">The scheduler ranks the selected day and time band ahead of other available slots. This is a preference, not a restriction: it can use another time when needed to complete therapy safely.</p>
-        <label>Preferred day<select id="patientPreferenceDay"><option value="">No priority</option>${["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"].map((label, day) => `<option value="${day}" ${payload.preference.day === day ? "selected" : ""}>${label}</option>`).join("")}</select></label>
-        <label>Preferred time<select id="patientPreferencePeriod"><option value="">No priority</option><option value="morning" ${payload.preference.period === "morning" ? "selected" : ""}>Morning · 09:00–12:35</option><option value="afternoon" ${payload.preference.period === "afternoon" ? "selected" : ""}>Afternoon · 13:15–16:50</option></select></label>
+      <section class="patient-plan-section" aria-labelledby="patientPlanTitle"><h3 id="patientPlanTitle">Plan</h3>${cancelStreakBadge(payload.cancelStreak)}
+        ${payload.plan?.length ? `<ul class="patient-plan-list">${payload.plan.map(therapy => `<li><h4>${escapeHtml(therapy.therapy)}</h4><dl><div><dt>Clinician</dt><dd>${escapeHtml(therapy.clinician || "Not assigned")}</dd></div><div><dt>Frequency</dt><dd>${escapeHtml(therapy.sessionsPerWeek)} ${therapy.sessionsPerWeek === 1 ? "session" : "sessions"}/week</dd></div><div><dt>Duration</dt><dd>${therapy.durationMonths ? `${escapeHtml(therapy.durationMonths)} ${therapy.durationMonths === 1 ? "month" : "months"}` : "Not recorded"}</dd></div><div><dt>Sessions</dt><dd>${escapeHtml(courseLabel({sessions: therapy.sessions || 0, target: therapy.target, complete: therapy.complete}))}</dd></div></dl></li>`).join("")}</ul>` : '<p class="patient-plan-empty">No active plan recorded.</p>'}
+      </section>
+      <form class="preference-form" id="patientPreferencesForm">
+        <fieldset class="preference-days" id="patientPreferenceDays"><legend>Preferred days</legend>
+          <div class="preference-day-options">${["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((label, day) => `<label class="preference-day"><input type="checkbox" value="${day}" ${(payload.preference.days || []).includes(day) ? "checked" : ""}><span>${label}</span></label>`).join("")}</div>
+        </fieldset>
+        <fieldset class="preference-days" id="patientPreferenceTimes"><legend><span>Preferred times</span><span class="preference-time-shortcuts"><button type="button" data-time-shortcut="morning">Morning</button><button type="button" data-time-shortcut="afternoon">Afternoon</button><button type="button" data-time-shortcut="clear">Clear</button></span></legend>
+          <div class="preference-day-options preference-time-options">${(payload.startTimes || []).map((time) => `<label class="preference-day"><input type="checkbox" value="${escapeHtml(time)}" ${(payload.preference.times || []).includes(time) ? "checked" : ""}><span>${escapeHtml(preferenceTimeLabel(time))}</span></label>`).join("")}</div>
+        </fieldset>
         <button class="primary-button" type="submit">Save preference</button>
       </form>
       </div>`;
@@ -818,14 +925,18 @@ async function openPatientPreferences(patient) {
       statusAction.textContent = payload.patient.active ? "Mark inactive" : "Reactivate";
       renderPatientsView();
     }));
+    wirePreferenceTimeShortcuts(drawer);
     $("#patientPreferencesForm", drawer).addEventListener("submit", async (event) => {
       event.preventDefault();
       const button = $('button[type="submit"]', event.currentTarget);
       button.disabled = true;
       button.textContent = "Saving…";
       try {
-        await api(`/api/patients/${patient.id}/preferences`, { method: "POST", body: JSON.stringify({ day: $("#patientPreferenceDay", drawer).value, period: $("#patientPreferencePeriod", drawer).value }) });
-        toast("Preference saved", "The next schedule will prioritize this day and time.");
+        const days = pickedPreferenceDays(drawer);
+        const times = pickedPreferenceTimes(drawer);
+        await api(`/api/patients/${patient.id}/preferences`, { method: "POST", body: JSON.stringify({ days, times }) });
+        toast("Preference saved", days.length || times.length ? "The next schedules will use the picked days and times first."
+          : "Preference cleared: any day, any time.");
         closeDrawers();
         await loadPatientsView();
       } catch (error) {
@@ -941,7 +1052,50 @@ function openPatientStatusDialog(patient, onSaved) {
 }
 
 const teamFilters = { query: "", status: "all", department: "", location: "" };
+const TEAM_PAGE_SIZE = 25;
 let teamDirectory = null;
+let teamPage = 1;
+
+// Status, department and location live in one Filters drawer, like the Schedule page.
+function teamFilterCount() {
+  return (teamFilters.status !== "all") + Boolean(teamFilters.department) + Boolean(teamFilters.location);
+}
+
+function ensureTeamFilterDrawer(departments, locations) {
+  $("#teamFilterDrawer")?.remove();
+  const options = (values, all) => `<option value="">${all}</option>${values.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("")}`;
+  const drawer = document.createElement("aside");
+  drawer.id = "teamFilterDrawer";
+  drawer.className = "drawer filter-drawer";
+  drawer.setAttribute("aria-hidden", "true");
+  drawer.setAttribute("aria-labelledby", "teamFilterTitle");
+  drawer.innerHTML = `<div class="drawer-header"><div><p class="eyebrow">Clinical team</p><h2 id="teamFilterTitle">Filters</h2></div><button class="icon-button" data-close-team-filters aria-label="Close filters">${icon("close")}</button></div>
+    <form id="teamFilterForm" class="drawer-body filter-form">
+      <label>Status<select id="teamStatusFilter"><option value="all">All</option><option value="active">Active</option><option value="inactive">Inactive</option></select></label>
+      <label>Department<select id="teamDepartmentFilter">${options(departments, "All departments")}</select></label>
+      <label>Location<select id="teamLocationFilter">${options(locations, "All locations")}</select></label>
+    </form>
+    <div class="drawer-footer"><button class="ghost-button" type="button" id="clearTeamFilters">Clear all</button><button class="primary-button" type="button" id="applyTeamFilters">Show clinicians</button></div>`;
+  document.body.append(drawer);
+  const fields = [["#teamStatusFilter", "status"], ["#teamDepartmentFilter", "department"], ["#teamLocationFilter", "location"]];
+  const sync = () => fields.forEach(([selector, key]) => { $(selector, drawer).value = teamFilters[key]; });
+  drawer.syncTeamFilters = sync;
+  $("[data-close-team-filters]", drawer).addEventListener("click", closeDrawers);
+  $("#teamFilterForm", drawer).addEventListener("submit", (event) => event.preventDefault());
+  $("#applyTeamFilters", drawer).addEventListener("click", () => {
+    fields.forEach(([selector, key]) => { teamFilters[key] = $(selector, drawer).value; });
+    teamPage = 1;
+    closeDrawers();
+    renderTeamView();
+  });
+  $("#clearTeamFilters", drawer).addEventListener("click", () => {
+    Object.assign(teamFilters, { status: "all", department: "", location: "" });
+    sync();
+    teamPage = 1;
+    renderTeamView();
+  });
+  return drawer;
+}
 
 async function loadTeamView() {
   const root = $("#view-team");
@@ -953,45 +1107,129 @@ async function loadTeamView() {
     const locations = [...new Set(teamDirectory.therapists.map((item) => item.location))].sort((a, b) => a.localeCompare(b));
     if (!departments.includes(teamFilters.department)) teamFilters.department = "";
     if (!locations.includes(teamFilters.location)) teamFilters.location = "";
-    const options = (values, all) => `<option value="">${all}</option>${values.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("")}`;
+    const drawer = ensureTeamFilterDrawer(departments, locations);
     // The toolbar is built once; typing and filters only re-render the rows, so focus is never lost.
     root.innerHTML = `${pageHeading("Capacity & coverage", "Clinical team", `<button class="secondary-button" data-team-calendar>${icon("calendar")}View team calendar</button>`)}
       <div class="directory-toolbar patient-directory-toolbar">
         <label class="search-field">${icon("search")}<input id="teamSearch" type="search" placeholder="Search by clinician name or code" aria-label="Search clinicians"></label>
-        <label class="patient-status-filter">Status <select id="teamStatusFilter" aria-label="Filter by status"><option value="all">All</option><option value="active">Active</option><option value="inactive">Inactive</option></select></label>
-        <label class="patient-status-filter">Department <select id="teamDepartmentFilter" aria-label="Filter by department">${options(departments, "All departments")}</select></label>
-        <label class="patient-status-filter">Location <select id="teamLocationFilter" aria-label="Filter by location">${options(locations, "All locations")}</select></label>
-        <span class="soft-pill" id="teamMatchCount"></span>
+        <button class="secondary-button" type="button" id="teamFilterButton" aria-haspopup="dialog" aria-controls="teamFilterDrawer">${icon("filter")}Filters <span class="filter-count" id="teamFilterCount" hidden>0</span></button>
+        <span class="soft-pill" id="teamMatchCount" role="status" aria-live="polite"></span>
+        ${mainWorkflowWorkspace ? zohoRefreshControls("team") : ""}
       </div>
       <div class="table-shell patient-directory-table"><table class="data-table"><thead><tr><th>Clinician</th><th>Department</th><th>Location</th><th>Weekly workload</th><th>Status</th></tr></thead><tbody></tbody></table>
-      <div class="table-footer"><span id="teamFooter"></span><span>Capacity assumes 10 daily slots</span></div></div>`;
+      <div class="table-footer"><span id="teamFooter"></span><div><button class="ghost-button" id="teamPrev">Previous</button><button class="ghost-button" id="teamNext">Next</button></div></div></div>`;
     $("#teamSearch", root).value = teamFilters.query;
-    $("#teamStatusFilter", root).value = teamFilters.status;
-    $("#teamDepartmentFilter", root).value = teamFilters.department;
-    $("#teamLocationFilter", root).value = teamFilters.location;
-    $("#teamSearch", root).addEventListener("input", (event) => { teamFilters.query = event.target.value; renderTeamView(); });
-    [["#teamStatusFilter", "status"], ["#teamDepartmentFilter", "department"], ["#teamLocationFilter", "location"]].forEach(([selector, key]) => {
-      $(selector, root).addEventListener("change", (event) => { teamFilters[key] = event.target.value; renderTeamView(); });
-    });
+    $("#teamSearch", root).addEventListener("input", (event) => { teamFilters.query = event.target.value; teamPage = 1; renderTeamView(); });
+    $("#teamFilterButton", root).addEventListener("click", () => { drawer.syncTeamFilters(); openDrawer("teamFilterDrawer"); });
+    $("#teamPrev", root).addEventListener("click", () => { teamPage--; renderTeamView(); });
+    $("#teamNext", root).addEventListener("click", () => { teamPage++; renderTeamView(); });
     $('[data-team-calendar]', root).addEventListener("click", () => setView("schedule"));
+    if ($("[data-zoho-refresh]", root)) {
+      $("[data-zoho-refresh]", root).addEventListener("click", startZohoRefresh);
+      pollZohoRefresh(false);  // Show the last refresh, or resume watching one already running.
+    }
     renderTeamView();
   } catch (error) { root.innerHTML = errorState(error.message); }
+}
+
+function openTherapistStatusDialog(therapist, onSaved) {
+  const active = !therapist.active;
+  let saving = false;
+  const dialog = document.createElement("dialog");
+  dialog.className = "patient-status-dialog";
+  dialog.setAttribute("aria-labelledby", "therapistStatusTitle");
+  dialog.setAttribute("aria-describedby", "therapistStatusWarning");
+  dialog.innerHTML = `
+    <form class="preference-form">
+      <h3 id="therapistStatusTitle">${active ? "Mark this clinician active?" : "Mark this clinician as inactive?"}</h3>
+      <p id="therapistStatusWarning"><strong>${escapeHtml(therapist.name)}</strong> ${active
+        ? "will be included when new sessions are scheduled."
+        : "will get no new sessions. Visits already booked stay on the calendar for you to review."}</p>
+      ${active ? "" : '<label>Reason for marking inactive <textarea name="reason" rows="3" maxlength="1000" required></textarea></label>'}
+      <p class="patient-status-error" role="alert" hidden></p>
+      <div class="patient-status-actions">
+        <button type="button" class="secondary-button" data-cancel-status>Cancel</button>
+        <button type="submit" class="primary-button">${active ? "Mark active" : "Mark inactive"}</button>
+      </div>
+    </form>`;
+  const form = $("form", dialog);
+  const reason = $("textarea", form);
+  const cancel = $("[data-cancel-status]", form);
+  const confirm = $('button[type="submit"]', form);
+  const errorNote = $(".patient-status-error", form);
+  cancel.addEventListener("click", () => dialog.close());
+  dialog.addEventListener("close", () => dialog.remove());
+  dialog.addEventListener("cancel", event => { if (saving) event.preventDefault(); });
+  reason?.addEventListener("input", () => reason.setCustomValidity(""));
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    if (saving) return;
+    const explanation = reason?.value.trim() ?? "";
+    if (reason && !explanation) {
+      reason.setCustomValidity("Enter a reason for marking this clinician inactive.");
+      reason.reportValidity();
+      return;
+    }
+    confirm.disabled = cancel.disabled = true;
+    saving = true;
+    errorNote.hidden = true;
+    let result;
+    try {
+      result = await api(`/api/therapists/${therapist.id}/status`, {
+        method: "POST", body: JSON.stringify({ active, reason: explanation }),
+      });
+    } catch (error) {
+      errorNote.textContent = error.message;
+      errorNote.hidden = false;
+      saving = false;
+      confirm.disabled = cancel.disabled = false;
+      return;
+    }
+    therapist.active = result.active;
+    // Keep the calendar's clinician list in step without a reload.
+    const scheduled = state.schedule?.therapists?.find(item => item.id === therapist.id);
+    if (scheduled) scheduled.active = result.active;
+    dialog.close();
+    onSaved();
+    const kept = result.upcomingBookings || 0;
+    toast(result.active ? "Clinician marked active" : "Clinician marked inactive",
+      !result.active && kept ? `${kept} upcoming visit${kept === 1 ? " is" : "s are"} still booked. Review ${kept === 1 ? "it" : "them"} in the calendar.` : "Scheduling status saved.");
+  });
+  document.body.append(dialog);
+  dialog.showModal();
+  (reason || cancel).focus();
 }
 
 function renderTeamView() {
   const root = $("#view-team");
   if (!teamDirectory || !$("#teamSearch", root)) return;
   const query = teamFilters.query.trim().toLowerCase();
-  const rows = teamDirectory.therapists.filter((item) =>
+  const matches = teamDirectory.therapists.filter((item) =>
     (!query || `${item.name} ${item.code}`.toLowerCase().includes(query)) &&
     (teamFilters.status === "all" || item.active === (teamFilters.status === "active")) &&
     (!teamFilters.department || item.department === teamFilters.department) &&
     (!teamFilters.location || item.location === teamFilters.location));
-  const total = teamDirectory.therapists.length;
-  $("#teamMatchCount", root).textContent = `${rows.length.toLocaleString("en-IN")} clinician${rows.length === 1 ? "" : "s"}`;
-  $("#teamFooter", root).textContent = `${rows.length.toLocaleString("en-IN")} of ${total.toLocaleString("en-IN")} clinicians · week of ${formatDate(parseLocalDate(teamDirectory.weekStart), { day: "numeric", month: "long", year: "numeric" })}`;
-  $("tbody", root).innerHTML = rows.length ? rows.map((item) => { const capacityLabel = item.capacity == null ? "Not supplied" : item.capacity; const utilization = item.capacity ? Math.min(100, Math.round(item.appointments / item.capacity * 100)) : 0; return `<tr><td><div class="person-cell"><span class="avatar">${escapeHtml(initials(item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.code)}</small></span></div></td><td>${escapeHtml(item.department)}</td><td>${escapeHtml(item.location)}</td><td><div style="display:flex;align-items:center;gap:10px"><div class="progress-track"><div class="progress-fill" style="width:${utilization}%"></div></div><span>${item.appointments} / ${capacityLabel}</span></div></td><td><span class="status-pill ${item.active ? "status-confirmed" : "status-needs_rescheduling"}">${item.active ? "Active" : "Inactive"}</span></td></tr>`; }).join("")
+  const pages = Math.max(1, Math.ceil(matches.length / TEAM_PAGE_SIZE));
+  teamPage = Math.max(1, Math.min(teamPage, pages));
+  const start = (teamPage - 1) * TEAM_PAGE_SIZE;
+  const rows = matches.slice(start, start + TEAM_PAGE_SIZE);
+  const filters = teamFilterCount();
+  $("#teamFilterCount", root).hidden = filters === 0;
+  $("#teamFilterCount", root).textContent = filters;
+  $("#teamMatchCount", root).textContent = `${matches.length.toLocaleString("en-IN")} clinician${matches.length === 1 ? "" : "s"}`;
+  $("#teamFooter", root).textContent = `Showing ${matches.length ? start + 1 : 0}–${Math.min(start + TEAM_PAGE_SIZE, matches.length)} of ${matches.length.toLocaleString("en-IN")} · week of ${formatDate(parseLocalDate(teamDirectory.weekStart), { day: "numeric", month: "long", year: "numeric" })}`;
+  $("#teamPrev", root).disabled = teamPage === 1;
+  $("#teamNext", root).disabled = teamPage === pages;
+  $("tbody", root).innerHTML = rows.length ? rows.map((item) => { const capacityLabel = item.capacity == null ? "Not supplied" : item.capacity; const utilization = item.capacity ? Math.min(100, Math.round(item.appointments / item.capacity * 100)) : 0; return `<tr><td><div class="person-cell"><span class="avatar">${escapeHtml(initials(item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.code)}</small></span></div></td><td>${escapeHtml(item.department)}</td><td>${escapeHtml(item.location)}</td><td><div style="display:flex;align-items:center;gap:10px"><div class="progress-track"><div class="progress-fill" style="width:${utilization}%"></div></div><span style="white-space:nowrap">${item.appointments} / ${capacityLabel}</span></div></td><td><button class="status-pill patient-status-button ${item.active ? "status-confirmed" : "status-needs_rescheduling"}" type="button" data-therapist-status="${item.id}" aria-haspopup="dialog" aria-label="${item.active ? "Active" : "Inactive"} — change scheduling status for ${escapeHtml(item.name)}">${item.active ? "Active" : "Inactive"} ${icon("chevron-right")}</button></td></tr>`; }).join("")
     : '<tr><td colspan="5">No clinicians match your search and filters.</td></tr>';
+  $$("[data-therapist-status]", root).forEach(button => button.addEventListener("click", () => {
+    const therapist = rows.find(item => String(item.id) === button.dataset.therapistStatus);
+    if (!therapist) return;
+    openTherapistStatusDialog(therapist, () => {
+      renderTeamView();
+      ($(`[data-therapist-status="${therapist.id}"]`, root) || $("#teamSearch", root)).focus();
+    });
+  }));
 }
 
 function renderReleasedAppointments(operations) {
@@ -1036,9 +1274,9 @@ async function loadOperationsView() {
     const therapists = state.schedule?.therapists || [];
     const tabs = [
       {id:"assistant", label:"Scheduling assistant", icon:"sparkles"},
-      ...(workflowWorkspace ? [{id:"whatsapp", label:"WhatsApp & attendance", icon:"bell"}] : []),
-      {id:"absence", label:"Record an absence", icon:"calendar"},
       {id:"rescheduling", label:"Needs rescheduling", icon:"operations"},
+      {id:"absence", label:"Record an absence", icon:"calendar"},
+      ...(workflowWorkspace ? [{id:"whatsapp", label:"WhatsApp replies & follow-ups", icon:"whatsapp"}] : []),
     ];
     root.innerHTML = `${pageHeading("Schedule continuity", "Operations")}
       <div class="operations-tabs" role="tablist" aria-label="Operations sections">
@@ -1046,7 +1284,7 @@ async function loadOperationsView() {
       </div>
       <div class="operations-tab-panel" role="tabpanel" id="operations-panel-assistant" aria-labelledby="operations-tab-assistant" tabindex="0" hidden>
       <section class="panel assistant-panel">
-        <div class="panel-header"><div><h2 class="assistant-title"><span class="assistant-ai-icon" aria-label="AI assistant">${icon("sparkles")}</span>Scheduling assistant</h2></div><div class="assistant-header-actions"><button class="secondary-button compact-button" id="assistantClearMemory" type="button">Clear memory</button></div></div>
+        <div class="panel-header"><div><h2 class="assistant-title">Scheduling assistant</h2></div><div class="assistant-header-actions"><button class="secondary-button compact-button" id="assistantClearMemory" type="button">Clear memory</button></div></div>
         <div class="assistant-messages" id="assistantMessages" aria-live="polite"><div class="assistant-message">${assistant.configured ? "Type a request to get started." : (assistant.unavailable ? "The assistant endpoint is not available in this running server. Restart the scheduler; use the absence and rescheduling tabs for those actions." : "Add the Azure OpenAI settings to .env, then restart the scheduler to use this assistant.")}</div></div>
         <form class="assistant-form" id="assistantForm"><textarea id="assistantInput" rows="2" maxlength="1000" placeholder="Give me an overall summary for today" ${assistant.configured ? "" : "disabled"} required></textarea><button class="primary-button" type="submit" ${assistant.configured ? "" : "disabled"}>Send request</button></form>
       </section>
@@ -1174,7 +1412,7 @@ async function loadOperationsView() {
       input.focus();
     }));
     if (workflowWorkspace) window.therapyWhatsapp.mountOperations({
-      root, date: isoDate(state.currentDate), api, onChanged: refreshAfterWhatsapp,
+      root, date: isoDate(state.currentDate), api, onChanged: refreshAfterWhatsapp, patients: patients.patients,
     });
     bindReleasedAppointments(root, operations);
   } catch (error) { root.innerHTML = errorState(error.message); }
@@ -1358,6 +1596,8 @@ async function openAppointment(item) {
   const drawer = ensureAppointmentDrawer();
   const canChange = !item.preview && ["PROPOSED", "PENDING_CONFIRMATION", "CONFIRMED"].includes(item.status);
   const plan = state.schedule?.patientPlans?.[String(item.patientId)] || [];
+  const staffCancellationEnabled = state.schedule.staffCancellationEnabled === true;
+  const visit = state.schedule.appointments.filter(other => !other.preview && other.patientId === item.patientId && other.date === item.date && (item.bundle ? other.bundle === item.bundle : other.id === item.id));
   drawer.innerHTML = `<div class="drawer-header"><div><p class="eyebrow">Appointment details</p><h2 id="appointmentDrawerTitle">${formatDate(parseLocalDate(item.date), { weekday: "long", day: "numeric", month: "long" })}</h2></div><button class="icon-button" data-close-appointment aria-label="Close appointment">${icon("close")}</button></div>
     <div class="drawer-body"><div class="appointment-hero"><span class="status-pill status-${item.status.toLowerCase()}">${escapeHtml(formatStatus(item.status))}</span><h3>${escapeHtml(item.patientName)}</h3><p>${escapeHtml(item.patientCode)} · ${escapeHtml(item.therapy)}</p></div>
       <dl class="appointment-facts">
@@ -1366,7 +1606,7 @@ async function openAppointment(item) {
         <div><dt>Location</dt><dd>${escapeHtml(item.location)}</dd></div>
         <div><dt>Plan</dt><dd>${plan.length ? `<ul class="appointment-plan">${plan.map(therapy => `<li><span>${escapeHtml(therapy.therapy)}</span><span>${escapeHtml(therapy.sessionsPerWeek)} ${therapy.sessionsPerWeek === 1 ? "session" : "sessions"}/week</span></li>`).join("")}</ul>` : '<span class="appointment-plan-empty">No active plan recorded.</span>'}</dd></div>
       </dl>
-      ${canChange ? `<section class="drawer-section"><h3>Move this visit</h3><form class="form-grid" id="moveAppointmentForm"><label>New date<input type="date" id="moveDate" value="${item.date}" required></label><label>New starting time<select id="moveSlot">${state.overview.slotLabels.map((label, index) => `<option value="${index}" ${index === item.slot ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></label><button class="secondary-button" type="submit">Validate and move</button></form></section><div class="drawer-actions"><button class="danger-button" id="cancelAppointment">Record patient cancellation</button></div>` : ""}
+      ${canChange ? `<section class="drawer-section"><h3>Cancel appointment</h3><form class="preference-form" id="cancelAppointmentForm"><label>Cancel<select id="cancelAppointmentScope"><option value="session">This session</option><option value="visit">Entire visit (${visit.length} ${visit.length === 1 ? "session" : "sessions"})</option></select></label><ul id="cancelScopeSummary" class="cancel-scope-summary"></ul><label>Reason<textarea id="cancelAppointmentReason" rows="2" maxlength="1000" required></textarea></label><p class="fine-print">The opening will be released for staff to choose a replacement. No replacement is booked automatically.</p><p id="cancelAppointmentError" class="replacement-error" role="alert" hidden></p>${staffCancellationEnabled ? "" : '<p class="fine-print" role="status">This action needs the updated Thanal backend. It is not available in this session yet.</p>'}<button class="danger-button" type="submit" ${staffCancellationEnabled ? "" : "disabled"}>Confirm cancellation</button></form></section><section class="drawer-section"><h3>Move this visit</h3><form class="form-grid" id="moveAppointmentForm"><label>New date<input type="date" id="moveDate" value="${item.date}" required></label><label>New starting time<select id="moveSlot">${state.overview.slotLabels.map((label, index) => `<option value="${index}" ${index === item.slot ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></label><button class="secondary-button" type="submit">Validate and move</button></form></section>` : ""}
     </div>`;
   $('[data-close-appointment]', drawer).addEventListener("click", closeDrawers);
   if (canChange) {
@@ -1378,16 +1618,37 @@ async function openAppointment(item) {
         toast("Appointment moved", result.message); closeDrawers(); await loadSchedule();
       } catch (error) { toast("Move blocked by scheduling rules", error.message, "error"); button.disabled = false; button.textContent = "Validate and move"; }
     });
-    $("#cancelAppointment", drawer).addEventListener("click", async () => {
-      if (!window.confirm(`Record a patient cancellation for ${item.patientName} on ${formatDate(parseLocalDate(item.date), { day: "numeric", month: "long" })}?`)) return;
-      const button = $("#cancelAppointment", drawer); button.disabled = true; button.textContent = "Recording…";
+    const cancelScope = $("#cancelAppointmentScope", drawer);
+    const renderCancellationScope = () => {
+      const items = cancelScope.value === "visit" ? visit : [item];
+      $("#cancelScopeSummary", drawer).innerHTML = items.map(session => `<li>${escapeHtml(session.time)} · ${escapeHtml(session.therapy)}${session.status === "COMPLETED" ? " (completed — cannot cancel)" : ""}</li>`).join("");
+    };
+    cancelScope.addEventListener("change", renderCancellationScope);
+    renderCancellationScope();
+    $("#cancelAppointmentForm", drawer).addEventListener("submit", async event => {
+      event.preventDefault();
+      const button = $('button[type="submit"]', event.currentTarget);
+      const inputs = $$("input, select, textarea, button", drawer);
+      const disabled = inputs.map(input => input.disabled);
+      inputs.forEach(input => input.disabled = true);
+      button.textContent = "Cancelling…";
+      const errorNote = $("#cancelAppointmentError", drawer);
+      errorNote.hidden = true;
+      let result;
       try {
-        const result = await api(`/api/appointments/${item.id}/cancel`, { method: "POST", body: "{}" });
-        const candidates = (result.replacementGroups || []).reduce((total, group) => total + group.candidates.length, 0);
-        toast("Cancellation recorded", candidates ? `${candidates} continuity-preserving replacement option${candidates === 1 ? "" : "s"} found.` : "The opening is ready for the next repair run.");
-        closeDrawers(); await loadSchedule();
-        if (result.replacementGroups?.length) showReplacementCandidates(result.replacementGroups);
-      } catch (error) { toast("Couldn’t record cancellation", error.message, "error"); button.disabled = false; button.textContent = "Record patient cancellation"; }
+        result = await api(`/api/appointments/${item.id}/staff-cancel`, {method: "POST", body: JSON.stringify({scope: cancelScope.value, reason: $("#cancelAppointmentReason", drawer).value})});
+      } catch (error) {
+        errorNote.textContent = error.status === 404 ? "Staff cancellation requires the updated Thanal backend. Nothing was changed." : error.message;
+        errorNote.hidden = false;
+        inputs.forEach((input, index) => input.disabled = disabled[index]);
+        button.textContent = "Confirm cancellation";
+        return;
+      }
+      closeDrawers();
+      toast(result.message, `${result.cancelledIds.length} session(s) released. Choose a replacement or leave the opening for later.`);
+      try { await loadSchedule(); }
+      catch (error) { toast("Cancellation saved", "Refresh the calendar to see the updated counts.", "error"); }
+      if (result.replacementGroups?.length) showReplacementCandidates(result.replacementGroups);
     });
   }
   openDrawer("appointmentDrawer");
@@ -1600,6 +1861,6 @@ if (!workflowWorkspace) {
     link.className = 'nav-item';
     link.href = status.path || '/';
     link.innerHTML = `${icon('operations')}<span>Daily operations</span>`;
-    document.querySelector('[aria-label="Planning navigation"]').append(link);
+    document.querySelector('[aria-label="Primary navigation"]').append(link);
   }).catch(() => { /* The original workspace remains usable if operations are unavailable. */ });
 }

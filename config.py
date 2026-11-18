@@ -9,6 +9,8 @@ BASE_DIR = Path(__file__).resolve().parent
 
 def load_local_env_file(path: Path) -> None:
     """Load local ``KEY=value`` settings without overriding real environment values."""
+    if os.getenv("THERAPY_SCHEDULER_LOAD_LOCAL_ENV", "true").strip().lower() == "false":
+        return
     if not path.is_file():
         return
     for raw_line in path.read_text(encoding="utf-8").splitlines():

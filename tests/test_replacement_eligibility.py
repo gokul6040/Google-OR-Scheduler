@@ -100,8 +100,12 @@ def test_inactive_records_and_invalid_plan_dates_are_not_suggested(db_session, o
     elif change == "not_started":
         requirement.plan_start_date = DAY + timedelta(days=1)
     elif change == "ended":
+        # A course ends at its session total (12 Nov 2026), not its calendar end.
         requirement.plan_start_date = date(2026, 9, 1)
         requirement.duration_months = 1
+        for index in range(requirement.sessions_per_week * 4):
+            booking(db_session, requirement, target=date(2026, 9, 1) + timedelta(days=index),
+                    slot=0, status=AppointmentStatus.COMPLETED)
     else:
         vacant.date = DAY + timedelta(days=6)
     db_session.flush()

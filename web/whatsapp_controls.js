@@ -4,7 +4,7 @@ window.therapyWhatsapp = (() => {
   const preview = data => data.mode.startsWith('PREVIEW');
   const label = value => String(value || 'Not reported').toLowerCase().replaceAll('_', ' ').replace(/\b\w/g, c => c.toUpperCase());
   const action = (title, kind, attrs = '', disabled = false) => `<button type="button" class="secondary-button compact-button" data-wa-action="${kind}" ${attrs} ${disabled ? 'disabled' : ''}>${esc(title)}</button>`;
-  const table = (headers, rows) => `<div class="wa-table"><table class="data-table"><thead><tr>${headers.map(h => `<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.length ? rows.map(row => `<tr>${row.map(cell => `<td>${cell}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${headers.length}">Nothing yet.</td></tr>`}</tbody></table></div>`;
+  const table = (headers, rows, extraClass = '') => `<div class="wa-table ${esc(extraClass)}"><table class="data-table"><thead><tr>${headers.map(h => `<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.length ? rows.map(row => `<tr>${row.map(cell => `<td>${cell}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${headers.length}">Nothing yet.</td></tr>`}</tbody></table></div>`;
   const post = (api, path, body) => api(path, {method:'POST', body:JSON.stringify(body)});
   const readiness = (data, patient) => data.messaging_paused ? 'Messaging is OFF — offers remain queued' : preview(data) && data.test_data ? 'Preview — no messages sent' : data.workspace === 'main' && !data.recipients[patient] ? 'Import a verified parent number before publishing' : preview(data) ? 'Preview — no messages sent' : !data.recipients[patient] ? 'Recipient not configured' : data.message_mode === 'session' && !data.windows[patient]?.open ? `${data.recipients[patient]} · offer will wait for a parent message` : `${data.recipients[patient]} · ready to receive`;
   const ready = (data, patient) => (preview(data) && (data.test_data || data.workspace !== 'main')) || Boolean(data.recipients[patient]);
@@ -27,6 +27,21 @@ window.therapyWhatsapp = (() => {
   function controller(body, options, render, active, getDate, notice) {
     let data = null, busy = false, timer = null, signature = '';
     const valid = () => body.isConnected && active();
+    function paint(next) {
+      const focus = body.contains(document.activeElement) ? document.activeElement : null;
+      const filter = focus?.dataset.waFilter;
+      const selection = filter && focus.tagName === 'INPUT' ? [focus.selectionStart, focus.selectionEnd] : null;
+      const selections = new Map([...body.querySelectorAll('[data-wa-reply]')].map(el => [el.dataset.waReply,el.value]));
+      const expanded = new Set([...body.querySelectorAll('details[data-wa-detail][open]')].map(el => el.dataset.waDetail));
+      body.innerHTML = render(next);
+      body.querySelectorAll('details[data-wa-detail]').forEach(el => { el.open = expanded.has(el.dataset.waDetail); });
+      body.querySelectorAll('[data-wa-reply]').forEach(el => { if (selections.has(el.dataset.waReply)) el.value = selections.get(el.dataset.waReply); });
+      if (filter) {
+        const field = [...body.querySelectorAll('[data-wa-filter]')].find(el => el.dataset.waFilter === filter);
+        field?.focus();
+        if (selection) field?.setSelectionRange(...selection);
+      }
+    }
     async function refresh(force = false) {
       if (!valid()) return;
       try {
@@ -37,9 +52,7 @@ window.therapyWhatsapp = (() => {
         const serialized = JSON.stringify(next);
         const editing = body.contains(document.activeElement) && document.activeElement.matches('input,select,textarea');
         if (force || (signature !== serialized && !editing)) {
-          const selections = new Map([...body.querySelectorAll('[data-wa-reply]')].map(el => [el.dataset.waReply,el.value]));
-          body.innerHTML = render(next);
-          body.querySelectorAll('[data-wa-reply]').forEach(el => { if (selections.has(el.dataset.waReply)) el.value = selections.get(el.dataset.waReply); });
+          paint(next);
           signature = serialized;
         }
         if (!busy && previousAppointments && previousAppointments !== JSON.stringify(next.appointments)) await options.onChanged();
@@ -63,7 +76,7 @@ window.therapyWhatsapp = (() => {
         if (kind === 'process-inbound') result = await post(options.api,'/api/process',{});
         if (preview(data)) await post(options.api,'/api/process',{});
         await refresh(true);
-        if (valid()) notice(kind === 'publish' ? `${result.offers} visit offer(s) ${preview(data) ? 'published in preview. No messages sent.' : 'queued for WhatsApp.'}` : 'Saved. Replies, attendance and weekly progress are updated.');
+        if (valid()) notice(kind === 'resolve' ? 'Request marked as resolved.' : kind === 'publish' ? `${result.offers} visit offer(s) ${preview(data) ? 'published in preview. No messages sent.' : 'queued for WhatsApp.'}` : 'Saved. Replies, attendance and weekly progress are updated.');
         if (kind !== 'resolve') await options.onChanged();
       } catch (error) { if (valid()) notice(error.message, true); }
       finally {
@@ -83,7 +96,7 @@ window.therapyWhatsapp = (() => {
       }, 5000);
     }
     refresh(true).then(poll);
-    return {refresh:() => !busy && refresh(true), stop:() => clearTimeout(timer)};
+    return {refresh:() => !busy && refresh(true), redraw:() => { if (data && !busy) paint(data); }, stop:() => clearTimeout(timer)};
   }
 
   let drawerController = null, operationsController = null, operationsDate = null;
@@ -101,16 +114,55 @@ window.therapyWhatsapp = (() => {
     }, () => Boolean(root.closest('.drawer.open')), () => item.date, notice);
   }
 
-  function operationsBody(data) {
-    const drafts = data.appointments.filter(a => a.status === 'PROPOSED');
-    const publish = action(preview(data) ? 'Publish proposed visits in preview' : 'Publish proposed WhatsApp offers','publish','',!drafts.length || drafts.some(a => !ready(data,a.patient)));
-    const unread = data.inbox.filter(i => !i.resolved).length;
-    const explanation = data.sending_paused ? 'WhatsApp sending is paused for configuration repair. Received replies continue processing; saved offers remain queued.' : data.messaging_paused ? 'Messaging is OFF. Saved offers remain queued; existing delivery history is preserved.' : preview(data)
-      ? (data.workspace === 'main' && !data.allow_simulation ? 'Preview mode queues offers without sending messages. Use the test workspace for simulated parent replies.' : 'Publishing and simulated replies exercise the test queue without sending WhatsApp messages.')
-      : 'Ready parents receive their offers. In session mode, other offers wait for a parent message to open the contact window. Delivery receipts never confirm attendance.';
-    const resumeSending = data.sending_paused ? `<p class="wa-error">WhatsApp sending paused. Fix the credentials or template configuration before resuming.</p>${action('Resume after configuration fix','resume-sending')}` : '';
-    const processInbound = data.messaging_paused ? action('Process received replies','process-inbound') : '';
-    return `<p class="wa-mode">${esc(data.mode)}</p><p class="wa-explanation">${esc(explanation)}</p><div class="wa-actions">${publish}${processInbound}</div>${resumeSending}<h3>Visits & attendance</h3>${table(['Child','Therapy / time','Appointment','Action'],data.appointments.map(a => [esc(a.patient),`${esc(a.therapy)}<small>${esc(a.time)}</small>`,esc(label(a.status)),appointmentActions(a,data)]))}<h3>Offers, delivery & parent replies</h3><div class="wa-offers">${data.offers.map(o => offerCard(o,data,'operations')).join('') || '<p class="fine-print">Publish a proposed visit to create an offer.</p>'}</div><h3>Help & staff inbox <span class="soft-pill">${unread} open</span></h3><p class="fine-print">Help and reschedule requests retain the booking until staff act. This inbox includes all ${data.workspace === 'main' ? 'operations' : 'test'} dates.</p>${data.inbox.map(i => `<article class="wa-inbox"><strong>${esc(i.patient || 'Unmatched message')} · ${esc(i.reason)}</strong><p>${esc(i.text)}</p>${i.resolved ? '<span class="soft-pill">Resolved</span>' : action('Mark resolved','resolve',`data-id="${i.id}"`)}</article>`).join('') || '<p class="fine-print">No staff requests.</p>'}<h3>Unsubscribed families <span class="soft-pill">${(data.unsubscribed || []).length}</span></h3><p class="fine-print">These parents replied "unsubscribe". They get no offers or reminders until they reply "subscribe". Contact them another way.</p>${table(['Phone','Children','Since'],(data.unsubscribed || []).map(u => [esc(u.phone),esc((u.patients || []).join(', ') || 'Not matched'),esc(u.since ? new Date(u.since).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'}) + ' IST' : '')]))}<details class="wa-detail"><summary>Queue & delivery history</summary>${table(['Job','Type','State','Delivery / issue'],data.jobs.map(j => [esc(j.id),esc(j.kind),esc(label(j.status)),esc([j.delivery, j.error, j.next_attempt_at ? `Next retry: ${new Date(j.next_attempt_at).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} IST` : '', j.accepted_at ? `Accepted: ${new Date(j.accepted_at).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} IST` : ''].filter(Boolean).join(' · ') || 'Not reported')]))}</details><details class="wa-detail"><summary>Weekly therapy progress</summary>${table(['Child','Therapy','Target','Completed','Booked','Remaining'],data.progress.map(p => [p.patient,p.therapy,p.target,p.completed,p.booked,p.remaining].map(esc)))}</details>`;
+  let replyPage = 1;
+  let attentionPage = 1, attentionQuery = '', attentionType = 'all', replyQuery = '';
+  function operationsBody(data, patients = []) {
+    const names = new Map(patients.map(p => [p.code, p.name]));
+    const patient = code => `<strong>${esc(names.get(code) || code || 'Unmatched message')}</strong>${names.has(code) ? `<small>${esc(code)}</small>` : ''}`;
+    const matchesPatient = (code, query) => `${code || ''} ${names.get(code) || ''}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase());
+    // Thanal's message has Yes/No buttons only, so typed Help/Reschedule requests sit in "Other requests".
+    const kind = item => /whatsapp|deliver|unmatched message/i.test(item.reason) ? 'messages' : 'other';
+    const inbox = data.inbox.filter(item => !item.resolved && matchesPatient(item.patient, attentionQuery) && (attentionType === 'all' || kind(item) === attentionType));
+    const issues = data.offers.filter(o => matchesPatient(o.patient, attentionQuery) && ['all','messages'].includes(attentionType) && !['CLOSED','DECLINED'].includes(o.state) &&
+      (['FAILED','UNKNOWN','NEEDS_ATTENTION','BLOCKED','WAITING_FOR_CONTACT'].includes(o.send_status) || o.delivery === 'failed'));
+    const attention = inbox.map(item => `<article class="wa-followup-item"><div>${patient(item.patient)}<p>${esc(item.reason)}</p><details class="wa-detail" data-wa-detail="inbox-${item.id}"><summary>View details</summary><p>${esc(item.text)}</p></details></div>${action('Mark resolved','resolve',`data-id="${item.id}"`)}</article>`);
+    attention.push(...issues.map(o => `<article class="wa-followup-item"><div>${patient(o.patient)}<p>${esc(o.send_status === 'WAITING_FOR_CONTACT' ? 'Parent needs to message first' : o.send_status === 'UNKNOWN' ? 'Message delivery needs checking' : 'Message could not be delivered')}</p><details class="wa-detail" data-wa-detail="issue-${esc(o.token)}"><summary>View details</summary>${offerCard(o,data,'followup')}</details></div></article>`));
+    const unsubscribed = (data.unsubscribed || []).filter(u => !attentionQuery.trim() || (u.patients || []).some(code => matchesPatient(code, attentionQuery)));
+    if (unsubscribed.length && ['all','unsubscribed'].includes(attentionType)) attention.push(`<article class="wa-followup-item"><div><strong>${unsubscribed.length} unsubscribed ${unsubscribed.length === 1 ? 'family' : 'families'}</strong><p>Contact these families another way.</p><details class="wa-detail" data-wa-detail="unsubscribed"><summary>View details</summary>${table(['Family','Phone'],unsubscribed.map(u => [esc((u.patients || []).join(', ') || 'Not matched'),esc(u.phone)]))}</details></div></article>`);
+    if (data.sending_paused && !attentionQuery.trim() && ['all','messages'].includes(attentionType)) attention.unshift('<article class="wa-followup-item"><div><strong>WhatsApp sending needs a configuration fix</strong><p>Messages are paused. Check the connection before resuming in View details below.</p></div></article>');
+    const replyLabel = o => {
+      if (o.last_reply === 'YES') return 'Yes';
+      if (['NO','VISIT','DAY'].includes(o.last_reply)) return 'No';
+      if (o.last_reply === 'HELP') return 'Help requested';
+      if (o.last_reply === 'RESCHEDULE') return 'Reschedule requested';
+      if (o.state === 'DECLINED') return 'Declined';
+      if (o.assumed_accepted && o.state === 'CONFIRMED') return 'Confirmed without a reply';
+      if (o.state === 'CLOSED') return 'Offer withdrawn';
+      if (o.state === 'EXPIRED') return 'No reply before deadline';
+      if (['FAILED','BLOCKED','NEEDS_ATTENTION','UNSUBSCRIBED'].includes(o.send_status) || o.delivery === 'failed') return 'Not delivered';
+      if (o.send_status === 'UNKNOWN') return 'Delivery unknown';
+      if (o.send_status !== 'SENT' && !(preview(data) && o.send_status === 'SIMULATED')) return 'Not sent yet';
+      return 'Awaiting reply';
+    };
+    const offers = [...data.offers].reverse().filter(o => matchesPatient(o.patient, replyQuery));
+    const pageCount = Math.max(1, Math.ceil(offers.length / 10));
+    replyPage = Math.min(replyPage, pageCount);
+    const selected = offers.slice((replyPage - 1) * 10, replyPage * 10);
+    const replyRows = selected.map(o => {
+      const items = data.appointments.filter(a => o.appointment_ids.includes(a.id));
+      const times = [...new Set(items.map(a => a.time))].join(', ') || 'Time unavailable';
+      const therapies = [...new Set(items.map(a => a.therapy))].join(', ');
+      const text = replyLabel(o);
+      const tone = ['No','Declined'].includes(text) ? 'wa-reply-no' : text === 'Yes' ? 'wa-reply-yes' : '';
+      return [patient(o.patient),`${esc(times)}<small>${esc(therapies)}</small>`,`<span class="${tone}">${esc(text)}</span>`, `<details class="wa-reply-detail" data-wa-detail="reply-${esc(o.token)}"><summary>View details</summary>${offerCard(o,data,'reply')}</details>`];
+    });
+    const attentionPages = Math.max(1, Math.ceil(attention.length / 5));
+    attentionPage = Math.min(attentionPage, attentionPages);
+    const filterField = (key, title, value) => `<label>${title}<input type="search" data-wa-filter="${key}" placeholder="Search patient name or ID" value="${esc(value)}" maxlength="254" autocomplete="off"></label>`;
+    const pagination = (page, pages, key, count) => pages > 1 ? `<div class="wa-reply-pagination"><span>Page ${page} of ${pages} · ${count} items</span><button type="button" class="secondary-button compact-button" data-wa-${key}-page="${page-1}" ${page === 1 ? 'disabled' : ''}>Previous</button><button type="button" class="secondary-button compact-button" data-wa-${key}-page="${page+1}" ${page === pages ? 'disabled' : ''}>Next</button></div>` : '';
+    return `<section class="wa-followup-section" aria-labelledby="waAttentionTitle"><div class="wa-section-heading"><h3 id="waAttentionTitle">Needs attention</h3><span class="soft-pill">${attention.length}</span></div><p class="fine-print">Open requests across all dates, plus delivery issues for the selected day.</p>${data.messaging_paused || preview(data) ? '<p class="wa-followup-mode">WhatsApp is off. Saved offers remain queued.</p>' : ''}<div class="wa-followup-filters">${filterField('attentionQuery','Patient name or ID',attentionQuery)}<label>Request type<select data-wa-filter="attentionType">${[['all','All requests'],['messages','Message issues'],['unsubscribed','Unsubscribed'],['other','Other requests']].map(([value,title]) => `<option value="${value}" ${attentionType === value ? 'selected' : ''}>${title}</option>`).join('')}</select></label></div>${attention.slice((attentionPage-1)*5,attentionPage*5).join('') || `<p class="wa-followup-empty">${attentionQuery.trim() || attentionType !== 'all' ? 'No items match these filters.' : 'Nothing needs your attention.'}</p>`}${pagination(attentionPage,attentionPages,'attention',attention.length)}</section>
+      <section class="wa-followup-section" aria-labelledby="waRepliesTitle"><div class="wa-section-heading"><h3 id="waRepliesTitle">Parent replies</h3><span class="soft-pill">${offers.length}</span></div><div class="wa-followup-filters">${filterField('replyQuery','Patient name or ID',replyQuery)}</div>${offers.length ? table(['Patient','Appointment time','Reply',''],replyRows,'wa-replies-table') : `<p class="wa-followup-empty">${replyQuery.trim() ? 'No replies match this patient name or ID.' : 'No parent replies or offers for this date.'}</p>`}${pagination(replyPage,pageCount,'reply',offers.length)}</section>
+      <details class="wa-detail wa-followup-details" data-wa-detail="history"><summary>View details</summary><h4>Message history</h4>${table(['Type','Status','Delivery / issue'],data.jobs.map(j => [esc(label(j.kind)),esc(label(j.status)),esc(j.error || j.delivery || 'Not reported')]))}<h4>Resolved requests</h4>${data.inbox.filter(i => i.resolved).map(i => `<p>${esc(i.patient || 'Unmatched message')} · ${esc(i.reason)}</p>`).join('') || '<p class="fine-print">No resolved requests.</p>'}${data.messaging_paused ? action('Process received replies','process-inbound') : ''}${data.sending_paused ? action('Resume after configuration fix','resume-sending') : ''}</details>`;
   }
 
   function mountOperations(options) {
@@ -118,35 +170,38 @@ window.therapyWhatsapp = (() => {
     operationsDate = operationsDate || options.date;
     const panel = document.createElement('section');
     panel.className = 'panel wa-panel';
-    panel.innerHTML = '<div class="panel-header"><div><h2>WhatsApp & attendance</h2><p>Publish visits, follow replies, and handle staff requests.</p></div></div><div class="panel-body"><div class="wa-toolbar"><label>WhatsApp planning date<input type="date" class="wa-date"></label><button class="secondary-button" type="button" data-wa-refresh>Refresh WhatsApp status</button></div><p class="wa-notice" role="status"></p><div class="wa-body">Loading WhatsApp status…</div></div>';
+    panel.innerHTML = '<div class="panel-header"><div><h2 class="wa-title"><svg aria-hidden="true"><use href="#i-whatsapp"/></svg>WhatsApp replies & follow-ups</h2><p>Check parent replies and handle items that need attention.</p></div></div><div class="panel-body"><div class="wa-toolbar"><label>Appointment date<input type="date" class="wa-date"></label><button class="secondary-button compact-button" type="button" data-wa-refresh>Refresh</button></div><p class="wa-notice" role="status"></p><div class="wa-body">Loading replies…</div></div>';
     options.root.querySelector('#operations-panel-whatsapp').append(panel);
     const date = panel.querySelector('.wa-date');
     date.value = operationsDate;
     const notice = (message,error=false) => { const el = panel.querySelector('.wa-notice'); el.textContent = message; el.classList.toggle('wa-error',error); };
-    operationsController = controller(panel.querySelector('.wa-body'),options,operationsBody,() => options.root.classList.contains('active'),() => date.value,notice);
-    date.onchange = () => { if (date.value) { operationsDate = date.value; operationsController.refresh(); } };
+    operationsController = controller(panel.querySelector('.wa-body'),options,data => operationsBody(data,options.patients),() => options.root.classList.contains('active'),() => date.value,notice);
+    panel.querySelector('.wa-body').addEventListener('click', event => {
+      const button = event.target.closest('[data-wa-reply-page], [data-wa-attention-page]');
+      if (button && !button.disabled) {
+        if (button.hasAttribute('data-wa-attention-page')) attentionPage = Number(button.dataset.waAttentionPage);
+        else replyPage = Number(button.dataset.waReplyPage);
+        operationsController.redraw();
+      }
+    });
+    const updateFilter = event => {
+      if (event.isComposing) return;
+      const field = event.target;
+      if (field.dataset.waFilter === 'attentionQuery') { attentionQuery = field.value; attentionPage = 1; }
+      else if (field.dataset.waFilter === 'attentionType') { attentionType = field.value; attentionPage = 1; }
+      else if (field.dataset.waFilter === 'replyQuery') { replyQuery = field.value; replyPage = 1; }
+      else return;
+      operationsController.redraw();
+    };
+    panel.querySelector('.wa-body').addEventListener('input', event => { if (event.target.tagName === 'INPUT') updateFilter(event); });
+    panel.querySelector('.wa-body').addEventListener('change', event => { if (event.target.tagName === 'SELECT') updateFilter(event); });
+    date.onchange = () => { if (date.value) { operationsDate = date.value; replyPage = 1; attentionPage = 1; operationsController.refresh(); } };
     panel.querySelector('[data-wa-refresh]').onclick = () => operationsController.refresh();
   }
 
   function mountCalendar(options) {
-    let button = options.root.querySelector('[data-wa-open]');
-    if (!button) {
-      button = document.createElement('button');
-      button.className = 'secondary-button'; button.dataset.waOpen = 'true';
-      button.textContent = 'WhatsApp offers'; options.root.prepend(button);
-    }
-    button.onclick = () => {
-      operationsDate = options.date;
-      options.onOpen();
-    };
-    let push = options.root.querySelector('[data-zoho-open]');
-    if (!push) {
-      push = document.createElement('button');
-      push.type = 'button'; push.className = 'secondary-button';
-      push.dataset.zohoOpen = 'true'; push.textContent = 'Push to Zoho';
-      button.after(push);
-    }
-    push.onclick = () => openZohoExport(options, push);
+    // Offers and Zoho exports are handled by the scheduled jobs.
+    options.root.querySelectorAll('[data-wa-open], [data-zoho-open]').forEach(button => button.remove());
   }
 
   function openZohoExport(options, opener) {

@@ -182,14 +182,19 @@ def test_changed_names_and_modified_time_update_without_duplicates(reports, sour
         assert session.scalar(select(Patient.name).where(Patient.patient_code == "TEST-H")) == "Fictional Child H Updated"
 
 
-def test_consultant_deactivation_with_bookings_needs_review(reports, source_flow):
+def test_zoho_status_does_not_override_staff_owned_consultant_status(reports, source_flow):
     apply_reports(source_flow, reports, date(2026, 10, 22))
     source_flow.generate(date(2026, 10, 23))
+
+    def active_codes():
+        with source_flow.sessions() as session:
+            return set(session.scalars(select(Therapist.therapist_code).where(
+                Therapist.therapist_code.like("ZC-%"), Therapist.active.is_(True))))
+
+    before = active_codes()
     reports["All_Consultants"][0]["Status"] = "Inactive"
     apply_reports(source_flow, reports, date(2026, 10, 22))
-    with source_flow.sessions() as session:
-        assert session.scalar(select(func.count(Therapist.id)).where(
-            Therapist.therapist_code.like("ZC-%"), Therapist.active.is_(True))) == 1
+    assert active_codes() == before
 
 
 def test_sunday_draft_target_is_skipped(reports, source_flow, monkeypatch):

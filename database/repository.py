@@ -42,6 +42,35 @@ def off_plan_appointment_ids() -> Select[tuple[int]]:
     )
 
 
+WEEKS_PER_MONTH = 4  # User decision (12 Nov 2026): 1 month = 4 Monday–Saturday weeks.
+
+
+def course_target(sessions_per_week: int | None, duration_months: int | None) -> int | None:
+    """Total sessions a prescription needs; None keeps legacy weekly-only behaviour."""
+    if not sessions_per_week or not duration_months or sessions_per_week < 0 or duration_months < 0:
+        return None
+    return sessions_per_week * duration_months * WEEKS_PER_MONTH
+
+
+def course_session_counts(session, requirement_ids, *, exclude: tuple[date, date] | None = None) -> Counter:
+    """Count saved sessions toward each course: booked or done, never cancelled/declined/no-show.
+
+    A saved session counts as attended unless it is later cancelled, declined or
+    marked no-show, which drops it from this count again (user decision).
+    """
+    ids = list(requirement_ids)
+    if not ids:
+        return Counter()
+    query = select(Appointment.treatment_requirement_id).where(
+        Appointment.treatment_requirement_id.in_(ids),
+        Appointment.status.in_(ACTIVE_SCHEDULE_STATUSES),
+        Appointment.id.notin_(off_plan_appointment_ids()),
+    )
+    if exclude is not None:
+        query = query.where(or_(Appointment.date < exclude[0], Appointment.date > exclude[1]))
+    return Counter(session.scalars(query))
+
+
 def _plan_end_date(start_date: date | None, duration_months: int | None) -> date | None:
     """Return the final active date for a calendar-month therapy plan."""
     if start_date is None or duration_months is None:
@@ -61,7 +90,18 @@ def load_scheduling_problem(
     planning_start_date: date | None = None,
     carryover_by_requirement: dict[int, int] | None = None,
     priority_requirement_ids: set[int] | None = None,
+    planned_elsewhere: dict[int, int] | None = None,
 ):
+    """Load one planning window.
+
+    A prescription with a duration is a fixed course of ``course_target``
+    sessions: each week asks for at most the weekly frequency, but never more
+    than the course still needs once sessions saved outside this window (and
+    ``planned_elsewhere``, unsaved sessions from earlier preview weeks) are
+    counted. The calendar end date no longer stops a course; reaching the
+    target does. Missed sessions are made up by finishing later, not by
+    raising the weekly frequency.
+    """
     week_end = week_start + timedelta(days=horizon_days - 1)
     retained_ids = select(Appointment.treatment_requirement_id).where(
         Appointment.date >= week_start, Appointment.date <= week_end,
@@ -78,7 +118,23 @@ def load_scheduling_problem(
         ))
     ))
     carryover_by_requirement = carryover_by_requirement or {}
+    planned_elsewhere = planned_elsewhere or {}
     therapists = {item.id: item for item in session.scalars(select(Therapist))}
+    targets = {item.id: course_target(item.sessions_per_week, item.duration_months)
+               for item, eligible in requirements if eligible}
+    counted_outside = course_session_counts(
+        session, [identifier for identifier, target in targets.items() if target is not None],
+        exclude=(week_start, week_end))
+
+    def weekly_demand(item, eligible: bool) -> int:
+        if not eligible:
+            return 0
+        target = targets.get(item.id)
+        if target is None:
+            return item.sessions_per_week + carryover_by_requirement.get(item.id, 0)
+        outstanding = target - counted_outside[item.id] - planned_elsewhere.get(item.id, 0)
+        return max(0, min(item.sessions_per_week, outstanding))
+
     inputs = [
         RequirementInput(
             id=item.id,
@@ -86,12 +142,12 @@ def load_scheduling_problem(
             department_id=item.department_id,
             therapist_id=item.assigned_therapist_id,
             location_id=item.location_id or therapists[item.assigned_therapist_id].location_id,
-            sessions_per_week=(
-                item.sessions_per_week + carryover_by_requirement.get(item.id, 0) if eligible else 0
-            ),
+            sessions_per_week=weekly_demand(item, eligible),
             sequence_order=item.sequence_order,
             plan_start_date=item.plan_start_date,
-            plan_end_date=_plan_end_date(item.plan_start_date, item.duration_months),
+            plan_end_date=(None if targets.get(item.id) is not None
+                           else _plan_end_date(item.plan_start_date, item.duration_months)),
+            course_target=targets.get(item.id),
         )
         for item, eligible in requirements
     ]
@@ -244,7 +300,10 @@ def load_daily_scheduling_problem(session, target: date) -> SchedulingProblem:
         ):
             continue
         shortfall = requirement.sessions_per_week - previous_bookings[requirement.id]
-        if shortfall > 0:
+        if shortfall > 0 and requirement.course_target is not None:
+            # A course finishes later instead of doubling up; it only gains priority.
+            problem.priority_requirement_ids.add(requirement.id)
+        elif shortfall > 0:
             problem.requirements[index] = replace(
                 requirement, sessions_per_week=requirement.sessions_per_week + shortfall,
             )
@@ -260,11 +319,59 @@ def record_daily_planning_start(session, target: date) -> None:
 
 def limit_new_bookings_to_day(problem: SchedulingProblem, target: date) -> None:
     """Keep weekly accounting and allow new placements only on the target day."""
+    hold_for_picked_days(problem, target)
     problem.new_booking_slots = {
         (requirement.therapist_id, requirement.department_id, requirement.location_id, target, slot.slot_index)
         for requirement in problem.requirements
         for slot in SLOTS
     }
+
+
+# Matches web_app.PREFERRED_DAY_BONUS: only staff-picked days score above a plain time preference.
+PICKED_DAY_MIN_SCORE = 300
+
+
+def hold_for_picked_days(problem: SchedulingProblem, target: date) -> set[int]:
+    """Do not book a child on a day staff did not pick while their remaining picked days
+    this week can still hold every remaining visit. Returns the held patient IDs.
+
+    Visits a week = the child's most frequent therapy; unpicked visits ("up to N" days)
+    still go on any day, so a child is never held past what the week can absorb.
+    """
+    picked: dict[int, set[int]] = {}
+    for (patient_id, weekday, _slot), score in getattr(problem, "patient_preferences", {}).items():
+        if score >= PICKED_DAY_MIN_SCORE:
+            picked.setdefault(patient_id, set()).add(weekday)
+    if not picked:
+        return set()
+    weekday = target.weekday()
+    week_start = target - timedelta(days=weekday)
+    week_end = week_start + timedelta(days=6)
+    visits: Counter[int] = Counter()
+    for requirement in problem.requirements:
+        visits[requirement.patient_id] = max(visits[requirement.patient_id], requirement.sessions_per_week)
+    booked_days: dict[int, set[date]] = {}
+    for item in problem.pinned:
+        if item.counts_toward_requirement and week_start <= item.date < week_end:
+            booked_days.setdefault(item.patient_id, set()).add(item.date)
+    held = set()
+    for patient_id, days in picked.items():
+        if weekday in days:
+            continue
+        booked = booked_days.get(patient_id, set())
+        remaining = visits[patient_id] - len(booked)
+        later_picked = sum(1 for day in days if day > weekday and week_start + timedelta(days=day) not in booked)
+        if 0 < remaining <= later_picked:
+            held.add(patient_id)
+    if held:
+        pinned_counts = Counter(item.requirement_id for item in problem.pinned if item.counts_toward_requirement
+                                and week_start <= item.date < week_end)
+        problem.requirements = [
+            replace(requirement, sessions_per_week=pinned_counts[requirement.id])
+            if requirement.patient_id in held else requirement
+            for requirement in problem.requirements
+        ]
+    return held
 
 
 def save_proposed_schedule(session, result, week_start: date, horizon_days: int = 6):

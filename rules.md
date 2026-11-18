@@ -1,5 +1,225 @@
 # Therapy Scheduler Rules
 
+## Exact preferred start time — 16 November 2026
+
+User decision: "preffered time, should have all the time slots ! … suppose patient
+a preferes 9.40 … then our system should try to schedule that patient in that
+time", agreed as: the time is when the visit starts, "No priority" day means every
+day, and it stays a wish, not a rule.
+
+- **Implemented.** Preferred time offers the 10 slot start times (9:00 AM–4:10
+  PM); since the same day several can be picked (see below).
+- The preferred time is the visit's **start** time: the scheduler rewards a visit
+  by the slot it starts in, and the visit's other therapies follow straight after
+  (R-02). This applies to Morning/Afternoon too (a visit starting in the band).
+- With an exact time, the chosen slot scores 100 and each slot away from it 20
+  less, so the nearest free start time is preferred when the chosen one is taken.
+- With no preferred day picked, a chosen time applies on every working day; with
+  picked days it applies on those days (see "Several preferred days" below).
+  Clearing both removes the preference.
+- It remains a soft preference (R-22): it never costs a child a session and ranks
+  below meeting the weekly plan, catch-ups and even spacing (R-15).
+- Tests: `tests/test_web_app.py` (exact time every day, nearest-slot scores),
+  `tests/test_scheduler.py` (visit starts at the preferred time).
+
+## Several preferred days and start times — 16 November 2026
+
+User decisions: "if 3 sessions are there … theyll have to come 3 times a week …
+we should be able to provide which those 3 days are (preffered days) … for each -
+it should be dynamic"; **picked days win over even spacing**; then "they could
+select multiple preferences … 1 pm, 2pm , 3pm etc.. Multiple select should be
+enabled … Similiarly for days Monday, tuesday , wed, thursday or whatever!" —
+so any number of days and any number of start times (this replaced the earlier
+"up to the visits a week" limit the same day).
+
+- **Implemented.** The patient drawer has Mon–Sat day buttons and the 10 start
+  time buttons, all multi-select, with Morning / Afternoon / Clear shortcuts for
+  the times. It shows the child's visits a week for reference (the most frequent
+  active therapy: 3 + 2 sessions/week → 3 visits; 2 + 1 → 2).
+- Times: a chosen start slot scores 100; other slots score 20 less per slot from
+  the nearest chosen one, so the nearest free time is used when all are taken.
+  Saved as `patients.preferred_time = "slots:5,6,7"`; older "Morning",
+  "Afternoon" and "09:40" values are still read.
+- Picked days without times mean any time on those days; times without days
+  apply every day. Nothing picked = no preference.
+- Weekly planning: every slot of a picked day scores a day bonus (300 + the time
+  score, ×100 reward = 30,000+ per visit), which outweighs uneven spacing (5,000
+  per day of deviation, R-15) but stays below meeting the weekly plan.
+- Daily planning (tomorrow only; Thanal nightly job and browser generator): a
+  child is **not booked on a day staff did not pick while their remaining picked
+  days this week can still hold every remaining visit**. When fewer days than
+  visits are picked, the extra visits are booked on any day as before. If a picked day is full, the child is booked
+  on the following days as soon as the remaining picked days can no longer hold
+  the remaining visits; a full **last** picked day of the week can leave that
+  visit unbooked that week, as with any full day.
+- Older single-day preferences (no day bonus) are not held; they keep the R-22
+  soft preference until staff re-save them.
+- Tests: `tests/test_web_app.py` (several days and times, more days than visits,
+  labels, older formats), `tests/test_scheduler.py` (several start times),
+  `tests/test_preferred_days.py` (picked days beat even spacing; daily hold,
+  release when fewer days than visits, full picked day, booking on a picked day).
+
+## Refresh from Zoho on the Clinical team page — 16 November 2026
+
+User request: "add that zoho refresh button in clinicians tab also".
+
+- **Implemented.** The Clinical team page (workflow app) has the same Refresh from
+  Zoho button as Patients. It runs the same full import (`/api/zoho/refresh`),
+  shares the same one-at-a-time, 5-minute cool-down and 23:45–00:30 IST block,
+  and reloads the clinician list when done. New clinicians start with their Zoho
+  status; existing clinicians keep the status set in our app. Sends no messages.
+
+## Clinician Active/Inactive is set in our app — 16 November 2026
+
+User decision: "I want to be able to click status , and make them active and
+inactive just like patients tab - like if active they will be taken , if not they
+wont be - also keep the existing active as active , and existing inactive as
+inactive … this should be done in our thing itself, and backend will handle it !"
+
+- **Implemented.** On the Clinical team page, staff click a clinician's status to
+  mark them Active or Inactive, using the same confirmation as the Patients page.
+  Marking inactive needs a reason (1–1,000 characters); both changes are saved
+  with an audit record (`therapist_status_changed`). Endpoint:
+  `POST /api/therapists/<id>/status`; admin accounts only (doctor accounts stay
+  limited to their own sessions).
+- Active clinicians are used when new sessions are generated; inactive clinicians
+  get no new sessions (rules R-04 and S-05 unchanged). Visits already booked for a
+  clinician marked inactive stay on the calendar for staff review, as in the
+  existing consultant-inactive rule; the toast says how many upcoming visits remain.
+- Our app owns each existing clinician's status. The nightly Zoho syncs (Thanal
+  consultant import and the Zoho test import) no longer change it; Zoho's status
+  is used only when a clinician is first imported. Existing statuses were kept as
+  they were.
+- A patient cannot be marked active while their current plan names a clinician
+  who is inactive in our app; the Mark active check names the therapy and
+  clinician and is evaluated live, not from the nightly Zoho snapshot.
+- Marking a clinician active raises their centre's stored ceiling to at least the
+  active clinician count (S-03). The ceiling is never lowered, so kept bookings
+  cannot make a centre unplannable.
+- Tests: `tests/test_therapist_status.py`, `tests/test_thanal_consultant_import.py`,
+  `tests/test_thanal_daily_sync.py`, `tests/test_flow_test_zoho.py`.
+
+## Push planned visits while parent messaging is off — 15 November 2026
+
+User decision (15 November 2026): while WhatsApp messaging to parents is switched
+off, the Zoho push sends every planned visit as **Scheduled**, starting with the
+already-planned 13 and 14 November 2026 (pushed once, by hand) and then every day
+through the normal 23:00 push.
+
+- Controlled by the operator switch `MAIN_WORKFLOW_PUSH_UNSENT_AS_SCHEDULED=true`
+  (default off). It never applies when live messaging is on
+  (`MAIN_WORKFLOW_LIVE=true`); turn it off at the WhatsApp cutover.
+- At push time, a target-day visit still **waiting for confirmation** becomes
+  Confirmed (audit `flow_assumed_yes_unsent`) when its parent was never messaged
+  and never replied, and the child is active. Visits whose offer was actually sent
+  keep the existing rule (unanswered sent offers are assumed accepted at 23:00).
+- The preview (dry run) only counts them and changes nothing.
+- Cancelled and needs-rescheduling visits are unchanged: a visit released before
+  its first push is never sent; one released after is updated to Cancelled.
+- Automatic schedule (IST): 23:00 pushes tomorrow, 07:00 re-pushes today's late
+  changes (`thanalpush`, `thanalrepush`).
+
+Implemented in `flow_test/zoho_export.py` (`push_unsent_enabled`,
+`_finalise_unsent`); covered by `tests/test_main_workflow.py`
+(`test_push_switch_*`).
+
+### Push into the trial form only, skipping Zoho workflows — 16 November 2026
+
+User decision (16 November 2026): "Nothing should be pushed anywhere else, only
+push in trail one !, skip workflow or whatever idc". Thanal's form workflow on
+`Schedule_Adhoc_Trial` refused 185 of 225 rows for 13 November because staff had
+already booked those doctors in the main schedule (`All_Schedules`), and on
+success it creates session records in other reports.
+
+- Operator switch `MAIN_WORKFLOW_ZOHO_SKIP_WORKFLOW=true` (default off) sends
+  `skip_workflow: ["form_workflow", "schedules"]` on every create and update.
+- It applies only to Thanal's `thanal/eic` trial form and report; any other
+  target is written with workflows as before.
+- Effect: rows land in the trial form only; Zoho's overlap check and its
+  session-creating workflow do not run for them.
+
+Implemented in `flow_test/zoho_push.py` (`workflow_options`); covered by
+`tests/test_thanal_export.py`
+(`test_skip_workflow_switch_only_applies_to_thanal_trial_form`).
+
+## Therapy courses end at a session total — 12 November 2026
+
+User decisions (12 November 2026):
+
+- A prescription with a frequency and a duration is a **course** of
+  `sessions/week × months × 4` sessions (1 month = 4 Monday–Saturday weeks).
+  Example: 2/week for 2 months = 16 sessions.
+- **A course ends when its total is reached, not on a calendar date.** If two
+  months pass at 4/16, scheduling continues until 16/16. The plan's calendar end
+  date no longer blocks bookings for a course (it still does for legacy plans
+  with no duration).
+- **Counting:** every saved session (proposed, pending, confirmed or completed)
+  counts as attended. A parent Yes or no reply keeps it. A cancellation, a parent
+  No or a recorded no-show removes it again, so 6/16 becomes 5/16 and one more
+  session is booked later. Off-plan manual reservations never count.
+- **Pace:** each week still asks for at most the prescribed weekly frequency.
+  Missed sessions are made up by finishing later, never by doubling up. For a
+  course, the previous-week shortfall rule (R-23) now only gives priority; it no
+  longer raises the weekly number. Legacy plans without a duration keep R-23 as is.
+  In the last week the request is only what is still owed (e.g. 15/16 asks for 1).
+- **Start:** everyone starts at 0 from the first session the app saves. Sessions
+  before go-live are not counted.
+- **New plan = new course:** a new Zoho plan record creates new requirements, so
+  the count starts again at 0. Editing the same Zoho record does not reset it.
+- **At the total** the therapy gets no new bookings. A manual reservation for it
+  shows the warning "This therapy course already has all N sessions booked or done".
+- **Patient side panel only** (not the Patients list): each therapy shows "6/16 sessions" (or "· complete"); the
+  label says sessions, not completed, because upcoming saved sessions are included.
+- **Repeated cancellations:** when a child's last 4 sessions in a row were
+  cancelled, declined (parent No / patient absence) or no-show, the Patients tab
+  and the patient panel show "4 cancelled in a row" for staff to follow up. A
+  doctor's absence or system housekeeping (a replaced proposal, a child made
+  inactive) does not count. The warning clears once a session that has taken
+  place (today or earlier) was not cancelled; upcoming bookings do not clear it.
+
+Implemented in `database/repository.py` (`course_target`,
+`course_session_counts`, `load_scheduling_problem`, `load_daily_scheduling_problem`),
+`services/rolling_schedule_service.py`, `services/admin_reservation_service.py`,
+`services/course_progress.py`, `web_app.py`, `web/app.js` and `web/styles.css`.
+Covered by `tests/test_course_progress.py`.
+
+## Staff calendar cancellation — 12 November 2026
+
+- Staff can cancel **This session** or **Entire visit** from a saved proposed,
+  pending or confirmed appointment. A visit means the same patient/date/bundle;
+  another visit or day is unaffected. A reason is required. Completed therapy or
+  another terminal status rejects the selected operation without partial changes.
+- Cancelled rows remain as `CANCELLED_PATIENT` for history, preserving their IDs,
+  prescriptions and attendance. They stop reserving resources and counting toward
+  booked weekly targets; the prescribed sessions/week does not change. Staff
+  cancellation does not record whole-day unavailability.
+- The new `/api/appointments/{id}/staff-cancel` operation commits cancellation,
+  staff/reason audit, offer closure and queue cleanup together. The shared route
+  takes the sender lock before the workflow lock. Repeated/concurrent cancellation
+  requests cannot double-decrement counts or duplicate the audit.
+- Every combined offer containing a cancelled session is closed. Its unsent offer,
+  reminder and dependent text jobs become obsolete; stale replies cannot restore
+  the appointment. Remaining pending sessions of a partially cancelled offer stay
+  booked with a staff-review warning; they are not silently confirmed or re-offered.
+- Unfilled cancelled openings stay red and clickable on the calendar but are
+  excluded from the active appointment/doctor totals. The existing suggested-patient
+  and manual-patient reservation flow opens after cancellation. Staff select and
+  confirm/offer a replacement; nothing is automatically booked or messaged. Once a
+  replacement reserves an opening, its cancelled source card is hidden.
+- Existing Zoho export rules apply: never-pushed cancelled rows are not created;
+  previously pushed rows update to Cancelled with the same Scheduler_Key on the
+  next explicit/scheduled push. Cancellation itself performs no external write.
+
+Implemented in `services/cancellation_service.py`, `flow_test/shared_ui.py`,
+`web_app.py` and `web/app.js`. Covered by `tests/test_staff_cancellation.py` and
+the staff-cancellation cases in `tests/test_thanal_export.py`. Deploy the matching
+backend and frontend together. Operational workflow requests to the older `/cancel`
+route are rejected with a refresh instruction, so an old browser cannot bypass the
+required scope/reason or queue cleanup. The separate original app's legacy handler
+is unchanged. The new UI never falls back when `/staff-cancel` is unavailable. The calendar
+advertises `staffCancellationEnabled`; the new UI disables cancellation with an
+explanation when connected to an older backend without this capability.
+
 ## Thanal appointment export — 11 November 2026
 
 The Thanal adapter exports exactly Branch, Registration, For_Parent, Date_field,
@@ -450,7 +670,8 @@ reservation tests, import/contact tests and opt-in Zoho HTTP simulation tests.
   automatic offers, and the successful sync checkpoint does not advance. Correcting
   the row and replaying the same window clears its quarantine. Ambiguous identity,
   malformed report structure and timestamp-window failures still stop the import.
-  A consultant can become inactive without erasing history or stopping the whole
+  A consultant can become inactive (set by staff in our app since 16 November
+  2026) without erasing history or stopping the whole
   import; future saved bookings require staff review and new generation excludes
   inactive consultants. Missing contacts hold the affected offers for staff,
   rather than rolling back the whole calendar save.
@@ -1087,12 +1308,12 @@ workflow. Patient scheduling status and reasons are stored internally.
 | R-14 | `Plan_Detail` is the source of demand for the active scheduler. | **Implemented** | The approved source sheets are persisted as `plan_detail`, `therapist_master`, and `specialty_master` tables. The scheduler projection is built from those tables: each valid row in a child's latest plan version creates a treatment requirement with its registration ID, therapy type, weekly frequency, assigned therapist, branch, duration, and plan start date. Exact duplicate rows and non-positive frequencies are excluded with import warnings. |
 | R-16 | Therapy and specialty names must use `Specialty_Master` canonical values. | **Implemented** | The importer validates therapy types against the master mapping and stores its canonical specialty. A differing supplied specialty is normalized and logged for review. |
 | R-17 | A patient absence or cancellation should show children who can fill the released appointment without breaking therapist continuity. | **Implemented** | Selecting a released appointment in Operations opens a dedicated **Possible replacements** drawer. Candidates need the same therapy, branch, and assigned therapist; must be available and not absent at the exact opening; and must still have an unmet weekly target. They may need other therapies too, and a child already coming that day qualifies only when the opening joins their visit. Children who can take the whole released visit are listed first, then those who can take more of it, then single sessions. Suggestions never reassign the therapist or book anyone automatically. |
-| R-22 | A patient's recurring preferred day and morning/afternoon time band must influence scheduling without preventing therapy when another available time is the only safe option. | **Implemented** | The patient preference table stores Patient ID, preferred day, and preferred morning or afternoon band. The scheduler considers all valid candidate starts and rewards the preferred day/time combination. |
-| R-23 | Give unmet weekly targets priority in the following week, without inventing pre-start history. | **Implemented** | Daily drafts add a previous Monday–Saturday shortfall only when that full week is on or after the first saved daily-run baseline. Missing pre-start history adds nothing. Saved and completed sessions count toward the target; new placements remain on the selected date. Covered by daily capacity and production regression tests. |
+| R-22 | A patient's recurring preferred day and morning/afternoon time band must influence scheduling without preventing therapy when another available time is the only safe option. | **Implemented** | The patient preference table stores Patient ID, preferred days (up to the plan's visits a week, or every day), and a morning/afternoon band or exact start time (16 November 2026); picked days are held for in daily planning (see the 16 November 2026 sections). The scheduler considers all valid candidate starts and rewards a visit by its start slot, favouring the nearest time to an exact preference. |
+| R-23 | Give unmet weekly targets priority in the following week, without inventing pre-start history. | **Implemented** | For a fixed course (12 Nov 2026) the shortfall only adds priority; the course finishes later instead (see "Therapy courses end at a session total"). Daily drafts add a previous Monday–Saturday shortfall only when that full week is on or after the first saved daily-run baseline. Missing pre-start history adds nothing. Saved and completed sessions count toward the target; new placements remain on the selected date. Covered by daily capacity and production regression tests. |
 | R-20 | Today's-session views must allow an operator to narrow the displayed appointments by branch, therapist, and patient. | **Implemented** | The dashboard filters the current day's loaded appointments in the browser and updates the displayed count. Filtering does not alter appointments or scheduling rules. |
 | R-15 | Repeated visits should have a gap wherever capacity permits. | **Implemented as a preference** | The scheduler prefers even spacing—such as Monday, Wednesday, Friday for 3× weekly—but will use consecutive or wider-gap days when that is the only way to meet weekly demand. Therapies belonging to the same visit remain continuous. |
 | R-18 | A child’s therapy must be delivered at the branch recorded on the treatment plan. | **Implemented** | The scheduler uses the `Plan_Detail` branch as the appointment location and only considers therapist capability at that branch. |
-| R-19 | A therapy plan is schedulable only from its plan start date until its stated duration ends. | **Implemented** | The scheduler rejects slots before the plan starts or after its calendar-month duration ends. Plans without a valid duration retain no expiry date and are logged during import. |
+| R-19 | A therapy plan is schedulable only from its plan start date until its stated duration ends. | **Changed 12 Nov 2026** | Courses with a duration now end at their session total, not the calendar end (see "Therapy courses end at a session total"); the calendar end below applies only to plans without a duration. The scheduler rejects slots before the plan starts or after its calendar-month duration ends. Plans without a valid duration retain no expiry date and are logged during import. |
 | R-20 | A cancellation or absence must not rearrange unrelated existing appointments. | **Implemented** | Only the affected appointment is cancelled or released for rescheduling. Replacement-child and pull-forward lists are advisory only; no other appointment is moved, cancelled, or rebooked unless an administrator explicitly makes and validates that change. |
 | R-21 | Zoho Creator appointment sync uses the `therapy-scheduler` application's single flat schedule form. | **Implemented** | Each appointment is posted only to `All_Therapy_Schedules`, including its appointment date. Patient, therapist, therapy type, branch, and therapy plan are plain-text fields, so the sync never creates or depends on separate Creator lookup records. A one-time Zoho consent stores a local refresh token so restart reconnection is automatic. Bulk exports select unsynced active appointments only, send at most 200 in one Creator request, and store a local sync record only for Creator-confirmed rows. |
 | R-22 | Creator Plan Detail imports must not overwrite the scheduler's live source data without explicit approval. | **Implemented** | A manual pull reads `Plan_Detail_Report` into PostgreSQL `zoho_plan_detail_records`, keyed by the immutable Creator record ID. Repeated pulls update only those staging rows. The live `plan_detail` source used by scheduling remains unchanged until a separately approved promotion workflow is added. |
@@ -1424,3 +1645,35 @@ and the opt-in `tests/test_zoho_http_reliability.py` Postman HTTP checks.
   blindly retried. An explicit rerun re-reads Zoho before creating or updating rows.
   Completion time advances only after every frozen row is acknowledged. Existing
   finalisation, scheduling, messaging and attendance rules remain unchanged.
+
+## Individual portal accounts (implemented; opt-in)
+
+- With `PORTAL_AUTH_ENABLED=true`, staff sign in with an admin-created email/password
+  account. Any email domain is supported; there is no public registration or SSO.
+- Admins can use all centres and portal functions, create admins and clinician-linked
+  doctors, reset passwords, activate/deactivate accounts, and read recent activity.
+  The last active admin cannot be deactivated, including concurrent account changes.
+- Doctors are view-only and can access only their own Today/Tomorrow sessions in
+  India time. The server selects the clinician from the account and checks that the
+  clinician remains active. Admin APIs, other schedules, patient directories,
+  workflow aliases and the test workspace are denied to doctors.
+- The doctor's Schedule tab shows only confirmed and pending-confirmation appointments
+  for the selected Today/Tomorrow date. Cancellations and released-for-rescheduling
+  appointments appear separately in Cancellations, so a cancelled slot does not
+  appear alongside its replacement in the active schedule. Both lists remain scoped
+  to the signed-in clinician. This changes presentation only, not appointment status,
+  course counts, or booking rules. Covered by `test_doctor_schedule_separates_cancelled_slot_from_its_replacement`.
+  A processed parent No therefore appears as "Cancelled" in the doctor's Cancellations
+  tab, while retaining the internal needs-rescheduling status. Suggested/proposed
+  replacements are excluded from the doctor's active schedule; staff must reserve or
+  publish a replacement through the main app before it appears as pending or confirmed.
+- Temporary passwords must be replaced at first sign-in. Passwords are hashed;
+  sessions expire after 12 hours. Reset, password change or account status changes
+  revoke existing sessions. Five failures per account in 15 minutes block sign-in
+  temporarily; an independent client-IP limit also applies.
+- Account changes, sign-ins and successful portal mutations are attributed to the
+  signed-in email. Account setup does not enable messaging or change clinical rules.
+- Portal login overrides legacy shared browser keys. Signed provider webhooks and
+  direct database jobs remain separate; HTTP automation requires its own machine
+  credential and cannot manage user accounts. Production rollout is explicit.
+- Covered by `tests/test_portal_auth.py`; setup and rollout are in `PORTAL_LOGIN.md`.

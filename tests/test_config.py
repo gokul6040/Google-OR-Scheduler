@@ -19,3 +19,12 @@ def test_environment_value_removes_docker_preserved_quotes(monkeypatch):
     monkeypatch.setenv("DATABASE_FROM_DOCKER", '"sqlite:////app/data/schedule.db"')
 
     assert environment_value("DATABASE_FROM_DOCKER", "fallback") == "sqlite:////app/data/schedule.db"
+
+
+def test_deployment_settings_mode_ignores_local_env_files(tmp_path, monkeypatch):
+    path = tmp_path / '.env'
+    path.write_text('UNEXPECTED_LOCAL_CREDENTIAL=another-environment\n', encoding='utf-8')
+    monkeypatch.setenv('THERAPY_SCHEDULER_LOAD_LOCAL_ENV', 'false')
+    monkeypatch.delenv('UNEXPECTED_LOCAL_CREDENTIAL', raising=False)
+    load_local_env_file(path)
+    assert 'UNEXPECTED_LOCAL_CREDENTIAL' not in os.environ

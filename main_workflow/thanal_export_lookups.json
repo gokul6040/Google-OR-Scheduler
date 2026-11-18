@@ -158,5 +158,31 @@
       "branch_id": "149769000021575634",
       "appointment_slot_number": "5"
     }
-  ]
+  ],
+  "department_names": {
+    "149769000017980558": "Clinical Psychology",
+    "149769000017980562": "Speech and Language",
+    "149769000017980566": "Physiotherapy",
+    "149769000017980570": "Occupational Therapy",
+    "149769000017980574": "Special Education",
+    "149769000017980578": "Medical",
+    "149769000134828591": "Robotic Gait"
+  },
+  "consultation_department_names": {
+    "149769000018081733": "Medical",
+    "149769000018081737": "Clinical Psychology",
+    "149769000018081741": "Speech and Language",
+    "149769000018081745": "Physiotherapy",
+    "149769000018081749": "Occupational Therapy",
+    "149769000018081753": "Special Education",
+    "149769000018081765": "Occupational Therapy",
+    "149769000018081769": "Physiotherapy",
+    "149769000018081773": "Speech and Language",
+    "149769000018081777": "Clinical Psychology",
+    "149769000018081781": "Special Education",
+    "149769000018081785": "Special Education",
+    "149769000022922766": "Developmental Therapy",
+    "149769000024399250": "Developmental Therapy",
+    "149769000195563045": "Robotic Gait"
+  }
 }

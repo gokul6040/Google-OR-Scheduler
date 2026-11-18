@@ -30,6 +30,19 @@ def flow(tmp_path, legacy_flow_scenario):
     app.engine.dispose()
 
 
+def test_state_keeps_older_unresolved_requests_visible_beyond_history_limit(flow):
+    with flow.sessions.begin() as session:
+        session.add_all(FlowInbox(event_key=f'open-backlog-{i}', patient_code='TEST-A',
+            reason='Parent requested help', text='Open request', resolved=0) for i in range(105))
+        session.flush()
+        session.add_all(FlowInbox(event_key=f'closed-history-{i}', patient_code='TEST-A',
+            reason='Handled request', text='Resolved request', resolved=1) for i in range(105))
+    inbox = flow.state(MONDAY)['inbox']
+    assert sum(not item['resolved'] for item in inbox) == 105
+    assert sum(item['resolved'] for item in inbox) == 100
+    assert any(item['text'] == 'Open request' and item['id'] == 1 for item in inbox)
+
+
 def publish(flow, target=MONDAY):
     flow.generate(target)
     flow.publish(target)

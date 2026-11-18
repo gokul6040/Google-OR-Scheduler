@@ -55,6 +55,7 @@ def generate_rolling_schedule(
         needs_by_week[week_index].add(item.treatment_requirement_id)
 
     carryover: Counter[int] = Counter()
+    unsaved: Counter[int] = Counter()  # New sessions from earlier preview weeks, by requirement.
     results: list[ScheduleResult] = []
     appointments = []
     for week_index, week_start in enumerate(week_starts):
@@ -68,6 +69,8 @@ def generate_rolling_schedule(
             planning_start_date=planning_start,
             carryover_by_requirement=dict(carryover),
             priority_requirement_ids=priority_requirements,
+            # Earlier preview weeks are unsaved; count them so a course is not over-booked.
+            planned_elsewhere=dict(unsaved),
         )
         weekly_settings = replace(
             settings,
@@ -76,6 +79,9 @@ def generate_rolling_schedule(
         result = generate_weekly_schedule(problem, mode=mode, settings=weekly_settings)
         results.append(result)
         appointments.extend(result.appointments)
+        pinned = set(getattr(problem, "pinned", ()))
+        unsaved.update(item.requirement_id for item in result.appointments
+                       if item not in pinned and item.counts_toward_requirement)
         carryover = Counter({
             item.requirement_id: item.missing_sessions
             for item in result.unmet

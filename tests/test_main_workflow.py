@@ -364,3 +364,51 @@ def test_main_oauth_token_does_not_replace_legacy_or_test_tokens(tmp_path, monke
     save_test_refresh_token(path, "new-main-dummy", key="MAIN_WORKFLOW_ZOHO_REFRESH_TOKEN")
     assert path.read_text() == ("ZOHO_CREATOR_REFRESH_TOKEN=legacy-dummy\nFLOW_TEST_ZOHO_REFRESH_TOKEN=test-dummy\n"
                                 "MAIN_WORKFLOW_ZOHO_REFRESH_TOKEN=new-main-dummy\n")
+
+
+def test_push_switch_confirms_unsent_visits_only_when_enabled(main_operations, monkeypatch):
+    from flow_test.zoho_export import export_preview, finalise_unanswered
+
+    instance, reports, calls = main_operations
+    assert import_source(instance, reports)[0] == 200
+    code, raw = request("/workflow/api/schedules/generate", {"start": DAY.isoformat(), "patients": ["TEST-H"]}, token=KEY)
+    preview = generated_preview(instance, code, raw)
+    assert request(f"/workflow/api/schedules/{preview['previewId']}/save", {}, token=KEY)[0] == 200
+    # Messaging is off: the offer is queued but never sent.
+    assert calls == []
+    pending = [a["id"] for a in instance.flow.state(DAY)["appointments"]]
+    assert pending
+
+    monkeypatch.delenv("MAIN_WORKFLOW_PUSH_UNSENT_AS_SCHEDULED", raising=False)
+    with instance.flow.sessions.begin() as session:
+        assert finalise_unanswered(instance.flow, session, DAY) == 0
+
+    monkeypatch.setenv("MAIN_WORKFLOW_PUSH_UNSENT_AS_SCHEDULED", "true")
+    assert export_preview(instance.flow, DAY)["wouldAssumeAcceptedVisits"] == len(pending)
+    assert {a["status"] for a in instance.flow.state(DAY)["appointments"]} == {"PENDING_CONFIRMATION"}
+    with monkeypatch.context() as live:
+        live.setattr(instance.flow, "live", True)
+        with instance.flow.sessions.begin() as session:
+            assert finalise_unanswered(instance.flow, session, DAY, dry_run=True) == 0
+    with instance.flow.sessions.begin() as session:
+        assert finalise_unanswered(instance.flow, session, DAY) == len(pending)
+    assert {a["status"] for a in instance.flow.state(DAY)["appointments"]} == {"CONFIRMED"}
+    with instance.flow.sessions.begin() as session:
+        assert finalise_unanswered(instance.flow, session, DAY) == 0
+    assert calls == []
+
+
+def test_push_switch_waits_for_parents_who_were_actually_messaged(main_operations, monkeypatch):
+    from flow_test.zoho_export import finalise_unanswered
+
+    instance, reports, calls = main_operations
+    assert import_source(instance, reports)[0] == 200
+    code, raw = request("/workflow/api/schedules/generate", {"start": DAY.isoformat(), "patients": ["TEST-H"]}, token=KEY)
+    preview = generated_preview(instance, code, raw)
+    assert request(f"/workflow/api/schedules/{preview['previewId']}/save", {}, token=KEY)[0] == 200
+    instance.flow.drain()
+    assert len(calls) == 1
+    monkeypatch.setenv("MAIN_WORKFLOW_PUSH_UNSENT_AS_SCHEDULED", "true")
+    with instance.flow.sessions.begin() as session:
+        assert finalise_unanswered(instance.flow, session, DAY) == 0
+    assert {a["status"] for a in instance.flow.state(DAY)["appointments"]} == {"PENDING_CONFIRMATION"}

@@ -3,6 +3,7 @@
 from datetime import date, datetime, timezone
 import hashlib
 import json
+import os
 import re
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -142,7 +143,54 @@ def finalise_unanswered(flow: "FlowTest", session: Session, target: date, *, dry
         flow._audit(session, "flow_assumed_yes", f"offer:{offer.token}")
         assumed += 1
     session.flush()
-    return assumed
+    return assumed + _finalise_unsent(flow, session, target, dry_run=dry_run)
+
+
+def push_unsent_enabled(flow: "FlowTest") -> bool:
+    """Operator switch: while parent messaging is off, planned visits are pushed as Scheduled.
+
+    Off by default. It never applies when live messaging is on, so a parent's answer to a
+    message that really went out is always waited for.
+    """
+    return (not getattr(flow, "live", False)
+            and os.getenv("MAIN_WORKFLOW_PUSH_UNSENT_AS_SCHEDULED", "false").strip().lower() == "true")
+
+
+def _finalise_unsent(flow: "FlowTest", session: Session, target: date, *, dry_run: bool) -> int:
+    """Confirm the target day's still-pending visits whose parent was never messaged."""
+    if not push_unsent_enabled(flow):
+        return 0
+    pending = list(session.scalars(select(Appointment).join(Patient, Patient.id == Appointment.patient_id).where(
+        Appointment.date == target, Appointment.status == AppointmentStatus.PENDING_CONFIRMATION,
+        Patient.active.is_(True))))
+    if not pending:
+        return 0
+    offers = offers_on(session, target)
+    offer_of: dict[int, list[FlowOffer]] = {}
+    for offer in offers:
+        for appointment_id in json.loads(offer.appointment_ids):
+            offer_of.setdefault(appointment_id, []).append(offer)
+    keys = {offer.token: hashlib.sha256(f"offer:{offer.token}".encode()).hexdigest() for offer in offers}
+    sent = set(session.scalars(select(FlowJob.event_key).where(
+        FlowJob.event_key.in_(list(keys.values())), FlowJob.status.in_(("SENT", "SIMULATED"))))) if offers else set()
+    replied = set(session.scalars(select(AuditLog.entity).where(
+        AuditLog.entity.in_([f"offer:{o.token}" for o in offers]),
+        AuditLog.action.like("flow_reply_%")))) if offers else set()
+    confirmed = 0
+    for item in pending:
+        linked = offer_of.get(item.id, [])
+        if any(keys[o.token] in sent or f"offer:{o.token}" in replied for o in linked):
+            continue  # A message went out or a parent answered: the normal rules apply.
+        confirmed += 1
+        if dry_run:
+            continue
+        item.status = AppointmentStatus.CONFIRMED
+        for offer in linked:
+            if offer.state in ("PENDING", "EXPIRED"):
+                offer.state, offer.expires_at = "CONFIRMED", None
+        flow._audit(session, "flow_assumed_yes_unsent", f"appointment:{item.id}")
+    session.flush()
+    return confirmed
 
 
 def export_rows(flow: "FlowTest", session: Session, target: date, namespace: str,

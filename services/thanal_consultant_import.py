@@ -138,7 +138,9 @@ def sync_consultants(flow: Any, rows: list[dict], *, apply: bool = False) -> dic
                 session.add(doctor)
                 session.flush()
                 doctors[row["code"]] = doctor
-            doctor.name, doctor.active, doctor.location_id = row["name"], row["active"], branch_id
+            # Zoho's status seeds a NEW doctor only; staff own Active/Inactive afterwards
+            # (Clinical team page). Existing doctors keep their status.
+            doctor.name, doctor.location_id = row["name"], branch_id
             if doctor.department_id not in capabilities:
                 doctor.department_id = min(capabilities)
             existing = {cap.department_id: cap for cap in session.scalars(select(TherapistCapability).where(

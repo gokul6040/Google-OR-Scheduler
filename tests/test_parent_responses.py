@@ -269,13 +269,37 @@ def test_released_opening_cannot_be_filled_by_another_therapy(base_problem):
     assert result.unmet[0].reason == "OUTSIDE_REPAIR_OPENING"
 
 
-def test_expired_plan_cannot_receive_new_replacement(response_demo, db_session):
-    target, patients, _ = response_demo
+def _past_calendar_end(db_session, target, patient):
+    """A 1-month plan that started 100 days ago: its calendar end has passed."""
     requirement = db_session.scalar(select(TreatmentRequirement).where(
-        TreatmentRequirement.patient_id == patients["DEMO-D"].id,
+        TreatmentRequirement.patient_id == patient.id,
     ))
     requirement.plan_start_date = target - timedelta(days=100)
     requirement.duration_months = 1
+    return requirement
+
+
+def test_completed_course_cannot_receive_new_replacement(response_demo, db_session):
+    """Courses end at sessions/week x months x 4 sessions (user decision, 12 Nov 2026)."""
+    target, patients, _ = response_demo
+    requirement = _past_calendar_end(db_session, target, patients["DEMO-D"])
+    location = db_session.scalar(select(Appointment.location_id).limit(1))
+    for index in range(requirement.sessions_per_week * 4):
+        db_session.add(Appointment(
+            patient_id=requirement.patient_id, treatment_requirement_id=requirement.id,
+            therapist_id=requirement.assigned_therapist_id, department_id=requirement.department_id,
+            location_id=requirement.location_id or location,
+            date=target - timedelta(days=14 + 7 * (index // 2) + index % 2), slot_index=0,
+            status=AppointmentStatus.COMPLETED, bundle_id=f"done-{index}", source="test"))
     db_session.commit()
     result = process_daily_responses(db_session, target)
     assert not result.proposed_appointment_ids
+
+
+def test_course_past_its_calendar_end_still_receives_replacements(response_demo, db_session):
+    """An unfinished course keeps going after its calendar end until its total is reached."""
+    target, patients, _ = response_demo
+    _past_calendar_end(db_session, target, patients["DEMO-D"])
+    db_session.commit()
+    result = process_daily_responses(db_session, target)
+    assert result.proposed_appointment_ids

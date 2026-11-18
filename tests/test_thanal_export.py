@@ -170,6 +170,30 @@ def test_a_visit_released_before_any_push_is_never_exported(booked):
     assert [row["fields"]["Status"] for row in preview["changes"]] == ["Scheduled"]
 
 
+def test_staff_cancel_updates_the_same_pushed_zoho_row(booked):
+    from services.cancellation_service import cancel_saved_visit
+    from flow_test.zoho_export import setting
+    _mark_pushed(booked)
+    with booked.sessions.begin() as session:
+        first = session.scalar(select(Appointment).order_by(Appointment.id))
+        expected_key = f"{setting(session, 'namespace')}:{first.id}"
+        cancel_saved_visit(session, first.id, scope="session",
+                           reason="Family contacted staff", actor="staff", flow=booked)
+    changes = export_preview(booked, DAY)["changes"]
+    assert len(changes) == 1
+    assert changes[0]["fields"]["Scheduler_Key"] == expected_key
+    assert changes[0]["fields"]["Status"] == "Cancelled"
+
+
+def test_staff_cancel_before_first_push_creates_no_zoho_row(booked):
+    from services.cancellation_service import cancel_saved_visit
+    with booked.sessions.begin() as session:
+        first = session.scalar(select(Appointment).order_by(Appointment.id))
+        cancel_saved_visit(session, first.id, scope="session", reason="Cancelled", actor="staff", flow=booked)
+    changes = export_preview(booked, DAY)["changes"]
+    assert len(changes) == 1 and changes[0]["fields"]["Status"] == "Scheduled"
+
+
 def test_schema_rejects_text_registration_and_additional_required_fields():
     fields = {name:{"type":12,"is_lookup_field":True} for name in thanal_export.LOOKUPS}
     fields.update(For_Parent={"type":16},Date_field={"type":10},Slot_Number={"type":5},
@@ -246,3 +270,71 @@ def test_real_http_partial_rejection_keeps_success_and_retries_only_missing(book
         assert warning.patient_code=='FAKE-1'
     assert push()['created']==1
     assert export_preview(booked,DAY)['openBatch'] is None
+
+
+@pytest.mark.parametrize("switch, thanal, expected", [
+    ("true", True, ["form_workflow", "schedules"]),
+    ("false", True, None),
+    ("true", False, None),
+])
+def test_skip_workflow_switch_only_applies_to_thanal_trial_form(monkeypatch, switch, thanal, expected):
+    from contextlib import contextmanager
+    from io import BytesIO
+    from flow_test import zoho_push
+
+    monkeypatch.setenv("MAIN_WORKFLOW_ZOHO_SKIP_WORKFLOW", switch)
+    monkeypatch.setattr(zoho_push, "validate_payload", lambda *a, **k: None)
+    settings = export_settings()
+    if thanal:
+        settings = replace(settings, account_owner="thanal", app_link_name="eic",
+                           form_link_name=thanal_export.FORM, report_link_name=thanal_export.REPORT)
+    bodies = []
+
+    @contextmanager
+    def fake_open(request, timeout):
+        bodies.append(json.loads(request.data))
+        answer = {"code": 3000, "result": [{"code": 3000, "data": {"ID": "11", "Scheduler_Key": "main-a"}}]}
+        if request.get_method() == "PATCH" and "/report/" in request.full_url and request.full_url.endswith("/11"):
+            answer = {"code": 3000, "result": {"code": 3000, "data": {"ID": "11"}}}
+        yield BytesIO(json.dumps(answer).encode())
+
+    monkeypatch.setattr(zoho_push, "open_zoho_request", fake_open)
+    no_check = lambda s: None
+    zoho_push.write_records(settings, "t", [{"Scheduler_Key": "main-a"}], verify=no_check, key_prefix="main-")
+    zoho_push.write_record(settings, "t", {"Scheduler_Key": "main-a"}, "11", verify=no_check, key_prefix="main-")
+    zoho_push.write_updates(settings, lambda: "t", [{"fields": {"Scheduler_Key": "main-a", "Status": "Cancelled"}}],
+                            {"main-a": {"ID": "11", "Scheduler_Key": "main-a", "Status": "Scheduled"}}, verify=no_check)
+    assert len(bodies) == 3
+    assert all(body.get("skip_workflow") == expected for body in bodies)
+
+
+def test_calendar_department_names_follow_the_export_bindings(booked, monkeypatch):
+    catalog = deepcopy(CATALOG)
+    catalog["department_names"] = {"900": "Physiotherapy", "901": "Speech and Language"}
+    monkeypatch.setattr(thanal_export, "default_catalog", lambda: catalog)
+    with booked.sessions() as session:
+        names = thanal_export.department_names(session)
+        local = {req.department_id for req in session.scalars(select(TreatmentRequirement))}
+        bindings = thanal_export.bindings_from_catalog(
+            thanal_export.read_setting(session, thanal_export.MAP_KEY, {}), "10", catalog)
+    assert set(names) == local
+    assert {names[int(k)] for k in bindings["departments"]} == {"Physiotherapy", "Speech and Language"}
+    assert all(names[int(k)] == catalog["department_names"][v] for k, v in bindings["departments"].items())
+
+
+def test_calendar_department_names_skip_departments_without_a_known_name(booked):
+    with booked.sessions() as session:
+        assert thanal_export.department_names(session) == {}
+
+
+def test_calendar_department_names_use_each_consultations_zoho_department(booked, monkeypatch):
+    catalog = deepcopy(CATALOG)
+    catalog["department_bindings"] = []  # No export binding: the consultation map alone names it.
+    catalog["consultation_department_names"] = {"20": "Physiotherapy", "21": "Speech and Language"}
+    monkeypatch.setattr(thanal_export, "default_catalog", lambda: catalog)
+    with booked.sessions() as session:
+        source = thanal_export.read_setting(session, thanal_export.MAP_KEY, {})
+        names = thanal_export.department_names(session)
+    expected = {row["local_id"]: catalog["consultation_department_names"][key]
+                for key, row in source["therapies"].items() if key in catalog["consultation_department_names"]}
+    assert expected and names == expected

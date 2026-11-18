@@ -573,10 +573,8 @@ def generate_weekly_schedule(
         for day, start, therapist_ids in candidates[bundle.id]:
             variable = variables[(bundle.id, day, start, therapist_ids)]
             weekday = (problem.week_start + timedelta(days=day)).weekday()
-            preference = sum(
-                problem.patient_preferences.get((bundle.patient_id, weekday, start + offset), 0)
-                for offset in range(len(bundle.items))
-            )
+            # A preferred time is when the visit STARTS; the visit's other therapies follow on.
+            preference = problem.patient_preferences.get((bundle.patient_id, weekday, start), 0)
             # Avoiding unmet clinical sessions dominates every lower-priority preference.
             reward = (settings.unmet_bundle_penalty + settings.scheduled_session_reward) * len(bundle.items)
             reward += settings.preference_reward * preference
