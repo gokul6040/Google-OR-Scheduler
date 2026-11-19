@@ -64,6 +64,9 @@ class SchedulingProblem:
     new_booking_slots: set[tuple[int, int, int, date, int]] | None = None
     released_bundle_slots: set[tuple[int, date, int, str, int]] = field(default_factory=set)
     isolate_saved_failures: bool = False
+    # Centre id -> Timetable (scheduling.slot_config). Centres without configured
+    # shifts use the original 10-session timetable.
+    timetables: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

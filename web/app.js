@@ -9,11 +9,14 @@ const state = {
   patientPage: 1,
   patientQuery: "",
   patientStatusFilter: "all",
+  patientCentreFilter: "",
   latestPreview: null,
   showPreview: false,
   assistantSessionId: null,
   assistantMemoryContext: null,
   operationsTab: "assistant",
+  shiftView: "",
+  shiftLocation: "",
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -146,6 +149,7 @@ async function api(path, options = {}) {
   if (!response.ok) {
     const error = new Error(payload.error || "Something went wrong. Please try again.");
     error.status = response.status;
+    error.details = payload;
     throw error;
   }
   return payload;
@@ -271,6 +275,7 @@ function setView(view, options = {}) {
   if (view === "overview") loadOverviewView();
   if (view === "patients") loadPatientsView();
   if (view === "team") loadTeamView();
+  if (view === "shifts") loadShiftsView();
   if (view === "operations") loadOperationsView();
   if (view === "generator") loadGeneratorView();
 }
@@ -403,6 +408,24 @@ function populateFilterOptions() {
   makeSearchableSelect($("#patientFilter"), "Search patients");
   makeSearchableSelect($("#departmentFilter"), "Search therapies");
   makeSearchableSelect($("#locationFilter"), "Search branches");
+  populateShiftPicker();
+}
+
+// Calendar Shift picker: the default shift first, then the others, then All shifts.
+// Shown only when some centre has more than one shift. It changes the view only.
+function populateShiftPicker() {
+  const picker = $("#shiftViewPicker"), select = $("#shiftViewSelect");
+  if (!picker || !select) return;
+  const options = state.schedule.shiftOptions || [];
+  picker.hidden = options.length < 2;
+  if (!options.includes(state.shiftView) && state.shiftView !== "all") state.shiftView = options[0] || "";
+  select.innerHTML = options.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")
+    + (options.length > 1 ? '<option value="all">All shifts</option>' : "");
+  select.value = state.shiftView;
+  if (!select.dataset.bound) {
+    select.dataset.bound = "1";
+    select.addEventListener("change", () => { state.shiftView = select.value; renderSchedule(); });
+  }
 }
 
 function readFilters() {
@@ -477,11 +500,18 @@ function updateDateDisplay() {
   $("#dateDisplay").textContent = formatDate(state.currentDate, { weekday: "long", day: "numeric", month: "long", year: "numeric" });
 }
 
-function calendarBreakRow(afterSlot, view) {
-  return (state.schedule.calendarBreaks || [])
-    .filter((item) => item.afterSlot === afterSlot)
-    .map((item) => `<div class="${view}-grid-row calendar-break-row"><div class="time-label">${escapeHtml(item.start)}</div><div class="calendar-break-label">${escapeHtml(item.label)} · ${escapeHtml(item.start)}–${escapeHtml(item.end)}</div></div>`)
-    .join("");
+// A gap between two shown sessions is a break; it is "Lunch" when a shown doctor lunches then.
+function calendarGapRow(session, next, doctors) {
+  if (!next || next.start <= session.end) return "";
+  const lunch = doctors.some((doctor) => (doctor.breaks || []).some((item) => item.kind === "lunch" && item.start < next.start && item.end > session.end));
+  return `<div class="doctor-grid-row calendar-break-row"><div class="time-label">${escapeHtml(session.end)}</div><div class="calendar-break-label">${lunch ? "Lunch break" : "Break"} · ${escapeHtml(session.end)}–${escapeHtml(next.start)}</div></div>`;
+}
+
+// What a doctor is doing in a session they do not work: their lunch, a break, or off shift.
+function offShiftLabel(doctor, session) {
+  const inBreak = (doctor.breaks || []).find((item) => item.start < session.end && item.end > session.start);
+  if (inBreak) return inBreak.kind === "lunch" ? "Lunch" : "Break";
+  return "Off shift";
 }
 
 function calendarDoctors(appointments) {
@@ -489,8 +519,11 @@ function calendarDoctors(appointments) {
   // A doctor filter shows that doctor; patient, therapy, status or search shows only doctors with matches.
   const booked = new Set(appointments.map((item) => item.therapistId));
   const narrowedToVisits = Boolean(state.filters.patient || state.filters.department || state.filters.status || state.filters.search);
+  const onShift = (doctor) => !state.shiftView || state.shiftView === "all"
+    || (state.schedule.shiftOptions || []).length < 2 || doctor.shiftName === state.shiftView;
   return state.schedule.therapists.filter((doctor) => {
     if (state.filters.therapist) return String(doctor.id) === state.filters.therapist;
+    if (!onShift(doctor)) return false;
     if (booked.has(doctor.id)) return true;
     if (narrowedToVisits || !doctor.active) return false;
     return !state.filters.location || String(doctor.locationId) === state.filters.location;
@@ -515,12 +548,18 @@ function renderDoctorCalendar(appointments) {
     return;
   }
   const headers = doctors.map((doctor) => `<div class="doctor-header${doctor.active ? "" : " is-inactive"}" title="${escapeHtml(doctor.zohoDepartment ? `${doctor.name} · ${doctor.zohoDepartment}` : doctor.name)}"><span class="doctor-header-name">${escapeHtml(doctor.name)}</span>${doctor.zohoDepartment ? `<span class="doctor-header-department">${escapeHtml(doctor.zohoDepartment)}</span>` : ""}</div>`).join("");
-  const rows = state.schedule.slotLabels.map((label, slot) => {
+  // Rows: the sessions these doctors work (plus any session holding a booking), in clock order.
+  const shown = new Set(doctors.flatMap((doctor) => doctor.sessions || state.schedule.defaultSessions || []));
+  appointments.forEach((item) => { if (doctors.some((doctor) => doctor.id === item.therapistId)) shown.add(item.slot); });
+  const sessions = (state.schedule.sessions || []).filter((session) => shown.has(session.id));
+  const rows = sessions.map((session, index) => {
     const cells = doctors.map((doctor) => {
-      const items = appointments.filter((item) => item.slot === slot && item.therapistId === doctor.id);
-      return `<div class="doctor-cell" ${!items.length ? emptySlotAttributes(day, slot, doctor.id) : ""}>${items.map(appointmentCard).join("")}</div>`;
+      const items = appointments.filter((item) => item.slot === session.id && item.therapistId === doctor.id);
+      const works = (doctor.sessions || state.schedule.defaultSessions || []).includes(session.id);
+      if (!items.length && !works) return `<div class="doctor-cell off-shift">${escapeHtml(offShiftLabel(doctor, session))}</div>`;
+      return `<div class="doctor-cell" ${!items.length ? emptySlotAttributes(day, session.id, doctor.id) : ""}>${items.map(appointmentCard).join("")}</div>`;
     }).join("");
-    return `<div class="doctor-grid-row"><div class="time-label">${escapeHtml(label.split("–")[0])}</div>${cells}</div>${calendarBreakRow(slot, "doctor")}`;
+    return `<div class="doctor-grid-row"><div class="time-label">${escapeHtml(session.start)}</div>${cells}</div>${calendarGapRow(session, sessions[index + 1], doctors)}`;
   }).join("");
   $("#calendarSurface").innerHTML = `<div class="doctor-calendar" style="--doctor-columns:${doctors.length}"><div class="doctor-grid-header"><div class="time-corner">Time</div>${headers}</div>${rows}</div>`;
   bindAppointmentCards();
@@ -797,12 +836,27 @@ function cancelStreakBadge(count) {
   return count && count >= (state.cancelStreakWarning || 4) ? `<span class="cancel-streak-warning" title="The last ${count} sessions were cancelled, declined or missed. Please check with the family.">${icon("alert")}${count} cancelled in a row</span>` : "";
 }
 
+// Centre filter: every centre a child has a plan at (25+ centres, so it is searchable).
+function syncPatientCentreFilter(root) {
+  const select = $("#patientCentreFilter", root);
+  const centres = [...new Set(state.patients.flatMap((item) => item.centres || []))].sort((a, b) => a.localeCompare(b));
+  if (state.patientCentreFilter && !centres.includes(state.patientCentreFilter)) state.patientCentreFilter = "";
+  const key = centres.join("|");
+  if (select.dataset.centres !== key) {
+    select.innerHTML = `<option value="">All centres</option>${centres.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")}`;
+    select.dataset.centres = key;
+  }
+  select.value = state.patientCentreFilter;
+  makeSearchableSelect(select, "Search centres");
+}
+
 function renderPatientsView() {
   const root = $("#view-patients");
   const query = state.patientQuery.trim().toLowerCase();
   const patients = state.patients.filter(item =>
     (!query || `${item.name} ${item.code}`.toLowerCase().includes(query)) &&
-    (state.patientStatusFilter === "all" || item.active === (state.patientStatusFilter === "active")));
+    (state.patientStatusFilter === "all" || item.active === (state.patientStatusFilter === "active")) &&
+    (!state.patientCentreFilter || (item.centres || []).includes(state.patientCentreFilter)));
   const pageSize = 25;
   const pages = Math.max(1, Math.ceil(patients.length / pageSize));
   state.patientPage = Math.max(1, Math.min(state.patientPage, pages));
@@ -810,7 +864,7 @@ function renderPatientsView() {
   const rows = patients.slice(start, start + pageSize);
   if (!$("#patientSearch", root)) {
     root.innerHTML = `${pageHeading("Care directory", "Patients")}
-    <div class="directory-toolbar patient-directory-toolbar"><label class="search-field">${icon("search")}<input id="patientSearch" type="search" value="${escapeHtml(state.patientQuery)}" placeholder="Search by patient name or code" aria-label="Search patients"></label><label class="patient-status-filter">Status<select id="patientStatusFilter"><option value="all">All</option><option value="active">Active</option><option value="inactive">Inactive</option></select></label><span class="soft-pill" id="patientMatchCount" role="status" aria-live="polite"></span>${mainWorkflowWorkspace ? zohoRefreshControls("patients") : ""}</div>
+    <div class="directory-toolbar patient-directory-toolbar"><label class="search-field">${icon("search")}<input id="patientSearch" type="search" value="${escapeHtml(state.patientQuery)}" placeholder="Search by patient name or code" aria-label="Search patients"></label><label class="patient-status-filter">Status<select id="patientStatusFilter"><option value="all">All</option><option value="active">Active</option><option value="inactive">Inactive</option></select></label><label class="patient-status-filter patient-centre-filter">Centre<select id="patientCentreFilter" aria-label="Centre"><option value="">All centres</option></select></label><span class="soft-pill" id="patientMatchCount" role="status" aria-live="polite"></span>${mainWorkflowWorkspace ? zohoRefreshControls("patients") : ""}</div>
     <div class="table-shell patient-directory-table"><table class="data-table"><thead><tr><th>Patient ID</th><th>Patient</th><th>Preference day</th><th>Preferred time</th><th>Status</th><th></th></tr></thead><tbody>
     </tbody></table><div class="table-footer"><span id="patientPageSummary"></span><div><button class="ghost-button" id="patientPrev">Previous</button><button class="ghost-button" id="patientNext">Next</button></div></div></div>`;
     $("#patientSearch", root).addEventListener("input", event => {
@@ -820,6 +874,11 @@ function renderPatientsView() {
     });
     $("#patientStatusFilter", root).addEventListener("change", event => {
       state.patientStatusFilter = event.target.value;
+      state.patientPage = 1;
+      renderPatientsView();
+    });
+    $("#patientCentreFilter", root).addEventListener("change", event => {
+      state.patientCentreFilter = event.target.value;
       state.patientPage = 1;
       renderPatientsView();
     });
@@ -833,11 +892,12 @@ function renderPatientsView() {
   const search = $("#patientSearch", root);
   if (search.value !== state.patientQuery) search.value = state.patientQuery;
   $("#patientStatusFilter", root).value = state.patientStatusFilter;
+  syncPatientCentreFilter(root);
   $("#patientMatchCount", root).textContent = `${patients.length.toLocaleString("en-IN")} patients`;
   $("#patientPageSummary", root).textContent = `Showing ${patients.length ? start + 1 : 0}–${Math.min(start + pageSize, patients.length)} of ${patients.length.toLocaleString("en-IN")}`;
   $("#patientPrev", root).disabled = state.patientPage === 1;
   $("#patientNext", root).disabled = state.patientPage === pages;
-  $("tbody", root).innerHTML = rows.length ? rows.map((item) => `<tr data-open-patient="${item.id}"><td><strong>${escapeHtml(item.code)}</strong></td><td><button type="button" class="patient-open-button person-cell" data-patient-preferences="${item.id}" aria-label="View plan and preferences for ${escapeHtml(item.name)}"><span class="avatar">${escapeHtml(initials(item.name === "Name not provided" ? item.code : item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${item.therapies} active therap${item.therapies === 1 ? "y" : "ies"}</small>${cancelStreakBadge(item.cancelStreak)}</span></button></td><td>${escapeHtml(item.preferenceDay)}</td><td>${escapeHtml(item.preferencePeriod)}</td><td><button class="status-pill patient-status-button ${item.active ? "status-confirmed" : "status-needs_rescheduling"}" type="button" data-patient-status="${item.id}" aria-haspopup="dialog" aria-label="${item.active ? "Active" : "Inactive"} — change scheduling status for ${escapeHtml(item.code)}">${item.active ? "Active" : "Inactive"} ${icon("chevron-right")}</button></td><td><button class="ghost-button" type="button" data-patient-preferences="${item.id}">Edit</button></td></tr>`).join("") : '<tr><td colspan="6">No patients match your search and status filter.</td></tr>';
+  $("tbody", root).innerHTML = rows.length ? rows.map((item) => `<tr data-open-patient="${item.id}"><td><strong>${escapeHtml(item.code)}</strong></td><td><button type="button" class="patient-open-button person-cell" data-patient-preferences="${item.id}" aria-label="View plan and preferences for ${escapeHtml(item.name)}"><span class="avatar">${escapeHtml(initials(item.name === "Name not provided" ? item.code : item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${item.therapies} active therap${item.therapies === 1 ? "y" : "ies"}</small>${cancelStreakBadge(item.cancelStreak)}</span></button></td><td>${escapeHtml(item.preferenceDay)}</td><td>${escapeHtml(item.preferencePeriod)}</td><td><button class="status-pill patient-status-button ${item.active ? "status-confirmed" : "status-needs_rescheduling"}" type="button" data-patient-status="${item.id}" aria-haspopup="dialog" aria-label="${item.active ? "Active" : "Inactive"} — change scheduling status for ${escapeHtml(item.code)}">${item.active ? "Active" : "Inactive"} ${icon("chevron-right")}</button></td><td><button class="ghost-button" type="button" data-patient-preferences="${item.id}">Edit</button></td></tr>`).join("") : '<tr><td colspan="6">No patients match your search and filters.</td></tr>';
   $$("[data-open-patient]", root).forEach(row => row.addEventListener("click", event => {
     if (event.target.closest("button, a, input, select, textarea")) return;
     const patient = rows.find(item => String(item.id) === row.dataset.openPatient);
@@ -868,7 +928,7 @@ function pickedPreferenceTimes(root) {
 function wirePreferenceTimeShortcuts(root) {
   $$("[data-time-shortcut]", root).forEach((button) => button.addEventListener("click", () => {
     const boxes = $$("#patientPreferenceTimes input", root);
-    const group = button.dataset.timeShortcut === "clear" ? [] : boxes.filter((box) => (box.value < "12:45") === (button.dataset.timeShortcut === "morning"));
+    const group = button.dataset.timeShortcut === "clear" ? [] : boxes.filter((box) => (box.value < "12:30") === (button.dataset.timeShortcut === "morning"));
     if (button.dataset.timeShortcut === "clear") boxes.forEach((box) => { box.checked = false; });
     else { const on = !group.every((box) => box.checked); group.forEach((box) => { box.checked = on; }); }
   }));
@@ -1051,14 +1111,46 @@ function openPatientStatusDialog(patient, onSaved) {
   if (active) checkActivation();
 }
 
-const teamFilters = { query: "", status: "all", department: "", location: "" };
-const TEAM_PAGE_SIZE = 25;
+const teamFilters = { query: "", status: "all", department: "", location: "", shift: "" };
+const TEAM_PAGE_SIZE = 30;
 let teamDirectory = null;
 let teamPage = 1;
+let teamMatches = [];  // Clinicians the current search and filters show (all pages), for Select all.
 
 // Status, department and location live in one Filters drawer, like the Schedule page.
 function teamFilterCount() {
-  return (teamFilters.status !== "all") + Boolean(teamFilters.department) + Boolean(teamFilters.location);
+  return (teamFilters.status !== "all") + Boolean(teamFilters.department) + Boolean(teamFilters.location) + Boolean(teamFilters.shift);
+}
+
+// Shift filter value: "" (all), "none" (no active shift, at any centre the Location filter allows),
+// or "centreId:shiftId" (shiftId empty for a centre still on its original timetable).
+function teamShiftKey(item) {
+  return item.noShift ? "none" : `${item.locationId}:${item.shiftId ?? ""}`;
+}
+
+// Active clinicians at the location (every location when empty) with no active shift: not scheduled.
+function teamNoShiftCount(location) {
+  return teamDirectory.therapists.filter((item) => item.active && item.noShift && (!location || item.location === location)).length;
+}
+
+// The Shift filter follows Location, so it stays short with many centres: with no location it offers
+// only "No shift (n)"; with one, that centre's shifts. Counts are active clinicians.
+function teamShiftFilterOptions(location) {
+  const options = [];
+  if (location) {
+    const ids = [...new Set(teamDirectory.therapists.filter((item) => item.location === location).map((item) => String(item.locationId)))];
+    ids.forEach((id) => (teamDirectory.centreShifts?.[id] || []).forEach((option) => {
+      const value = `${id}:${option.id ?? ""}`;
+      const count = teamDirectory.therapists.filter((item) => item.active && teamShiftKey(item) === value).length;
+      options.push({ value, name: `${option.name} (${count})` });
+    }));
+  }
+  options.push({ value: "none", name: `No shift (${teamNoShiftCount(location)})` });
+  return options;
+}
+
+function teamShiftSelectHtml(location) {
+  return `<option value="">All shifts</option>${teamShiftFilterOptions(location).map((shift) => `<option value="${escapeHtml(shift.value)}">${escapeHtml(shift.name)}</option>`).join("")}`;
 }
 
 function ensureTeamFilterDrawer(departments, locations) {
@@ -1074,11 +1166,24 @@ function ensureTeamFilterDrawer(departments, locations) {
       <label>Status<select id="teamStatusFilter"><option value="all">All</option><option value="active">Active</option><option value="inactive">Inactive</option></select></label>
       <label>Department<select id="teamDepartmentFilter">${options(departments, "All departments")}</select></label>
       <label>Location<select id="teamLocationFilter">${options(locations, "All locations")}</select></label>
+      <label>Shift<select id="teamShiftFilter"></select><span class="filter-hint" id="teamShiftHint">Pick a location to filter by a specific shift.</span></label>
     </form>
     <div class="drawer-footer"><button class="ghost-button" type="button" id="clearTeamFilters">Clear all</button><button class="primary-button" type="button" id="applyTeamFilters">Show clinicians</button></div>`;
   document.body.append(drawer);
-  const fields = [["#teamStatusFilter", "status"], ["#teamDepartmentFilter", "department"], ["#teamLocationFilter", "location"]];
-  const sync = () => fields.forEach(([selector, key]) => { $(selector, drawer).value = teamFilters[key]; });
+  const fields = [["#teamStatusFilter", "status"], ["#teamDepartmentFilter", "department"], ["#teamLocationFilter", "location"], ["#teamShiftFilter", "shift"]];
+  // Rebuild the Shift list for a location; a shift from another centre resets to All shifts.
+  const refreshShifts = (location, wanted) => {
+    const select = $("#teamShiftFilter", drawer);
+    select.innerHTML = teamShiftSelectHtml(location);
+    select.value = teamShiftFilterOptions(location).some((option) => option.value === wanted) ? wanted : "";
+    $("#teamShiftHint", drawer).hidden = Boolean(location);
+  };
+  const sync = () => {
+    fields.forEach(([selector, key]) => { if (key !== "shift") $(selector, drawer).value = teamFilters[key]; });
+    refreshShifts(teamFilters.location, teamFilters.shift);
+  };
+  sync();
+  $("#teamLocationFilter", drawer).addEventListener("change", (event) => refreshShifts(event.target.value, $("#teamShiftFilter", drawer).value));
   drawer.syncTeamFilters = sync;
   $("[data-close-team-filters]", drawer).addEventListener("click", closeDrawers);
   $("#teamFilterForm", drawer).addEventListener("submit", (event) => event.preventDefault());
@@ -1089,7 +1194,7 @@ function ensureTeamFilterDrawer(departments, locations) {
     renderTeamView();
   });
   $("#clearTeamFilters", drawer).addEventListener("click", () => {
-    Object.assign(teamFilters, { status: "all", department: "", location: "" });
+    Object.assign(teamFilters, { status: "all", department: "", location: "", shift: "" });
     sync();
     teamPage = 1;
     renderTeamView();
@@ -1107,6 +1212,7 @@ async function loadTeamView() {
     const locations = [...new Set(teamDirectory.therapists.map((item) => item.location))].sort((a, b) => a.localeCompare(b));
     if (!departments.includes(teamFilters.department)) teamFilters.department = "";
     if (!locations.includes(teamFilters.location)) teamFilters.location = "";
+    if (!teamShiftFilterOptions(teamFilters.location).some((shift) => shift.value === teamFilters.shift)) teamFilters.shift = "";
     const drawer = ensureTeamFilterDrawer(departments, locations);
     // The toolbar is built once; typing and filters only re-render the rows, so focus is never lost.
     root.innerHTML = `${pageHeading("Capacity & coverage", "Clinical team", `<button class="secondary-button" data-team-calendar>${icon("calendar")}View team calendar</button>`)}
@@ -1116,13 +1222,29 @@ async function loadTeamView() {
         <span class="soft-pill" id="teamMatchCount" role="status" aria-live="polite"></span>
         ${mainWorkflowWorkspace ? zohoRefreshControls("team") : ""}
       </div>
-      <div class="table-shell patient-directory-table"><table class="data-table"><thead><tr><th>Clinician</th><th>Department</th><th>Location</th><th>Weekly workload</th><th>Status</th></tr></thead><tbody></tbody></table>
+      <div class="team-noshift-banner" id="teamNoShiftBanner" role="status" hidden></div>
+      <div class="team-bulk-bar" id="teamBulkBar" role="region" aria-label="Selected clinicians" hidden></div>
+      <div class="table-shell patient-directory-table"><table class="data-table"><thead><tr><th class="team-pick-cell"><input type="checkbox" id="teamPickAll" aria-label="Select all clinicians shown"></th><th>Clinician</th><th>Department</th><th>Location</th><th>Shift</th><th>Weekly workload</th><th>Status</th></tr></thead><tbody></tbody></table>
       <div class="table-footer"><span id="teamFooter"></span><div><button class="ghost-button" id="teamPrev">Previous</button><button class="ghost-button" id="teamNext">Next</button></div></div></div>`;
     $("#teamSearch", root).value = teamFilters.query;
     $("#teamSearch", root).addEventListener("input", (event) => { teamFilters.query = event.target.value; teamPage = 1; renderTeamView(); });
     $("#teamFilterButton", root).addEventListener("click", () => { drawer.syncTeamFilters(); openDrawer("teamFilterDrawer"); });
     $("#teamPrev", root).addEventListener("click", () => { teamPage--; renderTeamView(); });
     $("#teamNext", root).addEventListener("click", () => { teamPage++; renderTeamView(); });
+    // Select all = every clinician the search and filters show, on every page.
+    $("#teamPickAll", root).addEventListener("change", (event) => {
+      teamMatches.forEach((item) => { if (event.target.checked) teamSelection.add(item.id); else teamSelection.delete(item.id); });
+      renderTeamView();
+    });
+    // "Show them" on the No shift banner: list exactly the active clinicians the banner counts.
+    // The search and department filters are cleared so the list never comes up empty; location stays.
+    $("#teamNoShiftBanner", root).addEventListener("click", (event) => {
+      if (!event.target.closest("[data-show-no-shift]")) return;
+      Object.assign(teamFilters, { shift: "none", status: "active", query: "", department: "" });
+      $("#teamSearch", root).value = "";
+      teamPage = 1;
+      renderTeamView();
+    });
     $('[data-team-calendar]', root).addEventListener("click", () => setView("schedule"));
     if ($("[data-zoho-refresh]", root)) {
       $("[data-zoho-refresh]", root).addEventListener("click", startZohoRefresh);
@@ -1208,7 +1330,10 @@ function renderTeamView() {
     (!query || `${item.name} ${item.code}`.toLowerCase().includes(query)) &&
     (teamFilters.status === "all" || item.active === (teamFilters.status === "active")) &&
     (!teamFilters.department || item.department === teamFilters.department) &&
-    (!teamFilters.location || item.location === teamFilters.location));
+    (!teamFilters.location || item.location === teamFilters.location) &&
+    (!teamFilters.shift || teamShiftKey(item) === teamFilters.shift));
+  teamMatches = matches;
+  syncTeamPickAll();
   const pages = Math.max(1, Math.ceil(matches.length / TEAM_PAGE_SIZE));
   teamPage = Math.max(1, Math.min(teamPage, pages));
   const start = (teamPage - 1) * TEAM_PAGE_SIZE;
@@ -1217,11 +1342,19 @@ function renderTeamView() {
   $("#teamFilterCount", root).hidden = filters === 0;
   $("#teamFilterCount", root).textContent = filters;
   $("#teamMatchCount", root).textContent = `${matches.length.toLocaleString("en-IN")} clinician${matches.length === 1 ? "" : "s"}`;
+  // Banner while active clinicians (at the chosen location) have no shift; hidden at 0 or once they are listed.
+  const unassigned = teamNoShiftCount(teamFilters.location);
+  const banner = $("#teamNoShiftBanner", root);
+  banner.hidden = !unassigned || teamFilters.shift === "none";
+  if (!banner.hidden) {
+    banner.innerHTML = `<span aria-hidden="true">⚠</span><span><strong>${unassigned} clinician${unassigned === 1 ? "" : "s"}</strong>${teamFilters.location ? ` at ${escapeHtml(teamFilters.location)}` : ""} ${unassigned === 1 ? "has" : "have"} no shift and won't be scheduled.</span><button class="team-noshift-link" type="button" data-show-no-shift>Show them</button>`;
+  }
   $("#teamFooter", root).textContent = `Showing ${matches.length ? start + 1 : 0}–${Math.min(start + TEAM_PAGE_SIZE, matches.length)} of ${matches.length.toLocaleString("en-IN")} · week of ${formatDate(parseLocalDate(teamDirectory.weekStart), { day: "numeric", month: "long", year: "numeric" })}`;
   $("#teamPrev", root).disabled = teamPage === 1;
   $("#teamNext", root).disabled = teamPage === pages;
-  $("tbody", root).innerHTML = rows.length ? rows.map((item) => { const capacityLabel = item.capacity == null ? "Not supplied" : item.capacity; const utilization = item.capacity ? Math.min(100, Math.round(item.appointments / item.capacity * 100)) : 0; return `<tr><td><div class="person-cell"><span class="avatar">${escapeHtml(initials(item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.code)}</small></span></div></td><td>${escapeHtml(item.department)}</td><td>${escapeHtml(item.location)}</td><td><div style="display:flex;align-items:center;gap:10px"><div class="progress-track"><div class="progress-fill" style="width:${utilization}%"></div></div><span style="white-space:nowrap">${item.appointments} / ${capacityLabel}</span></div></td><td><button class="status-pill patient-status-button ${item.active ? "status-confirmed" : "status-needs_rescheduling"}" type="button" data-therapist-status="${item.id}" aria-haspopup="dialog" aria-label="${item.active ? "Active" : "Inactive"} — change scheduling status for ${escapeHtml(item.name)}">${item.active ? "Active" : "Inactive"} ${icon("chevron-right")}</button></td></tr>`; }).join("")
-    : '<tr><td colspan="5">No clinicians match your search and filters.</td></tr>';
+  $("tbody", root).innerHTML = rows.length ? rows.map((item) => { const capacityLabel = item.capacity == null ? "Not supplied" : item.capacity; const utilization = item.capacity ? Math.min(100, Math.round(item.appointments / item.capacity * 100)) : 0; return `<tr><td class="team-pick-cell"><input type="checkbox" data-team-pick="${item.id}" ${teamSelection.has(item.id) ? "checked" : ""} aria-label="Select ${escapeHtml(item.name)}"></td><td><div class="person-cell"><span class="avatar">${escapeHtml(initials(item.name))}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.code)}</small></span></div></td><td>${escapeHtml(item.department)}</td><td>${escapeHtml(item.location)}</td><td class="team-shift-cell">${teamShiftCell(item)}</td><td><div style="display:flex;align-items:center;gap:10px"><div class="progress-track"><div class="progress-fill" style="width:${utilization}%"></div></div><span style="white-space:nowrap">${item.appointments} / ${capacityLabel}</span></div></td><td><button class="status-pill patient-status-button ${item.active ? "status-confirmed" : "status-needs_rescheduling"}" type="button" data-therapist-status="${item.id}" aria-haspopup="dialog" aria-label="${item.active ? "Active" : "Inactive"} — change scheduling status for ${escapeHtml(item.name)}">${item.active ? "Active" : "Inactive"} ${icon("chevron-right")}</button></td></tr>`; }).join("")
+    : '<tr><td colspan="7">No clinicians match your search and filters.</td></tr>';
+  bindTeamShiftControls(root, rows);
   $$("[data-therapist-status]", root).forEach(button => button.addEventListener("click", () => {
     const therapist = rows.find(item => String(item.id) === button.dataset.therapistStatus);
     if (!therapist) return;
@@ -1230,6 +1363,343 @@ function renderTeamView() {
       ($(`[data-therapist-status="${therapist.id}"]`, root) || $("#teamSearch", root)).focus();
     });
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Shifts: centre timetables, assigning clinicians, and the shared confirmations.
+// ---------------------------------------------------------------------------
+
+// The start times a visit at this centre can use (its shifts' sessions), in clock order.
+function centreSessionChoices(locationId) {
+  const ids = state.schedule?.centreSessions?.[String(locationId)] || state.schedule?.defaultSessions || [];
+  const byId = new Map((state.schedule?.sessions || []).map((session) => [session.id, session]));
+  return ids.map((id) => byId.get(id)).filter(Boolean);
+}
+
+function formatClock(value) {
+  const [hours, minutes] = String(value).split(":").map(Number);
+  return `${hours % 12 || 12}:${String(minutes).padStart(2, "0")} ${hours < 12 ? "AM" : "PM"}`;
+}
+
+// Ask before saving a change that leaves upcoming bookings outside a clinician's shift.
+function confirmAffectedBookings(error) {
+  const details = error.details || {};
+  return new Promise((resolve) => {
+    const dialog = document.createElement("dialog");
+    dialog.className = "patient-status-dialog shift-affected-dialog";
+    const listed = (details.affected || []).slice(0, 8);
+    const rows = listed.map((item) => `<li><strong>${escapeHtml(formatDate(parseLocalDate(item.date), { day: "numeric", month: "short" }))} · ${escapeHtml(item.time)}</strong> ${escapeHtml(item.clinician)} · ${escapeHtml(item.patientCode)}${item.clashesWith?.length ? `<span class="shift-clash">Overlaps new ${escapeHtml(item.clashesWith.join(", "))}: not booked then that day</span>` : ""}${item.splitVisit ? `<span class="shift-clash">Back-to-back visit would be split by a lunch break or gap</span>` : ""}</li>`).join("");
+    const more = (details.affectedCount || 0) - listed.length;
+    const list = rows || more > 0 ? `<ul class="shift-affected-list">${rows}${more > 0 ? `<li>and ${more} more</li>` : ""}</ul>` : "";
+    dialog.innerHTML = `<form method="dialog" class="shift-affected-form"><h3>${escapeHtml(details.title || "Bookings affected by this change")}</h3>${String(error.message).split("\n").map((line) => `<p>${escapeHtml(line)}</p>`).join("")}${list}<div class="dialog-actions"><button class="ghost-button" value="cancel" type="submit">Cancel</button><button class="primary-button" value="ok" type="submit">${escapeHtml(details.confirmLabel || "Save anyway")}</button></div></form>`;
+    document.body.append(dialog);
+    // Settle from the button itself (the dialog's own close event is not fired reliably everywhere).
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      resolve(ok);
+      if (dialog.open) dialog.close();
+      dialog.remove();
+    };
+    $$("button[value]", dialog).forEach((button) => button.addEventListener("click", (event) => {
+      event.preventDefault();
+      finish(button.value === "ok");
+    }));
+    dialog.addEventListener("cancel", () => finish(false));
+    dialog.addEventListener("close", () => finish(dialog.returnValue === "ok"));
+    dialog.showModal();
+  });
+}
+
+// POST a shift change; if bookings are affected, confirm and resend with acknowledgement.
+async function postShiftChange(path, body) {
+  try {
+    return await api(path, { method: "POST", body: JSON.stringify(body) });
+  } catch (error) {
+    if (error.status === 409 && error.details?.needsAcknowledgement) {
+      if (!(await confirmAffectedBookings(error))) return null;
+      return api(path, { method: "POST", body: JSON.stringify({ ...body, acknowledgeAffected: true }) });
+    }
+    throw error;
+  }
+}
+
+async function assignTherapistShift(therapistIds, shiftId) {
+  try {
+    const result = await postShiftChange("/api/therapists/shift", { therapistIds, shiftId: shiftId === "" ? null : Number(shiftId) });
+    if (!result) return false;
+    const kept = result.affected ? ` ${result.affected} existing booking${result.affected === 1 ? "" : "s"} kept as booked.` : "";
+    toast("Shift updated", `${result.assigned} clinician${result.assigned === 1 ? "" : "s"} now on ${result.shiftName}.${kept}`);
+    return true;
+  } catch (error) {
+    toast("Couldn’t change the shift", error.message, "error");
+    return false;
+  }
+}
+
+function teamShiftCell(item) {
+  const options = teamDirectory.centreShifts?.[String(item.locationId)] || [{ id: null, name: item.shiftName, isDefault: true }];
+  if (options.length < 2) return `<span class="shift-name">${escapeHtml(item.shiftName)}</span>`;
+  const select = `<select class="shift-select" data-therapist-shift="${item.id}" aria-label="Shift for ${escapeHtml(item.name)}">${options.map((option) => `<option value="${option.id ?? ""}" ${String(option.id ?? "") === String(item.shiftId ?? "") ? "selected" : ""}>${escapeHtml(option.name)}</option>`).join("")}</select>`;
+  return select + (item.shiftNeedsCheck ? `<span class="shift-check" title="New clinician on the default shift. Check their shift.">Check shift</span>` : "");
+}
+
+const teamSelection = new Set();
+
+// Header box: ticked when every clinician shown is selected, part-ticked when some are.
+function syncTeamPickAll() {
+  const pickAll = $("#teamPickAll");
+  if (!pickAll) return;
+  const picked = teamMatches.filter((item) => teamSelection.has(item.id)).length;
+  pickAll.checked = Boolean(teamMatches.length) && picked === teamMatches.length;
+  pickAll.indeterminate = picked > 0 && picked < teamMatches.length;
+  pickAll.disabled = !teamMatches.length;
+}
+
+function bindTeamShiftControls(root, rows) {
+  $$("[data-therapist-shift]", root).forEach((select) => select.addEventListener("change", async () => {
+    const therapist = rows.find((item) => String(item.id) === select.dataset.therapistShift);
+    select.disabled = true;
+    const done = await assignTherapistShift([therapist.id], select.value);
+    if (done) await loadTeamView(); else { select.value = String(therapist.shiftId ?? ""); select.disabled = false; }
+  }));
+  $$("[data-team-pick]", root).forEach((box) => box.addEventListener("change", () => {
+    if (box.checked) teamSelection.add(Number(box.dataset.teamPick)); else teamSelection.delete(Number(box.dataset.teamPick));
+    syncTeamPickAll();
+    renderTeamBulkBar();
+  }));
+  renderTeamBulkBar();
+}
+
+// Bulk assign: tick clinicians of one centre, pick a shift, apply.
+function renderTeamBulkBar() {
+  const bar = $("#teamBulkBar");
+  if (!bar || !teamDirectory) return;
+  const picked = teamDirectory.therapists.filter((item) => teamSelection.has(item.id));
+  bar.hidden = !picked.length;
+  if (!picked.length) return;
+  const centres = [...new Set(picked.map((item) => item.locationId))];
+  const options = centres.length === 1 ? (teamDirectory.centreShifts?.[String(centres[0])] || []) : [];
+  const assign = centres.length > 1
+    ? `<span class="fine-print">Pick clinicians from one centre to assign a shift together.</span>`
+    : `<label>Move to<select id="teamBulkShift">${options.map((option) => `<option value="${option.id ?? ""}">${escapeHtml(option.name)}</option>`).join("")}</select></label><button class="primary-button" type="button" id="teamBulkApply">Assign shift</button>`;
+  bar.innerHTML = `<span><strong>${picked.length}</strong> selected</span>${assign}<button class="ghost-button" type="button" id="teamBulkClear">Clear</button>`;
+  $("#teamBulkClear", bar).addEventListener("click", () => { teamSelection.clear(); renderTeamView(); });
+  $("#teamBulkApply", bar)?.addEventListener("click", async () => {
+    const button = $("#teamBulkApply", bar);
+    button.disabled = true;
+    if (await assignTherapistShift([...teamSelection], $("#teamBulkShift", bar).value)) { teamSelection.clear(); await loadTeamView(); }
+    else button.disabled = false;
+  });
+}
+
+// ---- Shifts screen --------------------------------------------------------------
+
+let shiftsData = null;
+let shiftEditor = null;  // {id, isDefault, locationId, name, status, items:[{kind, breakKind, start, end}], warnings:[]}
+
+function addMinutes(value, minutes) {
+  const [hours, mins] = value.split(":").map(Number);
+  const total = Math.min(23 * 60 + 59, hours * 60 + mins + minutes);
+  return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+}
+
+function minutesOf(value) {
+  const [hours, mins] = String(value).split(":").map(Number);
+  return hours * 60 + mins;
+}
+
+// Session length for the shift being edited: the centre's length, or, when the centre has no
+// active shift, the length of this shift's first session (it sets the length for all the others).
+function editorSessionLength(data, items) {
+  if (data.lengthLocked) return data.sessionMinutes;
+  const first = items.filter((item) => item.kind === "session").sort((a, b) => minutesOf(a.start) - minutesOf(b.start))[0];
+  const length = first ? minutesOf(first.end) - minutesOf(first.start) : data.sessionMinutes;
+  return length > 0 ? length : data.sessionMinutes;
+}
+
+function isFirstSession(items, index) {
+  const sessions = items.map((item, at) => ({ ...item, at })).filter((item) => item.kind === "session")
+    .sort((a, b) => minutesOf(a.start) - minutesOf(b.start));
+  return sessions.length > 0 && sessions[0].at === index;
+}
+
+function shiftSummary(shift) {
+  const sessions = shift.items.filter((item) => item.kind === "session");
+  if (!sessions.length) return "No sessions";
+  return `${formatClock(sessions[0].start)} – ${formatClock(sessions[sessions.length - 1].end)} · ${sessions.length} session${sessions.length === 1 ? "" : "s"}`;
+}
+
+async function loadShiftsView() {
+  const root = $("#view-shifts");
+  root.innerHTML = `<div class="loading-state"><span class="spinner"></span>Loading shifts…</div>`;
+  try {
+    shiftsData = await api(`/api/shifts${state.shiftLocation ? `?location=${encodeURIComponent(state.shiftLocation)}` : ""}`);
+    state.shiftLocation = String(shiftsData.locationId ?? "");
+    if (shiftEditor && String(shiftEditor.locationId) !== state.shiftLocation) shiftEditor = null;
+    renderShiftsView();
+  } catch (error) { root.innerHTML = errorState(error.message); }
+}
+
+function isEditing(shift) {
+  return shiftEditor && (shift.id !== null ? shiftEditor.id === shift.id : shiftEditor.isDefault && shiftEditor.id === null);
+}
+
+function renderShiftsView() {
+  const root = $("#view-shifts");
+  const data = shiftsData;
+  const centrePicker = `<label class="shift-centre-picker">Centre<select id="shiftCentre" aria-label="Centre">${data.locations.map((item) => `<option value="${item.id}" ${String(item.id) === state.shiftLocation ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}</select></label>`;
+  const cards = data.shifts.map((shift, index) => `<li><button type="button" class="shift-card${isEditing(shift) ? " is-selected" : ""}" data-shift-index="${index}">
+      <span class="shift-card-top"><strong>${escapeHtml(shift.name)}</strong>${shift.isDefault && shift.status !== "inactive" ? `<span class="soft-pill">Default</span>` : ""}${shift.status === "draft" ? `<span class="status-pill status-pending_confirmation">Draft</span>` : ""}${shift.status === "inactive" ? `<span class="status-pill status-needs_rescheduling">Inactive</span>` : ""}</span>
+      <span class="shift-card-meta">${escapeHtml(shiftSummary(shift))}</span>
+      <span class="shift-card-meta">${shift.doctors} clinician${shift.doctors === 1 ? "" : "s"}</span>
+    </button></li>`).join("");
+  const empty = `<div class="panel-empty">${icon("clock")}<strong>Choose a shift</strong><span>Pick a shift to view or edit its sessions and breaks, or create a new one.</span></div>`;
+  root.innerHTML = `${pageHeading("Timetables", "Shifts", centrePicker)}
+    <div class="shifts-layout">
+      <section class="panel shift-list-panel" aria-labelledby="shiftListTitle">
+        <div class="panel-header"><div><h2 id="shiftListTitle">Shifts</h2><p>${data.lengthLocked ? `${data.sessionMinutes}-minute sessions` : "No active shift · the next shift’s first session sets the session length"} · ${escapeHtml(formatClock(data.dayStart))}–${escapeHtml(formatClock(data.dayEnd))}</p>${data.withoutShift ? `<p class="shift-check-note">${data.withoutShift} clinician${data.withoutShift === 1 ? " is" : "s are"} not scheduled until a shift is in use.</p>` : ""}</div><button class="secondary-button compact-button" type="button" id="newShift">${icon("plus")}New shift</button></div>
+        <ul class="shift-card-list">${cards}</ul>
+      </section>
+      <section class="panel shift-editor-panel" aria-labelledby="shiftEditorTitle">${shiftEditor ? shiftEditorMarkup(data) : empty}</section>
+    </div>`;
+  $("#shiftCentre", root).addEventListener("change", (event) => { state.shiftLocation = event.target.value; shiftEditor = null; loadShiftsView(); });
+  // Type to find a centre (there can be 25+), like the other branch pickers.
+  makeSearchableSelect($("#shiftCentre", root), "Search centres");
+  $("#newShift", root).addEventListener("click", () => {
+    const start = "09:00";
+    shiftEditor = { id: null, isDefault: false, locationId: state.shiftLocation, name: "", status: "draft", warnings: [],
+      items: [{ kind: "session", breakKind: null, start, end: addMinutes(start, data.sessionMinutes) }] };
+    renderShiftsView();
+    $("#shiftName")?.focus();
+  });
+  $$("[data-shift-index]", root).forEach((button) => button.addEventListener("click", () => {
+    const shift = data.shifts[Number(button.dataset.shiftIndex)];
+    shiftEditor = { id: shift.id, isDefault: shift.isDefault, standard: Boolean(shift.standard), locationId: state.shiftLocation,
+      name: shift.name, status: shift.status, warnings: [], items: shift.items.map((item) => ({ ...item })) };
+    renderShiftsView();
+  }));
+  if (shiftEditor) bindShiftEditor(root, data);
+}
+
+function shiftEditorMarkup(data) {
+  const editor = shiftEditor;
+  const rows = editor.items.map((item, index) => `<tr>
+      <td><select data-row-kind="${index}" aria-label="Row ${index + 1} type"><option value="session" ${item.kind === "session" ? "selected" : ""}>Session</option><option value="short" ${item.kind === "break" && item.breakKind === "short" ? "selected" : ""}>Short break</option><option value="lunch" ${item.kind === "break" && item.breakKind === "lunch" ? "selected" : ""}>Lunch</option></select></td>
+      <td><input type="time" step="300" data-row-start="${index}" value="${escapeHtml(item.start)}" aria-label="Row ${index + 1} start"></td>
+      <td><input type="time" step="300" data-row-end="${index}" value="${escapeHtml(item.end)}" aria-label="Row ${index + 1} end" ${item.kind === "session" && (data.lengthLocked || !isFirstSession(editor.items, index)) ? "readonly" : ""}></td>
+      <td><button class="icon-button" type="button" data-row-remove="${index}" aria-label="Remove row ${index + 1}">${icon("close")}</button></td>
+    </tr>`).join("");
+  const warnings = editor.warnings.length ? `<div class="shift-warnings" role="alert">${icon("alert")}<div><strong>Overlapping times</strong><ul>${editor.warnings.map((text) => `<li>${escapeHtml(text)}</li>`).join("")}</ul><span>Saved as a draft. Fix these to use the shift for scheduling.</span></div></div>` : "";
+  const inactive = editor.status === "inactive";
+  const canDeactivate = !inactive && (editor.id !== null || editor.isDefault);
+  const isNew = editor.id === null && !editor.isDefault;
+  const length = editorSessionLength(data, editor.items);
+  const note = inactive ? "Deactivated · kept here, not used for scheduling. Reactivate it to use it again."
+    : !data.lengthLocked ? `The first session sets the session length for this centre: now ${length} minutes.`
+    : editor.isDefault ? "Default shift · clinicians without another shift work these hours."
+    : editor.status === "draft" ? "Draft · not used for scheduling yet." : "In use for scheduling.";
+  const saveButtons = inactive ? `<button class="primary-button" type="button" id="reactivateShift">Reactivate</button>`
+    : editor.isDefault || editor.status === "active"
+    ? `<button class="primary-button" type="submit" data-activate="true">Save</button>`
+    : `<button class="secondary-button" type="submit" data-activate="false">Save draft</button><button class="primary-button" type="submit" data-activate="true">Save and use</button>`;
+  return `<div class="panel-header"><div><h2 id="shiftEditorTitle">${isNew ? "New shift" : escapeHtml(editor.name)}</h2><p>${note}</p></div>${canDeactivate ? `<button class="danger-button compact-button" type="button" id="archiveShift">${editor.standard || editor.id === null ? "Deactivate shift" : "Delete shift"}</button>` : ""}</div>
+    <form class="shift-editor" id="shiftEditorForm">
+      <label class="shift-name-field">Name<input id="shiftName" maxlength="80" value="${escapeHtml(editor.name)}" ${editor.isDefault ? "readonly" : ""} required></label>
+      <div class="table-shell shift-rows"><table class="data-table"><thead><tr><th>Type</th><th>Start</th><th>End</th><th><span class="visually-hidden">Remove</span></th></tr></thead><tbody>${rows}</tbody></table></div>
+      <div class="shift-row-actions"><button class="ghost-button" type="button" id="addSession">${icon("plus")}Add session</button><button class="ghost-button" type="button" id="addBreak">${icon("plus")}Add break</button></div>
+      ${warnings}
+      <p class="replacement-error" id="shiftError" role="alert" hidden></p>
+      <div class="shift-save-actions">${saveButtons}</div>
+    </form>`;
+}
+
+function readShiftRows(root) {
+  shiftEditor.name = $("#shiftName", root)?.value ?? shiftEditor.name;
+  const raw = shiftEditor.items.map((item, index) => {
+    const kind = $(`[data-row-kind="${index}"]`, root).value;
+    const isSession = kind === "session";
+    return { kind: isSession ? "session" : "break", breakKind: isSession ? null : kind,
+      start: $(`[data-row-start="${index}"]`, root).value || item.start,
+      end: $(`[data-row-end="${index}"]`, root).value || item.end };
+  });
+  // Locked centres keep their length; otherwise the first session's own end sets it.
+  const length = editorSessionLength(shiftsData, raw);
+  shiftEditor.items = raw.map((item, index) => (item.kind === "session" && (shiftsData.lengthLocked || !isFirstSession(raw, index))
+    ? { ...item, end: addMinutes(item.start, length) } : item));
+}
+
+function bindShiftEditor(root, data) {
+  if (shiftEditor.status === "inactive") {
+    // A deactivated Shift 1 is shown as it was; it can only be reactivated.
+    $$("#shiftEditorForm input, #shiftEditorForm select, [data-row-remove], #addSession, #addBreak", root)
+      .forEach((element) => { element.disabled = true; });
+    $("#reactivateShift", root)?.addEventListener("click", async () => {
+      try {
+        // Warns first: shifts of another session length are deleted, bookings stay as booked.
+        const result = await postShiftChange(`/api/shifts/${shiftEditor.id}/reactivate`, {});
+        if (!result) return;
+        toast("Shift reactivated", result.deleted?.length
+          ? `${shiftEditor.name} is in use again. Deleted: ${result.deleted.join(", ")}.`
+          : `${shiftEditor.name} is in use again.`);
+        shiftEditor = null;
+        await loadShiftsView();
+      } catch (error) { toast("Couldn’t reactivate the shift", error.message, "error"); }
+    });
+    return;
+  }
+  const rerender = () => { readShiftRows(root); renderShiftsView(); };
+  $$("[data-row-kind], [data-row-start], [data-row-end]", root).forEach((input) => input.addEventListener("change", rerender));
+  $$("[data-row-remove]", root).forEach((button) => button.addEventListener("click", () => {
+    readShiftRows(root);
+    shiftEditor.items.splice(Number(button.dataset.rowRemove), 1);
+    renderShiftsView();
+  }));
+  const addRow = (kind) => {
+    readShiftRows(root);
+    const last = shiftEditor.items[shiftEditor.items.length - 1];
+    const start = last ? last.end : "09:00";  // A new row starts where the previous one ended.
+    shiftEditor.items.push(kind === "session"
+      ? { kind: "session", breakKind: null, start, end: addMinutes(start, editorSessionLength(data, shiftEditor.items)) }
+      : { kind: "break", breakKind: "short", start, end: addMinutes(start, 15) });
+    renderShiftsView();
+  };
+  $("#addSession", root).addEventListener("click", () => addRow("session"));
+  $("#addBreak", root).addEventListener("click", () => addRow("break"));
+  $("#archiveShift", root)?.addEventListener("click", async () => {
+    try {
+      const result = shiftEditor.id === null
+        ? await postShiftChange("/api/shifts/default/archive", { locationId: Number(state.shiftLocation) })
+        : await postShiftChange(`/api/shifts/${shiftEditor.id}/archive`, {});
+      if (!result) return;
+      toast(result.kept ? "Shift deactivated" : "Shift deleted",
+        result.kept ? `${shiftEditor.name} is kept as Inactive.` : `${shiftEditor.name} was deleted.`);
+      shiftEditor = null;
+      await loadShiftsView();
+    } catch (error) { toast("Couldn’t deactivate the shift", error.message, "error"); }
+  });
+  $("#shiftEditorForm", root).addEventListener("submit", async (event) => {
+    event.preventDefault();
+    readShiftRows(root);
+    const activate = event.submitter?.dataset.activate === "true";
+    $$("button", event.currentTarget).forEach((button) => { button.disabled = true; });
+    try {
+      const result = await postShiftChange("/api/shifts", { id: shiftEditor.id, isDefault: shiftEditor.isDefault,
+        locationId: Number(state.shiftLocation), name: shiftEditor.name, items: shiftEditor.items, activate });
+      if (!result) { renderShiftsView(); return; }
+      shiftEditor = { ...shiftEditor, id: result.shift.id, status: result.shift.status, warnings: result.warnings || [],
+        items: result.shift.items.map((item) => ({ ...item })) };
+      toast(result.shift.status === "active" ? "Shift saved" : "Draft saved",
+        result.warnings?.length ? "Fix the overlapping times before using it." : `${result.shift.name} · ${shiftSummary(result.shift)}`);
+      await loadShiftsView();
+    } catch (error) {
+      if (error.details?.warnings) shiftEditor.warnings = error.details.warnings;
+      renderShiftsView();
+      const line = $("#shiftError");
+      if (line) { line.textContent = error.message; line.hidden = false; }
+    }
+  });
 }
 
 function renderReleasedAppointments(operations) {
@@ -1606,7 +2076,7 @@ async function openAppointment(item) {
         <div><dt>Location</dt><dd>${escapeHtml(item.location)}</dd></div>
         <div><dt>Plan</dt><dd>${plan.length ? `<ul class="appointment-plan">${plan.map(therapy => `<li><span>${escapeHtml(therapy.therapy)}</span><span>${escapeHtml(therapy.sessionsPerWeek)} ${therapy.sessionsPerWeek === 1 ? "session" : "sessions"}/week</span></li>`).join("")}</ul>` : '<span class="appointment-plan-empty">No active plan recorded.</span>'}</dd></div>
       </dl>
-      ${canChange ? `<section class="drawer-section"><h3>Cancel appointment</h3><form class="preference-form" id="cancelAppointmentForm"><label>Cancel<select id="cancelAppointmentScope"><option value="session">This session</option><option value="visit">Entire visit (${visit.length} ${visit.length === 1 ? "session" : "sessions"})</option></select></label><ul id="cancelScopeSummary" class="cancel-scope-summary"></ul><label>Reason<textarea id="cancelAppointmentReason" rows="2" maxlength="1000" required></textarea></label><p class="fine-print">The opening will be released for staff to choose a replacement. No replacement is booked automatically.</p><p id="cancelAppointmentError" class="replacement-error" role="alert" hidden></p>${staffCancellationEnabled ? "" : '<p class="fine-print" role="status">This action needs the updated Thanal backend. It is not available in this session yet.</p>'}<button class="danger-button" type="submit" ${staffCancellationEnabled ? "" : "disabled"}>Confirm cancellation</button></form></section><section class="drawer-section"><h3>Move this visit</h3><form class="form-grid" id="moveAppointmentForm"><label>New date<input type="date" id="moveDate" value="${item.date}" required></label><label>New starting time<select id="moveSlot">${state.overview.slotLabels.map((label, index) => `<option value="${index}" ${index === item.slot ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></label><button class="secondary-button" type="submit">Validate and move</button></form></section>` : ""}
+      ${canChange ? `<section class="drawer-section"><h3>Cancel appointment</h3><form class="preference-form" id="cancelAppointmentForm"><label>Cancel<select id="cancelAppointmentScope"><option value="session">This session</option><option value="visit">Entire visit (${visit.length} ${visit.length === 1 ? "session" : "sessions"})</option></select></label><ul id="cancelScopeSummary" class="cancel-scope-summary"></ul><label>Reason<textarea id="cancelAppointmentReason" rows="2" maxlength="1000" required></textarea></label><p class="fine-print">The opening will be released for staff to choose a replacement. No replacement is booked automatically.</p><p id="cancelAppointmentError" class="replacement-error" role="alert" hidden></p>${staffCancellationEnabled ? "" : '<p class="fine-print" role="status">This action needs the updated Thanal backend. It is not available in this session yet.</p>'}<button class="danger-button" type="submit" ${staffCancellationEnabled ? "" : "disabled"}>Confirm cancellation</button></form></section><section class="drawer-section"><h3>Move this visit</h3><form class="form-grid" id="moveAppointmentForm"><label>New date<input type="date" id="moveDate" value="${item.date}" required></label><label>New starting time<select id="moveSlot">${centreSessionChoices(item.locationId).map((session) => `<option value="${session.id}" ${session.id === item.slot ? "selected" : ""}>${escapeHtml(session.label)}</option>`).join("")}</select></label><button class="secondary-button" type="submit">Validate and move</button></form></section>` : ""}
     </div>`;
   $('[data-close-appointment]', drawer).addEventListener("click", closeDrawers);
   if (canChange) {

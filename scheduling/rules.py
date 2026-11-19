@@ -1,7 +1,12 @@
 from datetime import timedelta
 
-from scheduling.slot_config import WORKING_DAYS, valid_consecutive_block
+from scheduling.slot_config import WORKING_DAYS, timetable_for
 from scheduling.types import SchedulingProblem, TherapyBundle
+
+
+def bundle_sessions(problem: SchedulingProblem, bundle: TherapyBundle, start_slot: int) -> tuple[int, ...] | None:
+    """The back-to-back sessions a visit starting at ``start_slot`` would use, or None."""
+    return timetable_for(problem, bundle.items[0].location_id).block(start_slot, len(bundle.items))
 
 
 def placement_rejection_reason(
@@ -18,15 +23,16 @@ def placement_rejection_reason(
         return "NON_WORKING_DAY"
     if problem.planning_start_date and target_date < problem.planning_start_date:
         return "PAST_PLANNING_DATE"
-    if not valid_consecutive_block(start_slot, len(bundle.items)):
-        return "CONSECUTIVE_BLOCK_UNAVAILABLE"
     locations = {item.location_id for item in bundle.items}
     if len(locations) > 1:
         return "LOCATION_TRANSITION_IMPOSSIBLE"
+    sessions = bundle_sessions(problem, bundle, start_slot)
+    if sessions is None:
+        return "CONSECUTIVE_BLOCK_UNAVAILABLE"
     if therapist_ids is None:
         therapist_ids = tuple(item.therapist_id for item in bundle.items)
     for offset, item in enumerate(bundle.items):
-        slot = start_slot + offset
+        slot = sessions[offset]
         if item.plan_start_date and target_date < item.plan_start_date:
             return "PLAN_NOT_STARTED"
         if item.plan_end_date and target_date > item.plan_end_date:

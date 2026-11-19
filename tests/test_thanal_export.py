@@ -76,16 +76,62 @@ def test_exact_output_uses_child_identity_and_name_without_guessing(booked):
     assert preview["openBatch"] is None
 
 
-def test_missing_or_ambiguous_lookup_blocks_before_export_preparation(booked, monkeypatch):
+def test_missing_or_ambiguous_lookup_holds_only_that_row(booked, monkeypatch):
     catalog = deepcopy(CATALOG)
     catalog["slot_bindings"].append({**catalog["slot_bindings"][0], "ID": "799"})
     monkeypatch.setattr(thanal_export, "default_catalog", lambda: catalog)
     result = export_preview(booked, DAY)
     assert len(result["changes"]) == 1
     assert "Slot Number" in result["blockedReasons"][0]["reason"]
-    with pytest.raises(ValueError, match="lookup/status"):
-        prepare_export(booked, DAY)
-    assert export_preview(booked, DAY)["openBatch"] is None
+    # User decision (18 Nov 2026): the valid row still goes; only the affected row waits.
+    batch = prepare_export(booked, DAY)
+    assert len(batch["changes"]) == 1 and len(batch["held"]) == 1
+    assert "Slot Number" in batch["held"][0]["reason"]
+
+
+def first_booking_at(flow, start, end):
+    from datetime import time
+    from scheduling.slot_config import encode_slot
+
+    with flow.sessions.begin() as session:
+        appointment = session.scalar(select(Appointment).order_by(Appointment.id))
+        appointment.slot_index = encode_slot(time(*start), time(*end))
+
+
+def test_new_shift_time_with_a_zoho_slot_exports_without_loading_shift_times(booked, monkeypatch):
+    catalog = deepcopy(CATALOG)
+    catalog["slot_bindings"].append({"branch_id": "10", "ID": "711", "Slot_Number": "11",
+                                     "appointment_slot_number": "11", "Start_Time": "12:35:00",
+                                     "End_Time": "13:15:00"})
+    monkeypatch.setattr(thanal_export, "default_catalog", lambda: catalog)
+    first_booking_at(booked, (12, 35), (13, 15))
+    preview = export_preview(booked, DAY)
+    assert not preview["blockedReasons"] and len(preview["changes"]) == 2
+    row = next(item for item in preview["changes"] if item["fields"]["Appointment_Time_Slot"] == "711")
+    assert row["fields"]["Slot_Number"] == 11
+    assert (row["fields"]["Date_Time"], row["fields"]["End_Time"]) == ("12/11/2026 12:35", "12/11/2026 13:15:00")
+
+
+def test_real_lookup_file_has_the_three_new_40_minute_zoho_slots():
+    """Refreshed from Zoho on 19 Nov 2026: 12:35, 16:50 and 17:30 are slots 11-13."""
+    from datetime import time
+    from scheduling.slot_config import encode_slot
+
+    catalog = thanal_export.default_catalog()
+    slots = thanal_export.bindings_from_catalog({"therapies": {}}, catalog["approved_branch_ids"][0], catalog)["slots"]
+    expected = {((12, 35), (13, 15)): 11, ((16, 50), (17, 30)): 12, ((17, 30), (18, 10)): 13}
+    for (start, end), number in expected.items():
+        assert slots[str(encode_slot(time(*start), time(*end)))]["number"] == number
+    assert len(slots) == len(catalog["slot_bindings"])  # every binding maps to exactly one session
+
+
+def test_a_time_zoho_lacks_holds_only_that_booking(booked):
+    first_booking_at(booked, (18, 20), (19, 0))
+    preview = export_preview(booked, DAY)
+    assert len(preview["changes"]) == 1
+    assert "Zoho has no 18:20–19:00 time slot" in preview["blockedReasons"][0]["reason"]
+    batch = prepare_export(booked, DAY)
+    assert len(batch["changes"]) == 1 and batch["held"][0]["reason"].startswith("Appointment time")
 
 
 def test_registration_display_must_be_verified_as_child_name(booked, monkeypatch):

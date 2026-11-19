@@ -52,6 +52,7 @@
         <button class="nav-item" data-view="overview"><svg><use href="#i-overview"/></svg><span>Overview</span></button>
         <button class="nav-item" data-view="patients"><svg><use href="#i-patients"/></svg><span>Patients</span></button>
         <button class="nav-item" data-view="team"><svg><use href="#i-team"/></svg><span>Clinical team</span></button>
+        <button class="nav-item" data-view="shifts"><svg><use href="#i-clock"/></svg><span>Shifts</span></button>
         <button class="nav-item" data-view="operations"><svg><use href="#i-operations"/></svg><span>Operations</span><span class="nav-badge" id="attentionBadge" hidden>0</span></button>
       </nav>
       <div class="sidebar-spacer"></div>
@@ -88,6 +89,7 @@
               <button data-calendar-day="tomorrow" aria-pressed="false">Tomorrow</button>
             </div>
             <span class="date-display day-display" id="dateDisplay">—</span>
+            <label class="shift-view-picker" id="shiftViewPicker" hidden>Shift<select id="shiftViewSelect" aria-label="Show clinicians on this shift"></select></label>
           </div>
 
           <div class="active-filter-row" id="activeFilters" hidden></div>
@@ -95,7 +97,6 @@
           <div class="calendar-summary" id="calendarSummary">
             <span><strong id="visibleAppointmentCount">0</strong> appointments</span>
             <span><strong id="visibleTherapistCount">0</strong> <span id="visibleEntityLabel">doctors scheduled</span></span>
-            <span class="privacy-note"><span class="status-dot"></span> Privacy-aware clinical view</span>
           </div>
           <div class="calendar-surface" id="calendarSurface" aria-live="polite">
             <div class="loading-state"><span class="spinner"></span>Loading the practice schedule…</div>
@@ -105,6 +106,7 @@
         <section class="view" id="view-overview" aria-labelledby="overviewTitle"></section>
         <section class="view" id="view-patients" aria-labelledby="patientsTitle"></section>
         <section class="view" id="view-team" aria-labelledby="teamTitle"></section>
+        <section class="view" id="view-shifts" aria-labelledby="shiftsTitle"></section>
         <section class="view" id="view-operations" aria-labelledby="operationsTitle"></section>
         <section class="view" id="view-generator" aria-labelledby="generatorTitle"></section>
       </main>

@@ -50,7 +50,7 @@ from database.repository import (
 )
 from importers.initialize_source import initialize_source_database
 from scheduling.cp_sat_scheduler import generate_weekly_schedule
-from scheduling.slot_config import CONSECUTIVE_TO_NEXT, SLOTS, slot_label
+from scheduling.slot_config import CONSECUTIVE_TO_NEXT, SLOTS, catalog_slots, known_slot, slot_def, slot_label
 from scheduling.types import ScheduleResult, SolverMode
 from services.absence_service import mark_patient_absent, mark_therapist_absent
 from services.appointment_service import move_appointment
@@ -121,30 +121,67 @@ PREFERENCE_ANY_TIME = "Any time"
 
 
 PREFERENCE_SLOTS_PREFIX = "slots:"  # patients.preferred_time, e.g. "slots:5,6,7"
-SLOT_START_TIMES = list(PREFERENCE_START_TIMES)  # index -> "HH:MM"
+MORNING_ENDS = "12:30"  # A session starting before this counts as "Morning".
+DEFAULT_SESSION_ORDER = [slot.slot_index for slot in SLOTS]
 
 
-def preference_slot_scores(slots: set[int]) -> dict[int, int]:
-    """Score each slot for a set of chosen start slots: 100 on a chosen one, 20 less per slot away
-    from the nearest chosen one, so the nearest free time wins when all chosen times are taken."""
+def start_hhmm(slot: int) -> str:
+    return slot_def(slot).start_time.strftime("%H:%M")
+
+
+def patient_session_choices(session, patient_id: int) -> tuple[list[int], list[int]]:
+    """(centre session order, sessions the child's own clinicians work) in clock order.
+
+    Preferred times follow the child's clinicians' shifts; a centre without shifts
+    uses the original 10 sessions.
+    """
+    from services.shift_service import load_shift_context
+
+    context = load_shift_context(session)
+    doctors = list(session.execute(
+        select(Therapist.id, Therapist.location_id).join(
+            TreatmentRequirement, TreatmentRequirement.assigned_therapist_id == Therapist.id)
+        .where(TreatmentRequirement.patient_id == patient_id, TreatmentRequirement.active.is_(True))).all())
+    location_id = doctors[0][1] if doctors else None
+    if location_id is None or location_id not in context.configured_locations():
+        return DEFAULT_SESSION_ORDER, DEFAULT_SESSION_ORDER
+    order = list(context.timetable(location_id).order)
+    worked = {slot for doctor, location in doctors if location == location_id
+              for slot in context.therapist_sessions(doctor, location_id)}
+    return order, [slot for slot in order if slot in worked] or order
+
+
+def preference_slot_scores(slots: set[int], order: list[int] | None = None) -> dict[int, int]:
+    """Score each session for a set of chosen start sessions: 100 on a chosen one, 20 less per
+    session away (in the centre's clock order) from the nearest chosen one, so the nearest free
+    time wins when all chosen times are taken."""
+    order = order or DEFAULT_SESSION_ORDER
     if not slots:
         return {}
-    return {slot.slot_index: max(0, PREFERRED_AVAILABILITY_SCORE - PREFERENCE_DISTANCE_STEP
-                                 * min(abs(slot.slot_index - chosen) for chosen in slots)) for slot in SLOTS}
+    chosen = [order.index(slot) for slot in slots if slot in order]
+    if not chosen:
+        return {}
+    return {slot: max(0, PREFERRED_AVAILABILITY_SCORE - PREFERENCE_DISTANCE_STEP
+                      * min(abs(position - other) for other in chosen))
+            for position, slot in enumerate(order)}
 
 
-def preferred_slots_from_request(times: Any, period: Any) -> set[int]:
+def preferred_slots_from_request(times: Any, period: Any, order: list[int] | None = None) -> set[int]:
     """Read start times ("HH:MM" list); older clients send one "period" (band or "HH:MM")."""
+    order = order or DEFAULT_SESSION_ORDER
     if times is None:
         times = [] if period in (None, "") else [period]
     if not isinstance(times, list):
         raise ApiError(HTTPStatus.BAD_REQUEST, "Choose valid preferred times")
+    starts = {start_hhmm(slot): slot for slot in order}
     slots: set[int] = set()
     for value in times:
-        if value in PREFERENCE_PERIODS:
-            slots.update(PREFERENCE_PERIODS[value])
-        elif value in PREFERENCE_START_TIMES:
-            slots.add(PREFERENCE_START_TIMES[value])
+        if value == "morning":
+            slots.update(slot for slot in order if start_hhmm(slot) < MORNING_ENDS)
+        elif value == "afternoon":
+            slots.update(slot for slot in order if start_hhmm(slot) >= MORNING_ENDS)
+        elif value in starts:
+            slots.add(starts[value])
         else:
             raise ApiError(HTTPStatus.BAD_REQUEST, "Choose a valid preferred time")
     return slots
@@ -178,7 +215,8 @@ def summarize_preference(patient: Patient, rows: list[PatientAvailability]) -> t
         days = sorted({item.day_of_week for item in rows})
         if len(days) == len(PREFERENCE_DAY_LABELS):
             days = []
-    return days, [SLOT_START_TIMES[slot] for slot in sorted(stored_preferred_slots(patient, rows))]
+    chosen = [slot for slot in stored_preferred_slots(patient, rows) if known_slot(slot)]
+    return days, [start_hhmm(slot) for slot in sorted(chosen, key=lambda slot: slot_def(slot).start_time)]
 
 
 def preference_labels(days: list[int], times: list[str]) -> tuple[str, str]:
@@ -187,17 +225,18 @@ def preference_labels(days: list[int], times: list[str]) -> tuple[str, str]:
         day_label = ", ".join(PREFERENCE_DAY_LABELS[day][:3] for day in days)
     else:
         day_label = "Every day" if times else "Not set"
-    slots = {PREFERENCE_START_TIMES[time] for time in times}
-    band = next((label for key, label in PREFERENCE_PERIOD_LABELS.items() if slots == set(PREFERENCE_PERIODS[key])),
-                None)
+    original = {start_hhmm(slot) for slot in DEFAULT_SESSION_ORDER}
+    bands = {"Morning": {time for time in original if time < MORNING_ENDS},
+             "Afternoon": {time for time in original if time >= MORNING_ENDS}}
+    band = next((label for label, members in bands.items() if set(times) == members), None)
     if not times:
         time_label = PREFERENCE_ANY_TIME if days else "Not set"
-    elif len(times) == len(SLOTS):
+    elif set(times) == original:
         time_label = PREFERENCE_ANY_TIME
     elif band:
         time_label = band
     else:
-        short = [SLOTS[PREFERENCE_START_TIMES[time]].start_time.strftime("%I:%M %p").lstrip("0") for time in times]
+        short = [datetime.strptime(time, "%H:%M").strftime("%I:%M %p").lstrip("0") for time in times]
         time_label = "Starts " + (", ".join(short) if len(short) <= 3 else f"{short[0]} +{len(short) - 1} more")
     return day_label, time_label
 
@@ -252,10 +291,11 @@ UNMET_REASON_LABELS = {
 class ApiError(Exception):
     """A request error that should be returned as JSON."""
 
-    def __init__(self, status: HTTPStatus, message: str) -> None:
+    def __init__(self, status: HTTPStatus, message: str, details: dict | None = None) -> None:
         super().__init__(message)
         self.status = status
         self.message = message
+        self.details = details or {}
 
 
 def whatsapp_webhook_challenge(query: dict[str, list[str]]) -> str:
@@ -1282,7 +1322,7 @@ def creator_status(appointment_status: AppointmentStatus) -> str:
 def creator_appointment_fields(row) -> dict[str, Any]:
     """Build the flat fields required by Creator's therapy-scheduler form."""
     appointment = row[0]
-    slot = SLOTS[appointment.slot_index]
+    slot = slot_def(appointment.slot_index)
     patient_code = row.patient_code
     therapy_plan = f"{patient_code} - {row.department_name} - Plan {appointment.treatment_requirement_id}"
     return {
@@ -1511,6 +1551,10 @@ def schedule_payload(start: date, days: int) -> dict[str, Any]:
             )
         )))
         zoho_departments = calendar_department_names(session)
+        from services.shift_service import calendar_shift_data
+        therapist_rows = list(session.scalars(select(Therapist).order_by(Therapist.name)))
+        # Sessions of the bookings shown always get a row, even after a shift stops using that time.
+        shift_data = calendar_shift_data(session, therapist_rows, {row[0].slot_index for row in rows})
         therapists = [{
             "id": item.id,
             "code": item.therapist_code,
@@ -1522,7 +1566,8 @@ def schedule_payload(start: date, days: int) -> dict[str, Any]:
             "location": item.location.name,
             "locationId": item.location_id,
             "active": item.active,
-        } for item in session.scalars(select(Therapist).order_by(Therapist.name))]
+            **shift_data["therapistShifts"][item.id],
+        } for item in therapist_rows]
         departments = [{"id": item.id, "name": item.name} for item in session.scalars(
             select(Department).where(Department.active.is_(True)).order_by(Department.name)
         )]
@@ -1557,15 +1602,13 @@ def schedule_payload(start: date, days: int) -> dict[str, Any]:
         "patients": patients,
         "departments": departments,
         "locations": locations,
-        "slotLabels": [slot_label(index) for index in range(len(SLOTS))],
-        "calendarBreaks": [{
-            "afterSlot": before.slot_index,
-            "start": before.end_time.strftime("%H:%M"),
-            "end": after.start_time.strftime("%H:%M"),
-            "label": "Lunch break",
-        } for before, after in zip(SLOTS, SLOTS[1:])
-            if before.end_time < after.start_time
-            and not CONSECUTIVE_TO_NEXT[before.slot_index]],
+        # Every session in clock order (shift times included), each clinician's shift
+        # (above), and the shift names for the calendar filter.
+        "sessions": shift_data["sessions"],
+        "slotLabels": shift_data["slotLabels"],
+        "centreSessions": shift_data["centreSessions"],
+        "defaultSessions": shift_data["defaultSessions"],
+        "shiftOptions": shift_data["shiftOptions"],
     }
 
 
@@ -1579,6 +1622,18 @@ def patients_payload(query: str = "") -> dict[str, Any]:
             .group_by(TreatmentRequirement.patient_id)
         ).all())
         patients = list(session.scalars(select(Patient).order_by(Patient.patient_code)))
+        # Each child's centre(s), for the Centre filter: from active plans, else any earlier plan.
+        active_centres: dict[int, set[str]] = {}
+        any_centres: dict[int, set[str]] = {}
+        for patient_id, active, centre in session.execute(
+            select(TreatmentRequirement.patient_id, TreatmentRequirement.active, Location.name)
+            .join(Location, Location.id == TreatmentRequirement.location_id)
+        ):
+            any_centres.setdefault(patient_id, set()).add(centre)
+            if active:
+                active_centres.setdefault(patient_id, set()).add(centre)
+        from services.shift_service import load_catalog
+        load_catalog(session)  # Shift session times (e.g. 12:35) for the preference labels.
         preference_rows: dict[int, list[PatientAvailability]] = {}
         for item in session.scalars(select(PatientAvailability).where(
             PatientAvailability.available.is_(True),
@@ -1602,6 +1657,7 @@ def patients_payload(query: str = "") -> dict[str, Any]:
             "active": patient.active,
             "therapies": requirement_counts.get(patient.id, 0),
             "cancelStreak": streaks.get(patient.id, 0),
+            "centres": sorted(active_centres.get(patient.id) or any_centres.get(patient.id) or []),
         })
     return {"patients": rows, "total": len(rows),
             "cancelStreakWarning": CANCELLATION_STREAK_WARNING}
@@ -1609,6 +1665,7 @@ def patients_payload(query: str = "") -> dict[str, Any]:
 
 def serialize_patient_preferences(session, patient: Patient) -> dict[str, Any]:
     """Return one patient's preferences and current prescribed therapy plan."""
+    _, choices = patient_session_choices(session, patient.id)  # Also loads shift session times.
     availability = list(session.scalars(select(PatientAvailability).where(
         PatientAvailability.patient_id == patient.id,
         PatientAvailability.available.is_(True),
@@ -1643,7 +1700,8 @@ def serialize_patient_preferences(session, patient: Patient) -> dict[str, Any]:
             "days": preferred_days,
             "times": preferred_times,
         },
-        "startTimes": list(PREFERENCE_START_TIMES),
+        # The child's own clinicians' session start times (their shifts), in clock order.
+        "startTimes": [start_hhmm(slot) for slot in choices],
         # For reference beside the day picker: the child comes this many times a week.
         "visitsPerWeek": visits_per_week(session, patient.id),
         "plan": plan,
@@ -1676,18 +1734,27 @@ def therapists_payload(start: date) -> dict[str, Any]:
             .group_by(Appointment.therapist_id)
         ).all())
         therapists = list(session.scalars(select(Therapist).order_by(Therapist.name)))
+        from services.shift_service import calendar_shift_data, centre_shift_options
+        shifts = calendar_shift_data(session, therapists)["therapistShifts"]
+        centre_shifts = centre_shift_options(session, [item.location_id for item in therapists])
         rows = [{
             "id": item.id,
             "code": item.therapist_code,
             "name": item.name,
             "department": item.department.name,
             "location": item.location.name,
+            "locationId": item.location_id,
             "appointments": counts.get(item.id, 0),
-            # A clinician can see one child per slot: 10 slots x 6 working days = 60 a week.
-            "capacity": len(SLOTS) * SCHEDULING_WEEK_DAYS,
+            # One child per session: the sessions of their shift x 6 working days.
+            "capacity": len(shifts[item.id]["sessions"]) * SCHEDULING_WEEK_DAYS,
             "active": item.active,
+            "shiftId": shifts[item.id]["shiftId"],
+            "shiftName": shifts[item.id]["shiftName"],
+            "shiftNeedsCheck": shifts[item.id]["shiftNeedsCheck"],
+            # The centre has no active shift: not scheduled until assigned to a new one.
+            "noShift": shifts[item.id]["shiftId"] is None and not shifts[item.id]["shiftDefault"],
         } for item in therapists]
-    return {"therapists": rows, "weekStart": start.isoformat()}
+    return {"therapists": rows, "weekStart": start.isoformat(), "centreShifts": centre_shifts}
 
 
 def operations_payload(today: date | None = None) -> dict[str, Any]:
@@ -1986,6 +2053,9 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             if match:
                 self.send_json(patient_preferences_payload(int(match.group(1))))
                 return
+            if parsed.path == "/api/shifts":
+                self.send_json(self.shifts_view(parse_qs(parsed.query)))
+                return
             if parsed.path == "/api/therapists":
                 params = parse_qs(parsed.query)
                 start = monday(parse_date(
@@ -2026,7 +2096,7 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
                     return
             super().do_GET()
         except ApiError as exc:
-            self.send_json({"error": exc.message}, exc.status)
+            self.send_json({"error": exc.message, **exc.details}, exc.status)
         except (ValueError, TypeError) as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         except Exception as exc:  # pragma: no cover - final HTTP safety net
@@ -2080,6 +2150,23 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             if match:
                 self.save_therapist_status(int(match.group(1)), body)
                 return
+            if parsed.path == "/api/shifts":
+                self.save_shift(body)
+                return
+            match = re.fullmatch(r"/api/shifts/(\d+)/archive", parsed.path)
+            if match:
+                self.archive_shift(int(match.group(1)), body)
+                return
+            if parsed.path == "/api/shifts/default/archive":
+                self.archive_shift(None, body)
+                return
+            match = re.fullmatch(r"/api/shifts/(\d+)/reactivate", parsed.path)
+            if match:
+                self.reactivate_shift(int(match.group(1)), body)
+                return
+            if parsed.path == "/api/therapists/shift":
+                self.assign_therapist_shift(body)
+                return
             match = re.fullmatch(r"/api/patients/(\d+)/preferences", parsed.path)
             if match:
                 self.save_patient_preferences(int(match.group(1)), body)
@@ -2122,7 +2209,7 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
                 return
             raise ApiError(HTTPStatus.NOT_FOUND, "API route not found")
         except ApiError as exc:
-            self.send_json({"error": exc.message}, exc.status)
+            self.send_json({"error": exc.message, **exc.details}, exc.status)
         except Exception as exc:  # pragma: no cover - final HTTP safety net
             print(f"Unhandled POST error: {exc!r}")
             self.send_json({"error": "The scheduler could not complete that request."}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -2193,6 +2280,94 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             session.commit()
         self.send_json({"active": active})
 
+    def shifts_view(self, params: dict[str, list[str]]) -> dict[str, Any]:
+        """Centres and their shifts for the Shifts screen."""
+        from services.shift_service import shifts_overview
+
+        raw = params.get("location", [""])[0]
+        try:
+            location_id = int(raw) if raw else None
+        except ValueError as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Choose a valid centre") from exc
+        with SessionLocal() as session:
+            return shifts_overview(session, location_id)
+
+    def _shift_action(self, action) -> Any:
+        """Run one shift change in a transaction; warnings/affected bookings go back to the screen."""
+        from services.shift_service import ShiftActionError
+
+        context = WORKSPACE_CONTEXT.get() or {}
+        actor = context.get("admin_user", "scheduler_manager")
+        with SessionLocal() as session:
+            try:
+                result = action(session, actor)
+            except ShiftActionError as exc:
+                session.rollback()
+                details = {}
+                if exc.warnings:
+                    details["warnings"] = exc.warnings
+                if exc.affected:
+                    details["affected"] = exc.affected[:50]
+                    details["affectedCount"] = len(exc.affected)
+                    details["needsAcknowledgement"] = True
+                if exc.confirm:
+                    details["needsAcknowledgement"] = True
+                    details["title"] = exc.title
+                    details["confirmLabel"] = exc.confirm_label
+                raise ApiError(HTTPStatus.CONFLICT if details else HTTPStatus.BAD_REQUEST, str(exc), details) from exc
+            session.commit()
+            return result
+
+    def save_shift(self, body: dict[str, Any]) -> None:
+        from services.shift_service import save_shift
+
+        try:
+            location_id = int(body.get("locationId"))
+            shift_id = None if body.get("id") in (None, "") else int(body.get("id"))
+        except (TypeError, ValueError) as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Choose a centre") from exc
+        result = self._shift_action(lambda session, actor: save_shift(
+            session, location_id=location_id, name=str(body.get("name") or ""), items=body.get("items"),
+            actor=actor, shift_id=shift_id, activate=body.get("activate") is True,
+            acknowledge_affected=body.get("acknowledgeAffected") is True,
+            edit_default=body.get("isDefault") is True))
+        self.send_json({"message": "Shift saved", **result})
+
+    def archive_shift(self, shift_id: int | None, body: dict[str, Any]) -> None:
+        """Deactivate a shift; ``shift_id`` None is the centre's default (body: locationId)."""
+        from services.shift_service import archive_shift
+
+        location_id = None
+        if shift_id is None:
+            try:
+                location_id = int(body.get("locationId"))
+            except (TypeError, ValueError) as exc:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "Choose a centre") from exc
+        result = self._shift_action(lambda session, actor: archive_shift(
+            session, shift_id, actor, location_id=location_id,
+            acknowledge_affected=body.get("acknowledgeAffected") is True))
+        self.send_json({"message": "Shift deactivated" if result.get("kept") else "Shift deleted", **result})
+
+    def reactivate_shift(self, shift_id: int, body: dict[str, Any]) -> None:
+        from services.shift_service import reactivate_shift
+
+        result = self._shift_action(lambda session, actor: reactivate_shift(
+            session, shift_id, actor, acknowledge_affected=body.get("acknowledgeAffected") is True))
+        self.send_json({"message": "Shift reactivated", **result})
+
+    def assign_therapist_shift(self, body: dict[str, Any]) -> None:
+        from services.shift_service import assign_shift
+
+        raw = body.get("shiftId")
+        try:
+            shift_id = None if raw in (None, "") else int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "Choose a shift") from exc
+        result = self._shift_action(lambda session, actor: assign_shift(
+            session, body.get("therapistIds"), shift_id, actor,
+            acknowledge_affected=body.get("acknowledgeAffected") is True))
+        self.send_json({"message": "Shift assigned", **result})
+
     def save_therapist_status(self, therapist_id: int, body: dict[str, Any]) -> None:
         """Staff set a clinician Active (gets new bookings) or Inactive (gets none)."""
         from zoneinfo import ZoneInfo
@@ -2234,26 +2409,31 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             raise ApiError(HTTPStatus.BAD_REQUEST, "Choose valid preferred days") from exc
         if any(day not in range(len(PREFERENCE_DAY_LABELS)) for day in picked_days):
             raise ApiError(HTTPStatus.BAD_REQUEST, "Choose valid preferred days")
-        preferred_slots = preferred_slots_from_request(body.get("times"), body.get("period"))
         with SessionLocal() as session:
             patient = session.get(Patient, patient_id)
             if patient is None:
                 raise ApiError(HTTPStatus.NOT_FOUND, "Patient not found")
+            # Times follow the centre's sessions (its clinicians' shifts), in clock order.
+            order, _ = patient_session_choices(session, patient.id)
+            preferred_slots = preferred_slots_from_request(body.get("times"), body.get("period"), order)
             existing = {
                 (item.day_of_week, item.slot_index): item
                 for item in session.scalars(select(PatientAvailability).where(
                     PatientAvailability.patient_id == patient.id
                 ))
             }
-            slot_scores = preference_slot_scores(preferred_slots)
+            slot_scores = preference_slot_scores(preferred_slots, order)
             if picked_days:
                 # Picked days: every slot gets the day bonus, plus the time score when times are set.
-                slot_scores = {slot: PREFERRED_DAY_BONUS + slot_scores.get(slot, 0) for slot in range(len(SLOTS))}
+                slot_scores = {slot: PREFERRED_DAY_BONUS + slot_scores.get(slot, 0) for slot in order}
                 preferred_days = set(picked_days)
             else:
                 preferred_days = set(range(len(PREFERENCE_DAY_LABELS))) if preferred_slots else set()
+            for (_, slot), stale in existing.items():
+                if slot not in order:
+                    stale.preference_score = 0  # A session the centre no longer runs.
             for day_index in range(len(PREFERENCE_DAY_LABELS)):
-                for slot in range(len(SLOTS)):
+                for slot in order:
                     availability = existing.get((day_index, slot))
                     if availability is None:
                         availability = PatientAvailability(
@@ -2717,7 +2897,7 @@ class TherapySchedulerHandler(SimpleHTTPRequestHandler):
             new_slot = int(body.get("slot"))
         except (TypeError, ValueError) as exc:
             raise ApiError(HTTPStatus.BAD_REQUEST, "Choose a valid starting time") from exc
-        if new_slot not in range(len(SLOTS)):
+        if not known_slot(new_slot):
             raise ApiError(HTTPStatus.BAD_REQUEST, "Choose a valid starting time")
         with SessionLocal() as session:
             appointment = session.get(Appointment, appointment_id)

@@ -13,7 +13,7 @@ from config import SolverSettings
 
 GET_ROUTES = (
     r"/api/schedules/jobs/\d+",
-    r"/api/(overview|schedule|patients|therapists|operations|health)",
+    r"/api/(overview|schedule|patients|therapists|operations|health|shifts)",
     r"/api/zoho/(status|draft)",
     r"/api/patients/\d+/preferences",
     r"/api/patients/\d+/activation",
@@ -27,6 +27,11 @@ POST_ROUTES = (
     r"/api/patients/\d+/preferences",
     r"/api/patients/\d+/status",
     r"/api/therapists/\d+/status",
+    r"/api/therapists/shift",
+    r"/api/shifts",
+    r"/api/shifts/\d+/archive",
+    r"/api/shifts/default/archive",
+    r"/api/shifts/\d+/reactivate",
     r"/api/appointments/\d+/(cancel|staff-cancel|move|reservation-preview|reserve)",
     r"/api/calendar/(reservation-preview|reserve)",
     r"/api/schedules/generate",

@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from database.db import Base
 from database.models import Appointment, Department, ParentAvailabilityResponse, Patient, TreatmentRequirement
 from importers.parent_response_demo_importer import load_parent_response_demo
-from scheduling.slot_config import SLOTS
+from scheduling.slot_config import SLOTS, slot_def
 from services.parent_response_service import process_daily_responses
 
 
@@ -24,7 +24,7 @@ def _appointments_table(session: Session) -> str:
         patient = session.get(Patient, item.patient_id)
         lines.append(
             f"| {patient.patient_code} | {item.date} | "
-            f"{SLOTS[item.slot_index].start_time:%H:%M} | {item.status.value} |"
+            f"{slot_def(item.slot_index).start_time:%H:%M} | {item.status.value} |"
         )
     return "\n".join(lines)
 
@@ -54,7 +54,7 @@ def run_demo(output_dir: Path) -> Path:
             for item in result.alternatives:
                 patient = session.get(Patient, item.patient_id)
                 alternatives.append(
-                    f"| {patient.patient_code} | {item.date} | {SLOTS[item.slot_index].start_time:%H:%M} |"
+                    f"| {patient.patient_code} | {item.date} | {slot_def(item.slot_index).start_time:%H:%M} |"
                 )
             progress = [
                 "| Patient | Therapy | Weekly target | Completed | Booked/proposed | Still to arrange |",

@@ -36,7 +36,7 @@ from database.workflow_lock import WorkflowLock, workflow_locks
 from scheduling.cp_sat_scheduler import generate_weekly_schedule, location_partitions
 from scheduling.response_repair import fill_released_openings
 from scheduling.schedule_validator import validate_schedule
-from scheduling.slot_config import SLOTS, slot_label
+from scheduling.slot_config import SLOTS, slot_def, slot_label
 from scheduling.types import ScheduledAppointment, ScheduleResult, SchedulingProblem
 from services.admin_reservation_service import reserve_admin_slot
 from services.parent_response_service import (
@@ -635,6 +635,11 @@ class FlowTest(Reliability):
             "locations": sorted(problem.location_capacities.items()),
             "patients": [tuple(row) for row in session.execute(select(Patient.id, Patient.active).order_by(Patient.id))],
         }
+        if problem.timetables:
+            # Shift sessions and which ones chain (a short break turned into lunch changes this).
+            # Added only when shifts exist, so fingerprints without shifts are unchanged.
+            values["timetables"] = sorted((location, list(table.order), sorted(table.links))
+                                          for location, table in problem.timetables.items())
         return hashlib.sha256(json.dumps(values, default=str, sort_keys=True).encode()).hexdigest()
 
     def preview_daily(
@@ -827,8 +832,8 @@ class FlowTest(Reliability):
             ))
             schedule = "\n".join(
                 f"{session.get(Department, a.department_id).name}: "
-                f"{SLOTS[a.slot_index].start_time.strftime('%I:%M %p').lstrip('0')}–"
-                f"{SLOTS[a.slot_index].end_time.strftime('%I:%M %p').lstrip('0')} IST"
+                f"{slot_def(a.slot_index).start_time.strftime('%I:%M %p').lstrip('0')}–"
+                f"{slot_def(a.slot_index).end_time.strftime('%I:%M %p').lstrip('0')} IST"
                 for a in sorted(items, key=lambda a: a.slot_index)
             )
             fields = {
@@ -839,7 +844,7 @@ class FlowTest(Reliability):
                 "therapy": " and ".join(therapy_names), "schedule": schedule,
                 "compact_schedule": "\n".join(
                     f"{session.get(Department, a.department_id).name}: "
-                    f"{SLOTS[a.slot_index].start_time:%H:%M}–{SLOTS[a.slot_index].end_time:%H:%M}"
+                    f"{slot_def(a.slot_index).start_time:%H:%M}–{slot_def(a.slot_index).end_time:%H:%M}"
                     for a in sorted(items, key=lambda a: a.slot_index)),
                 "date_display": target.strftime("%A, %d %B %Y"),
                 "centre": session.get(Location, items[0].location_id).name, "date": target.isoformat(),
@@ -849,7 +854,7 @@ class FlowTest(Reliability):
             if uses_daily_template(self):
                 fields.update(template_fields(
                     (session.get(Department, a.department_id).name,
-                     SLOTS[a.slot_index].start_time, SLOTS[a.slot_index].end_time)
+                     slot_def(a.slot_index).start_time, slot_def(a.slot_index).end_time)
                     for a in sorted(items, key=lambda a: a.slot_index)
                 ))
             if self.message_mode == "session" and len(format_offer_message(fields)) > 1024:
@@ -860,7 +865,7 @@ class FlowTest(Reliability):
             if uses_daily_template(self):
                 schedule_initial_job(self, outgoing, json.loads(outgoing.payload), target)
             if self.live:
-                outgoing.deadline_at = min(DateTime.combine(a.date, SLOTS[a.slot_index].start_time,
+                outgoing.deadline_at = min(DateTime.combine(a.date, slot_def(a.slot_index).start_time,
                     tzinfo=ZoneInfo("Asia/Kolkata")).astimezone(timezone.utc).replace(tzinfo=None) for a in items)
             if self.live and self.message_mode == "session" and self._session_deadline(session, recipient) <= time.time():
                 outgoing.status = "WAITING_FOR_CONTACT"
@@ -1261,7 +1266,7 @@ class FlowTest(Reliability):
         if self.live:
             # Session-window expiry is handled below by waiting for contact.
             # The durable final send cutoff is the visit's first start time.
-            deadlines = [DateTime.combine(a.date, SLOTS[a.slot_index].start_time,
+            deadlines = [DateTime.combine(a.date, slot_def(a.slot_index).start_time,
                          tzinfo=ZoneInfo("Asia/Kolkata")).astimezone(timezone.utc).replace(tzinfo=None)
                          for a in items]
             if job.kind == "TEXT":

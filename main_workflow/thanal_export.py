@@ -69,11 +69,23 @@ def bindings_from_catalog(source: dict, branch: str, catalog: dict) -> dict:
             local_id = str(therapy["local_id"])
             result["consultations"][local_id] = source_id
             result["departments"][local_id] = next(iter(candidates))
-    for index, slot in enumerate(SLOTS):
-        candidates = {(r.get("ID"), r.get("Slot_Number")) for r in catalog.get("slot_bindings", [])
-                      if r.get("branch_id") == branch and r.get("Start_Time") == slot.start_time.strftime("%H:%M:%S")
-                      and r.get("End_Time") == slot.end_time.strftime("%H:%M:%S")
-                      and str(r.get("appointment_slot_number")) == str(r.get("Slot_Number"))}
+    from scheduling.slot_config import encode_slot
+
+    # Each Zoho slot maps to our session with the same start/end time. The session number is
+    # worked out from the times themselves, so a freshly started app (which has not loaded
+    # the shift times yet) still finds new Zoho slots such as 12:35.
+    by_session: dict[int, set] = {}
+    for r in catalog.get("slot_bindings", []):
+        if r.get("branch_id") != branch or str(r.get("appointment_slot_number")) != str(r.get("Slot_Number")):
+            continue
+        try:
+            start = datetime.strptime(r.get("Start_Time"), "%H:%M:%S").time()
+            end = datetime.strptime(r.get("End_Time"), "%H:%M:%S").time()
+        except (TypeError, ValueError):
+            continue
+        if end > start:
+            by_session.setdefault(encode_slot(start, end), set()).add((r.get("ID"), r.get("Slot_Number")))
+    for index, candidates in by_session.items():
         if len(candidates) == 1:
             identifier, number = next(iter(candidates))
             if str(number).isdigit():
@@ -157,6 +169,10 @@ def appointment_fields(session: Any, item: Any, patient: Any, doctor: Any, names
     consultation = bindings.get("consultations", {}).get(str(item.department_id))
     slot = bindings.get("slots", {}).get(str(item.slot_index), {})
     if type(slot.get("number")) is not int or slot["number"] < 0:
+        from scheduling.slot_config import known_slot, slot_label
+        if known_slot(item.slot_index) and item.slot_index >= 10:
+            raise ValueError(f"Appointment time: Zoho has no {slot_label(item.slot_index)} time slot yet. "
+                             "Add it in Zoho, then refresh the export lookups.")
         raise ValueError("Slot Number: the Zoho slot numbering has not been verified")
     status = STATUSES.get(item.status.value)
     if status is None:
@@ -179,11 +195,11 @@ def appointment_fields(session: Any, item: Any, patient: Any, doctor: Any, names
 
 def timing_fields(day: date, slot_index: int) -> dict:
     """Supply the local clinic times needed by Zoho's session-creation workflow."""
-    from scheduling.slot_config import SLOTS
+    from scheduling.slot_config import known_slot, slot_def
 
-    if type(slot_index) is not int or not 0 <= slot_index < len(SLOTS):
+    if not known_slot(slot_index):
         raise ValueError("Appointment time: invalid scheduling slot")
-    slot = SLOTS[slot_index]
+    slot = slot_def(slot_index)
     start = datetime.combine(day, slot.start_time)
     end = datetime.combine(day, slot.end_time)
     return {"Date_Time": start.strftime("%d/%m/%Y %H:%M"),
@@ -204,10 +220,15 @@ def validate_fields(fields: dict, *, allow_preview: bool = False) -> None:
         day = datetime.strptime(fields["Date_field"], "%d/%m/%Y").date()
     except (ValueError, TypeError):
         raise ValueError("Date must use the verified day/month/year format") from None
-    from scheduling.slot_config import SLOTS
-    if type(fields["Duration"]) is not int or not any(
-            all(fields[name] == value for name, value in timing_fields(day, index).items())
-            for index in range(len(SLOTS))):
+    from scheduling.slot_config import encode_slot
+    try:
+        start = datetime.strptime(fields["Date_Time"], "%d/%m/%Y %H:%M")
+        end = datetime.strptime(fields["End_Time"], "%d/%m/%Y %H:%M:%S")
+        session = encode_slot(start.time(), end.time()) if start.date() == day and end > start else None
+    except (ValueError, TypeError):
+        session = None
+    if type(fields["Duration"]) is not int or session is None or any(
+            fields[name] != value for name, value in timing_fields(day, session).items()):
         raise ValueError("Appointment time: date, slot start/end and duration must agree")
     if fields["Status"] not in set(STATUSES.values()):
         raise ValueError("Unsupported Thanal appointment status")

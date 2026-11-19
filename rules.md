@@ -1,5 +1,155 @@
 # Therapy Scheduler Rules
 
+## Clinician shifts — 18 November 2026
+
+User decisions (17–18 Nov 2026): centres can run several therapist shifts (IQRAA:
+Shift 1 9:00–5:00, Shift 2 9:40–5:30, Shift 3 12:35–7:40); staff design shifts in a
+shift creator ("add session / add break", each row starting where the last ended),
+assign clinicians to shifts, and the scheduler books each clinician only in their
+shift; the calendar gets a shift filter (Shift 1 by default). "By default all should
+follow this 40 min slot"; a centre may use another length, but not two lengths in
+one centre; overlapping times "should show up as a warning"; children may wait
+through short breaks but not through lunch; 12:35–1:15 is lunch for some shifts and a
+session for others; the working day is 7:00 AM – 9:00 PM.
+
+- **Implemented — shift creator (Shifts screen).** Per centre: shifts made of
+  sessions and breaks (Short break or Lunch). A new row starts at the previous
+  row's end; a session's end is start + the centre's session length (40 min by
+  default). Save rejects wrong lengths, times outside 7:00 AM–9:00 PM, rows that
+  overlap inside the shift, and a break cutting through a session.
+- **Implemented — overlap warning.** A session that partly overlaps another active
+  shift's session at the same centre (e.g. 9:20–10:00 against 9:00–9:40) is listed
+  as a warning; such a shift can be saved as a **draft** but not used for
+  scheduling until fixed. Sessions must match another shift's times exactly or not
+  touch them, so within a centre sessions never partly overlap.
+- **Implemented — default shift.** Every centre starts on the original timetable
+  ("Shift 1", sessions 9:00–4:50, lunch 12:35–1:15, short breaks 10:20 and 3:15).
+  It is stored the first time the centre's shifts are edited. Clinicians without an
+  assignment work it. When a centre gets its first extra shift, its current
+  clinicians are recorded on Shift 1, so only clinicians who arrive later (e.g. from
+  the Zoho sync) show **Check shift**.
+- **Implemented — deactivating shifts and the session length, 18 Nov 2026.** User
+  decision: every centre starts on 40-minute Shift 1 (IQRAA keeps it); any shift,
+  including Shift 1, can be deactivated after an "are you sure" warning. The
+  default shift is deactivated last (other shifts first); a non-default shift
+  still needs its clinicians moved first. Once a centre has no active shift its
+  clinicians are not scheduled (shown as "No shift"); bookings stay as booked and
+  are listed in the warning. The next shift put in use becomes the centre's
+  default, and **its first session sets the session length** for the whole centre
+  (e.g. 9:00–9:50 → 50 minutes; 15 minutes to 3 hours); every later session and
+  shift at that centre must use that length until all its shifts are deactivated
+  again. One length per centre; other centres are unaffected. User decision (18 Nov
+  2026): the centre's original 40-minute **Shift 1 is never deleted** — deactivating
+  it keeps it in the list as **Inactive** (not used for scheduling) with a
+  **Reactivate** button. Reactivating first shows a warning (user decision, 18 Nov
+  2026): a centre uses one session length, so every shift of another length (in use
+  or draft) is listed and deleted on confirm; shifts already using 40 minutes stay
+  in use with their clinicians; clinicians left without a shift move to Shift 1;
+  upcoming bookings outside Shift 1 are listed and stay as booked. Shift 1 becomes
+  the default again and the centre returns to 40 minutes. Reactivation runs the same
+  overlap check as "Save and use": if a kept shift has a session that partly overlaps
+  a Shift 1 session (e.g. 9:20–10:00 against 9:00–9:40), the clashing times are shown
+  and Shift 1 stays inactive until staff fix them; exact matches and back-to-back
+  sessions are fine. Deactivating any other shift deletes it
+  ("Delete shift", after an "are you sure" warning).
+- **Implemented — assigning shifts (Clinical team).** Shift column with a dropdown
+  per clinician and a bulk "Assign shift" for clinicians of one centre. A shift
+  belongs to one centre. Upcoming bookings that fall outside the new hours are
+  listed and need "Save anyway"; they are **never moved or cancelled** and stay
+  valid for planning (the clinician keeps that one session open for them).
+- **Implemented — shift filter and Select all (Clinical team), 18 Nov 2026.** The
+  Filters panel has a Shift filter (grouped by centre). The header tick box selects
+  every clinician the current search and filters show, on every page, so e.g. all
+  Shift 2 clinicians can be moved together before Shift 2 is removed. A shift can
+  only be removed once nobody is on it (Shift 1 never). User decision (19 Nov 2026):
+  deactivating Shift 1 still works as before, and the Shift filter has **No shift
+  (n)** — the active clinicians with no active shift (not scheduled), shown even when
+  their calendars are empty. Staff pick it, tick Select all and assign them; they
+  leave the list once on an active shift, and No shift (0) means everyone is
+  covered. Clinical team only, not the Calendar. With many centres (19 Nov 2026) the
+  Shift filter follows the Location filter: with no location it offers only All
+  shifts and No shift (n) across all centres, with a hint to pick a location; with a
+  location it lists that centre's shifts, each with its count of active clinicians,
+  plus No shift (n) for that centre. Changing the location resets a shift from
+  another centre to All shifts. While any active clinician (at the chosen location)
+  has no shift, a banner above the table says "⚠ N clinicians have no shift and
+  won't be scheduled · Show them"; Show them applies the No shift and Active filters
+  and clears the name search and department filter (the location stays), so it
+  lists exactly the clinicians the banner counts. The banner hides at 0.
+- **Implemented — kept bookings that overlap new times, 18 Nov 2026.** User
+  decision: when a shift edit or a shift move leaves a kept booking that partly
+  overlaps a new session (e.g. kept 9:00–9:40, new 9:20–10:00), show a warning.
+  The confirmation lists each such booking with the new time it overlaps. On that
+  day the planner does not book the clinician (or room, beyond capacity) at the
+  overlapping new time. Clashes are checked by clock time, not session number, in
+  the planner, the quick preview, replacement offers and the safety check, so a
+  clinician, child or room can never be double-booked by overlapping times.
+- **Implemented — shift hours outside the planner, 18 Nov 2026.** A manual booking
+  at a time outside the clinician's shift shows the warning "This time is outside
+  the doctor's shift" and, like every booking warning, needs "Reserve anyway". The
+  manual-booking clash checks (clinician, child, room) compare clock times. The
+  replacement search ("pull a later visit forward") only offers openings inside each
+  clinician's shift, and treats a time as available unless it is marked unavailable,
+  like the planner (so new shift times such as 12:35 can be offered). Moving a visit
+  to a start time outside its doctor's shift is refused with "9:40–10:20 isn't a
+  session time in this doctor's shift. Choose one of their shift times." (user
+  wording, 19 Nov 2026).
+- **Implemented — booked times stay visible, 18 Nov 2026.** Every booking shown on
+  the calendar keeps its time row, even after no shift uses that time any more
+  (e.g. 5:30 PM removed from the last shift that had it).
+- **Implemented — break changes, 18 Nov 2026.** Saving a shift that is in use, or
+  removing one, lists upcoming back-to-back visits the change would split (e.g. a
+  short break turned into lunch, or a removed shift's short break) and needs "Save
+  anyway"; the visits stay as booked. A schedule preview made before such a change
+  can no longer be saved (its "has anything changed" check includes the centre's
+  sessions and which of them chain).
+- **Implemented — scheduling.** Each clinician is available only in their shift's
+  sessions. A centre's sessions are ordered by clock time; a back-to-back visit may
+  chain two sessions with no gap or with a short break between them, never across
+  lunch or an unexplained gap. A child may see clinicians from different shifts in
+  one visit when the times chain (e.g. 11:55 with a Shift 1 clinician, then 12:35
+  with a Shift 3 clinician). Part-day absences, moves ("Move this visit"),
+  replacement searches and admin bookings all use the centre's session order.
+- **Implemented — session numbers.** Original sessions keep numbers 0–9, so no
+  saved booking, preference or availability row was converted. A new session time's
+  number encodes its own start and end (100000 + start minute × 1440 + end minute),
+  identical in every database and process.
+- **Implemented — preferences.** A child's preferred times are the start times
+  their own clinicians' shifts use; "nearest free time" follows the centre's clock
+  order. Morning means a start before 12:30.
+- **Implemented — calendar.** A Shift picker (default shift first, other shifts,
+  All shifts) appears once a centre has more than one shift. Rows are the sessions
+  of the clinicians shown, in clock order; gaps show as "Break" or "Lunch break";
+  a session a clinician does not work shows "Lunch", "Break" or "Off shift" and
+  cannot be booked. The picker changes the view only, never scheduling.
+- **Implemented — Zoho.** A booking is sent with the Zoho time slot matching its
+  times. User decision (18 Nov 2026): a booking whose time Zoho does not have yet
+  waits on its own with the reason "Zoho has no 18:20–19:00 time slot yet"; every
+  other booking that day is still pushed, and the waiting one goes in a later push
+  once the slot exists and the lookups are refreshed. Zoho slots are matched to
+  sessions by their start and end times, so a freshly started app finds new slots
+  without first loading the shift times. On 18 Nov 2026 the 12:35, 16:50 and 17:30
+  40-minute slots (numbers 11–13) were added to Thanal's slot list via the API with
+  the user's OK; 18:20 and 19:00 were refused because Thanal's slot form only
+  accepts start times 09:00–18:00 (Thanal to widen it). On 19 Nov 2026 the export
+  lookup file was refreshed from Zoho (read only) with the three new slots, so
+  bookings at 12:35, 16:50 and 17:30 are pushed with slots 11, 12 and 13.
+- **Not in this version:** switching a centre's session length on a future "from
+  date" while keeping the old length until then, an "Add missing times to Zoho" button (needs Thanal's written OK), shift start
+  dates, different shifts per weekday, clinicians at two centres.
+- Tests: `tests/test_shifts.py` (IQRAA shifts, 15-session day, warnings and draft,
+  scheduling inside shifts, lunch, affected bookings, check-shift rule, overlapping
+  kept bookings, clock-time room use, off-shift manual booking, off-shift
+  replacement, booked time kept on calendar, break to lunch, deactivating Shift 1,
+  first session sets the length, default deactivated last, Shift 1 kept and reactivated with a warning, other shifts deleted, same-length shifts kept, reactivation blocked by overlapping times, Clinical team No shift flag, move outside the
+  doctor's shift explained),
+  `tests/test_thanal_export.py` (held rows, new Zoho slot without loaded shift
+  times, missing Zoho time), `tests/test_web_app.py` (calendar data),
+  `tests/test_multi_centre_e2e.py` (night plan across four centres with 40-, 50- and
+  30-minute shifts and one with no shift: visits inside each doctor's shift, no
+  clock overlaps, WhatsApp offers created with the real times and not sent, replies,
+  same-centre replacement suggestions, Zoho rows built or held per time).
+
 ## Exact preferred start time — 16 November 2026
 
 User decision: "preffered time, should have all the time slots ! … suppose patient
@@ -255,7 +405,8 @@ times are defined under "Daily automation" below.
 The existing stable Scheduler_Key, durable batches and acknowledgements remain
 in use. Creator lookup objects are compared by ID when reconciling a lost write
 response or checking for changes. Repeat pushes must not duplicate rows. Preview
-is read-only; held lookup/status rows block preparation. The separate test-gokul
+is read-only; held lookup/status rows wait on their own and the rest of the day is
+still pushed (user decision, 18 Nov 2026; see "Clinician shifts"). The separate test-gokul
 export retains its original text-field contract. No WhatsApp sends are enabled.
 
 Covered by tests/test_thanal_export.py and existing export/main-workflow tests.

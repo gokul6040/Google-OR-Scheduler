@@ -13,6 +13,7 @@ from database.models import (
     Department,
     PatientAbsence,
     PatientAvailability,
+    Therapist,
     TherapistAbsence,
     TherapistAvailability,
     TreatmentRequirement,
@@ -20,7 +21,8 @@ from database.models import (
 )
 from database.repository import load_scheduling_problem
 from scheduling.rules import placement_rejection_reason
-from scheduling.slot_config import valid_consecutive_block
+from scheduling.slot_config import peak_booked, timetable_for
+from services.shift_service import centre_timetable, clock_key, load_shift_context
 from scheduling.types import BundleItem, TherapyBundle
 from services.admin_reservation_service import (
     RELEASED_STATUSES, is_reserved_source, reserved_source_ids,
@@ -44,7 +46,8 @@ def _released_visit(session, vacant: Appointment) -> list[Appointment]:
         Appointment.bundle_id == vacant.bundle_id,
         Appointment.status.in_(RELEASED_STATUSES),
         Appointment.id.notin_(reserved_source_ids()),
-    ).order_by(Appointment.slot_index)))
+    )))
+    visit.sort(key=lambda item: clock_key(item.slot_index))
     return visit if any(item.id == vacant.id for item in visit) else [vacant]
 
 
@@ -87,11 +90,16 @@ def find_replacement_candidates(session, vacant: Appointment, week_start, *, who
     for item in problem.pinned:
         if item.date == vacant.date:
             same_day.setdefault(item.patient_id, []).append(item)
-    therapist_usage = Counter((item.therapist_id, item.date, item.slot_index) for item in problem.pinned)
-    location_usage = Counter((item.location_id, item.date, item.slot_index) for item in problem.pinned)
+    # Saved bookings per clinician/room and day, compared by clock time (a kept 9:00-9:40
+    # booking also blocks a freed 9:20-10:00 session).
+    therapist_usage: dict[tuple, Counter] = {}
+    location_usage: dict[tuple, Counter] = {}
+    for item in problem.pinned:
+        therapist_usage.setdefault((item.therapist_id, item.date), Counter())[item.slot_index] += 1
+        location_usage.setdefault((item.location_id, item.date), Counter())[item.slot_index] += 1
     open_slot = {source.id: not (
-        therapist_usage[(source.therapist_id, source.date, source.slot_index)]
-        or location_usage[(source.location_id, source.date, source.slot_index)] >=
+        peak_booked(therapist_usage.get((source.therapist_id, source.date), {}), source.slot_index)
+        or peak_booked(location_usage.get((source.location_id, source.date), {}), source.slot_index) >=
         problem.location_capacities.get(source.location_id, 0)
     ) for source in visit}
     needs: dict[int, list] = {}
@@ -117,10 +125,9 @@ def find_replacement_candidates(session, vacant: Appointment, week_start, *, who
         existing = same_day.get(patient_id, [])
         if any(item.location_id != slots[0].location_id for item in existing):
             return None
-        taken = sorted([item.slot_index for item in existing] + [source.slot_index for source in slots])
+        taken = [item.slot_index for item in existing] + [source.slot_index for source in slots]
         # One continuous visit: the opening is the visit, or joins the child's existing visit.
-        if (len(set(taken)) != len(taken) or taken != list(range(taken[0], taken[0] + len(taken)))
-                or not valid_consecutive_block(taken[0], len(taken))):
+        if len(set(taken)) != len(taken) or not timetable_for(problem, slots[0].location_id).chained(taken):
             return None
         used, chosen = Counter(), []
         for source in slots:
@@ -199,6 +206,14 @@ def find_pull_forward_candidates(session, vacant: Appointment, horizon_end):
     ).order_by(Appointment.date, Appointment.slot_index)))
     candidates = []
     seen_bundles = set()
+    shift_context = load_shift_context(session)
+    homes = {}  # therapist id -> home centre, for their shift
+
+    def on_shift(therapist_id: int, slot: int) -> bool:
+        if therapist_id not in homes:
+            homes[therapist_id] = session.scalar(select(Therapist.location_id).where(Therapist.id == therapist_id))
+        return slot in shift_context.therapist_sessions(therapist_id, homes[therapist_id])
+
     for appointment in future:
         bundle_key = (
             appointment.patient_id,
@@ -215,10 +230,12 @@ def find_pull_forward_candidates(session, vacant: Appointment, horizon_end):
                 Appointment.date == appointment.date,
                 Appointment.bundle_id == appointment.bundle_id,
                 Appointment.status.in_(ACTIVE_REPLACEMENT_STATUSES),
-            ).order_by(Appointment.slot_index)))
-        if appointment.id != group[0].id:
-            continue
-        if vacant.slot_index + len(group) > 10:
+            )))
+            group.sort(key=lambda item: clock_key(item.slot_index))
+        # The visit is reviewed once, from its earliest session by clock time.
+        appointment = group[0]
+        targets = centre_timetable(session, vacant.location_id).block(vacant.slot_index, len(group))
+        if targets is None:
             continue
 
         conflicting_visit = session.scalar(select(Appointment.id).where(
@@ -236,24 +253,27 @@ def find_pull_forward_candidates(session, vacant: Appointment, horizon_end):
         target_weekday = vacant.date.weekday()
         viable = True
         for offset, item in enumerate(group):
-            target_slot = vacant.slot_index + offset
+            target_slot = targets[offset]
+            # Same rule as the planner: available unless marked unavailable; clinicians
+            # additionally only within their shift (so new shift times like 12:35 count too).
             patient_available = session.scalar(select(PatientAvailability.id).where(
                 PatientAvailability.patient_id == item.patient_id,
                 PatientAvailability.day_of_week == target_weekday,
                 PatientAvailability.slot_index == target_slot,
-                PatientAvailability.available.is_(True),
-            ))
+                PatientAvailability.available.is_(False),
+            )) is None
             therapist_available = session.scalar(select(TherapistAvailability.id).where(
                 TherapistAvailability.therapist_id == item.therapist_id,
                 TherapistAvailability.day_of_week == target_weekday,
                 TherapistAvailability.slot_index == target_slot,
-                TherapistAvailability.available.is_(True),
-            ))
+                TherapistAvailability.available.is_(False),
+            )) is None
             therapist_absent = session.scalar(select(TherapistAbsence.id).where(
                 TherapistAbsence.therapist_id == item.therapist_id,
                 TherapistAbsence.date == vacant.date,
             ))
-            if not patient_available or not therapist_available or therapist_absent:
+            if (not patient_available or not therapist_available or therapist_absent
+                    or not on_shift(item.therapist_id, target_slot)):
                 viable = False
                 break
         if not viable:

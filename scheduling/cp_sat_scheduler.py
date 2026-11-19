@@ -11,9 +11,9 @@ from ortools.sat.python import cp_model
 
 from config import SOLVER_SETTINGS, SolverSettings
 from scheduling.bundle_builder import build_bundles
-from scheduling.rules import placement_rejection_reason
+from scheduling.rules import bundle_sessions, placement_rejection_reason
 from scheduling.schedule_validator import validate_schedule
-from scheduling.slot_config import WORKING_DAYS, SLOTS
+from scheduling.slot_config import WORKING_DAYS, peak_booked, slot_window, timetable_for
 from scheduling.types import (
     ScheduleResult,
     ScheduledAppointment,
@@ -47,20 +47,21 @@ def _candidate_placements(problem, bundles):
         period_start = bundle.period_index * 7
         period_end = min(problem.horizon_days, period_start + 7)
         for day in range(period_start, period_end):
-            for start_slot in range(len(SLOTS)):
+            for start_slot in timetable_for(problem, bundle.items[0].location_id).order:
                 reason = placement_rejection_reason(
                     problem, bundle, day, start_slot, check_therapists=False,
                 )
                 if reason:
                     rejected[bundle.id][reason] += 1
                     continue
+                sessions = bundle_sessions(problem, bundle, start_slot)
 
                 target_date = problem.week_start + timedelta(days=day)
                 weekday = target_date.weekday()
                 therapist_options = []
                 option_failure = None
                 for offset, item in enumerate(bundle.items):
-                    slot = start_slot + offset
+                    slot = sessions[offset]
                     therapist_id = item.therapist_id
                     if therapist_id not in problem.active_therapists:
                         option_failure = "NO_VALID_ASSIGNED_THERAPIST"
@@ -94,22 +95,63 @@ def _ranked_reasons(counter: Counter) -> tuple[str, ...]:
     return tuple(ranked) or ("THERAPIST_CAPACITY",)
 
 
+class _TimeUsage:
+    """Bookings per (clinician or room, day, session), read back by clock time.
+
+    ``usage[(who, day, slot)]`` is the most bookings at any moment of that session, so a
+    kept 9:00-9:40 booking makes a 9:20-10:00 session busy too.
+    """
+
+    def __init__(self) -> None:
+        self._booked: dict[tuple, Counter] = defaultdict(Counter)
+
+    def add(self, key: tuple) -> None:
+        who, day, slot = key
+        self._booked[(who, day)][slot] += 1
+
+    def __getitem__(self, key: tuple) -> int:
+        who, day, slot = key
+        booked = self._booked.get((who, day))
+        return peak_booked(booked, slot) if booked else 0
+
+
+def _add_time_limits(model, usage: dict, pinned: dict, capacity) -> None:
+    """Cap bookings at every moment of the day (clock time, not session numbers).
+
+    ``usage`` maps (who, day) -> {session: [variables]}; ``pinned`` maps (who, day) ->
+    Counter of saved sessions. Without overlapping sessions this is exactly one
+    ``new + saved <= capacity`` limit per used session, as before.
+    """
+    for (who, day), by_slot in usage.items():
+        saved = pinned.get((who, day), Counter())
+        windows = {slot: slot_window(slot) for slot in set(by_slot) | set(saved)}
+        moments = {window[0] for window in windows.values() if window}
+        groups = [[slot for slot, window in windows.items() if window and window[0] <= moment < window[1]]
+                  for moment in sorted(moments)]
+        groups += [[slot] for slot, window in windows.items() if window is None]
+        for slots in groups:
+            variables = [variable for slot in slots for variable in by_slot.get(slot, ())]
+            if variables:
+                model.Add(sum(variables) + sum(saved[slot] for slot in slots) <= capacity(who))
+
+
 def _selected_bundle_blockers(
     problem: SchedulingProblem,
     bundle: TherapyBundle,
     candidates: list[tuple[int, int, tuple[int, ...]]],
-    therapist_usage: Counter,
-    location_usage: Counter,
+    therapist_usage: _TimeUsage,
+    location_usage: _TimeUsage,
     patient_days: set[tuple[int, int]],
 ) -> Counter:
     """Explain which final-schedule constraints block a bundle's valid options."""
     blockers = Counter()
     for day, start, therapist_ids in candidates:
         candidate_blockers = set()
+        sessions = bundle_sessions(problem, bundle, start)
         if (bundle.patient_id, day) in patient_days:
             candidate_blockers.add("PATIENT_DAILY_VISIT_LIMIT")
         for offset, item in enumerate(bundle.items):
-            slot = start + offset
+            slot = sessions[offset]
             if therapist_usage[(therapist_ids[offset], day, slot)]:
                 candidate_blockers.add("THERAPIST_CAPACITY")
             if location_usage[(item.location_id, day, slot)] >= problem.location_capacities.get(
@@ -339,14 +381,14 @@ def _greedy_appointments(
     """Build a fast, rule-safe best-effort schedule for the quick preview."""
     appointments = list(problem.pinned)
     selected_bundles: set[str] = set()
-    therapist_usage = Counter()
-    location_usage = Counter()
+    therapist_usage = _TimeUsage()
+    location_usage = _TimeUsage()
     patient_days = set()
     for item in appointments:
         day = (item.date - problem.week_start).days
         if 0 <= day < problem.horizon_days:
-            therapist_usage[(item.therapist_id, day, item.slot_index)] += 1
-            location_usage[(item.location_id, day, item.slot_index)] += 1
+            therapist_usage.add((item.therapist_id, day, item.slot_index))
+            location_usage.add((item.location_id, day, item.slot_index))
             patient_days.add((item.patient_id, day))
 
     frequency_by_patient_location = defaultdict(int)
@@ -374,22 +416,25 @@ def _greedy_appointments(
     ):
         frequency = frequency_by_patient_location[(bundle.patient_id, bundle.items[0].location_id)]
         target_day = min(problem.horizon_days - 1, bundle.occurrence_index * max(1, 6 // frequency))
+        session_order = timetable_for(problem, bundle.items[0].location_id).order
         ordered_candidates = sorted(
             candidates[bundle.id],
-            key=lambda item: (abs(item[0] - target_day), item[0], item[1], item[2]),
+            # Earliest session first, by clock time (session numbers are identities, not order).
+            key=lambda item: (abs(item[0] - target_day), item[0], session_order.index(item[1]), item[2]),
         )
         for day, start, therapist_ids in ordered_candidates:
             if (bundle.patient_id, day) in patient_days:
                 continue
+            sessions = bundle_sessions(problem, bundle, start)
             if any(
-                therapist_usage[(therapist_ids[offset], day, start + offset)]
-                or location_usage[(item.location_id, day, start + offset)] >= problem.location_capacities.get(item.location_id, 0)
+                therapist_usage[(therapist_ids[offset], day, sessions[offset])]
+                or location_usage[(item.location_id, day, sessions[offset])] >= problem.location_capacities.get(item.location_id, 0)
                 for offset, item in enumerate(bundle.items)
             ):
                 continue
             target_date = problem.week_start + timedelta(days=day)
             for offset, item in enumerate(bundle.items):
-                slot = start + offset
+                slot = sessions[offset]
                 appointments.append(ScheduledAppointment(
                     patient_id=bundle.patient_id,
                     requirement_id=item.requirement_id,
@@ -400,8 +445,8 @@ def _greedy_appointments(
                     slot_index=slot,
                     bundle_id=bundle.id,
                 ))
-                therapist_usage[(therapist_ids[offset], day, slot)] += 1
-                location_usage[(item.location_id, day, slot)] += 1
+                therapist_usage.add((therapist_ids[offset], day, slot))
+                location_usage.add((item.location_id, day, slot))
             patient_days.add((bundle.patient_id, day))
             selected_bundles.add(bundle.id)
             break
@@ -414,14 +459,14 @@ def _greedy_result(problem: SchedulingProblem, started: float) -> ScheduleResult
     candidates, rejected = _candidate_placements(problem, bundles)
     appointments, selected_bundles = _greedy_appointments(problem, bundles, candidates)
     scheduled_by_requirement = Counter(item.requirement_id for item in appointments if item.counts_toward_requirement)
-    therapist_usage = Counter()
-    location_usage = Counter()
+    therapist_usage = _TimeUsage()
+    location_usage = _TimeUsage()
     patient_days = set()
     for appointment in appointments:
         day = (appointment.date - problem.week_start).days
         if 0 <= day < problem.horizon_days:
-            therapist_usage[(appointment.therapist_id, day, appointment.slot_index)] += 1
-            location_usage[(appointment.location_id, day, appointment.slot_index)] += 1
+            therapist_usage.add((appointment.therapist_id, day, appointment.slot_index))
+            location_usage.add((appointment.location_id, day, appointment.slot_index))
             patient_days.add((appointment.patient_id, day))
     missing_reasons = defaultdict(Counter)
     for bundle in bundles:
@@ -531,35 +576,34 @@ def generate_weekly_schedule(
     for key, usage in patient_day_bundles.items():
         model.Add(sum(usage) <= (0 if key in pinned_patient_days else 1))
 
-    therapist_usage = defaultdict(list)
-    patient_usage = defaultdict(list)
-    location_usage = defaultdict(list)
+    # (who, day) -> {session: [variables]}; limits are applied by clock time below.
+    therapist_usage = defaultdict(lambda: defaultdict(list))
+    patient_usage = defaultdict(lambda: defaultdict(list))
+    location_usage = defaultdict(lambda: defaultdict(list))
     for bundle in bundles:
         for day, start, therapist_ids in candidates[bundle.id]:
             variable = variables[(bundle.id, day, start, therapist_ids)]
+            sessions = bundle_sessions(problem, bundle, start)
             for offset, item in enumerate(bundle.items):
-                slot = start + offset
-                therapist_usage[(therapist_ids[offset], day, slot)].append(variable)
-                patient_usage[(bundle.patient_id, day, slot)].append(variable)
-                location_usage[(item.location_id, day, slot)].append(variable)
+                slot = sessions[offset]
+                therapist_usage[(therapist_ids[offset], day)][slot].append(variable)
+                patient_usage[(bundle.patient_id, day)][slot].append(variable)
+                location_usage[(item.location_id, day)][slot].append(variable)
 
-    pinned_therapist = Counter()
-    pinned_patient = Counter()
-    pinned_location = Counter()
+    pinned_therapist = defaultdict(Counter)
+    pinned_patient = defaultdict(Counter)
+    pinned_location = defaultdict(Counter)
     for item in problem.pinned:
         day = (item.date - problem.week_start).days
         if 0 <= day < problem.horizon_days and item.date.weekday() in WORKING_DAYS:
-            pinned_therapist[(item.therapist_id, day, item.slot_index)] += 1
-            pinned_patient[(item.patient_id, day, item.slot_index)] += 1
-            pinned_location[(item.location_id, day, item.slot_index)] += 1
+            pinned_therapist[(item.therapist_id, day)][item.slot_index] += 1
+            pinned_patient[(item.patient_id, day)][item.slot_index] += 1
+            pinned_location[(item.location_id, day)][item.slot_index] += 1
 
-    for key, usage in therapist_usage.items():
-        model.Add(sum(usage) + pinned_therapist[key] <= 1)
-    for key, usage in patient_usage.items():
-        model.Add(sum(usage) + pinned_patient[key] <= 1)
-    for key, usage in location_usage.items():
-        location_id = key[0]
-        model.Add(sum(usage) + pinned_location[key] <= problem.location_capacities.get(location_id, 0))
+    _add_time_limits(model, therapist_usage, pinned_therapist, lambda _who: 1)
+    _add_time_limits(model, patient_usage, pinned_patient, lambda _who: 1)
+    _add_time_limits(model, location_usage, pinned_location,
+                     lambda location_id: problem.location_capacities.get(location_id, 0))
 
     objective = []
     booked_days = defaultdict(set)
@@ -607,7 +651,8 @@ def generate_weekly_schedule(
                 by_bundle[item.bundle_id].append(item)
         selected_keys = set()
         for bundle_id, items in by_bundle.items():
-            ordered = sorted(items, key=lambda item: item.slot_index)
+            order = timetable_for(problem, items[0].location_id).order
+            ordered = sorted(items, key=lambda item: order.index(item.slot_index) if item.slot_index in order else item.slot_index)
             selected_keys.add((bundle_id, (ordered[0].date - problem.week_start).days,
                                ordered[0].slot_index, tuple(a.therapist_id for a in ordered)))
         for key, variable in variables.items():
@@ -661,6 +706,7 @@ def generate_weekly_schedule(
             if solver.BooleanValue(variables[(bundle.id, day, start, therapist_ids)]):
                 selected_bundles.add(bundle.id)
                 target_date = problem.week_start + timedelta(days=day)
+                sessions = bundle_sessions(problem, bundle, start)
                 for offset, item in enumerate(bundle.items):
                     appointments.append(
                         ScheduledAppointment(
@@ -670,22 +716,22 @@ def generate_weekly_schedule(
                             department_id=item.department_id,
                             location_id=item.location_id,
                             date=target_date,
-                            slot_index=start + offset,
+                            slot_index=sessions[offset],
                             bundle_id=bundle.id,
                         )
                     )
 
     generated = [item for item in appointments if item not in problem.pinned]
     scheduled_by_requirement = Counter(item.requirement_id for item in appointments if item.counts_toward_requirement)
-    selected_therapist_usage = Counter()
-    selected_location_usage = Counter()
+    selected_therapist_usage = _TimeUsage()
+    selected_location_usage = _TimeUsage()
     selected_patient_days = set()
     for appointment in appointments:
         day = (appointment.date - problem.week_start).days
         if not 0 <= day < problem.horizon_days:
             continue
-        selected_therapist_usage[(appointment.therapist_id, day, appointment.slot_index)] += 1
-        selected_location_usage[(appointment.location_id, day, appointment.slot_index)] += 1
+        selected_therapist_usage.add((appointment.therapist_id, day, appointment.slot_index))
+        selected_location_usage.add((appointment.location_id, day, appointment.slot_index))
         selected_patient_days.add((appointment.patient_id, day))
 
     missing_bundle_reasons = defaultdict(Counter)

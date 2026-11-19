@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from database.models import Appointment, AppointmentStatus, AuditLog, Patient, Therapist
 from flow_test.models import FlowExportItem, FlowInbox, FlowJob, FlowOffer, FlowOfferAppointment, FlowSetting
 from flow_test.zoho_import import put_setting, require_reconciled_source
-from scheduling.slot_config import SLOTS
+from scheduling.slot_config import SLOTS, slot_def
 
 if TYPE_CHECKING:
     from flow_test.service import FlowTest
@@ -233,7 +233,7 @@ def export_rows(flow: "FlowTest", session: Session, target: date, namespace: str
         fields = {"Scheduler_Key": f"{namespace}:{item.id}", "Reg_ID": patient.patient_code,
                   "PatientName": patient.name or patient.patient_code, "Doctor": doctor.name,
                   "Therapy_Date": item.date.strftime("%d-%m-%Y"),
-                  "TherapyTime": SLOTS[item.slot_index].start_time.strftime("%I:%M %p"), "Status": status}
+                  "TherapyTime": slot_def(item.slot_index).start_time.strftime("%I:%M %p"), "Status": status}
         if thanal:
             try:
                 fields = appointment_fields(session, item, patient, doctor, namespace, context=context)
@@ -250,7 +250,7 @@ def export_rows(flow: "FlowTest", session: Session, target: date, namespace: str
         if thanal:
             row.update(patientCode=patient.patient_code, patientName=patient.name,
                        display={"Registration": patient.name, "Consultant": doctor.name,
-                                "Appointment_Time_Slot": SLOTS[item.slot_index].start_time.strftime("%H:%M")})
+                                "Appointment_Time_Slot": slot_def(item.slot_index).start_time.strftime("%H:%M")})
         rows.append(row)
     return rows, blocked
 
@@ -288,9 +288,11 @@ def prepare_export(flow: "FlowTest", target: date) -> dict:
             assumed = finalise_unanswered(flow, session, target)
             diagnostics = []
             rows, blocked = export_rows(flow, session, target, namespace, diagnostics=diagnostics)
-            if diagnostics:
-                raise ValueError("Resolve the export preview's lookup/status issues before pushing: "
-                                 + "; ".join(dict.fromkeys(row["reason"] for row in diagnostics)))
+            # Rows with a lookup/status issue (e.g. a time Zoho has no slot for yet) wait on their
+            # own; every other row still goes (user decision, 18 Nov 2026). They are pushed by a
+            # later run once the issue is fixed, because they have no export record yet.
+            held = [{"appointmentId": row["appointmentId"], "patientCode": row["patientCode"],
+                     "reason": row["reason"]} for row in diagnostics]
             # A failed date must not block unrelated dates. A moved appointment
             # already frozen elsewhere waits for that record's older batch only.
             open_batches = [json.loads(item.value) for item in session.scalars(select(FlowSetting).where(
@@ -303,7 +305,7 @@ def prepare_export(flow: "FlowTest", target: date) -> dict:
             rows = [row for row in rows if row["appointmentId"] not in reserved]
             batch = {"id": uuid4().hex, "date": target.isoformat(), "target": getattr(flow, "export_target", TARGET),
                      "cutoffIST": ist_time(utc_now()), "assumedAcceptedVisits": assumed,
-                     "changes": rows, "awaitingStaff": blocked, "acknowledged": {}}
+                     "changes": rows, "awaitingStaff": blocked, "held": held, "acknowledged": {}}
             store_batch(session, batch)
             flow._audit(session, "flow_zoho_export_prepared", f"export:{batch['id']}")
             return batch

@@ -413,6 +413,27 @@ def test_patient_details_show_current_plan_and_assigned_clinician(db_session, mo
     assert payload["patient"]["active"] is False
 
 
+def test_patient_directory_lists_each_childs_centres_for_the_centre_filter(db_session, monkeypatch):
+    """Centre filter (19 Nov 2026): centres from active plans, else from earlier plans."""
+    department = Department(name="Speech", active=True)
+    kannur, calicut = Location(name="Kannur", capacity=2), Location(name="Calicut", capacity=2)
+    two, old, none = (Patient(patient_code=code, name=code, active=active)
+                      for code, active in (("P-TWO", True), ("P-OLD", False), ("P-NONE", True)))
+    db_session.add_all([department, kannur, calicut, two, old, none])
+    db_session.flush()
+    doctor = Therapist(therapist_code="T", name="T", department_id=department.id, location_id=kannur.id)
+    db_session.add(doctor)
+    db_session.flush()
+    for child, location, active in ((two, kannur, True), (two, calicut, True), (old, calicut, False)):
+        db_session.add(TreatmentRequirement(patient_id=child.id, department_id=department.id,
+                                            assigned_therapist_id=doctor.id, location_id=location.id,
+                                            sessions_per_week=1, sequence_order=0, active=active))
+    db_session.commit()
+    monkeypatch.setattr(web_app, "SessionLocal", lambda: nullcontext(db_session))
+    centres = {row["code"]: row["centres"] for row in web_app.patients_payload()["patients"]}
+    assert centres == {"P-TWO": ["Calicut", "Kannur"], "P-OLD": ["Calicut"], "P-NONE": []}
+
+
 def test_generate_schedule_uses_tomorrow_and_one_day_slots(monkeypatch):
     from types import SimpleNamespace
 
@@ -524,10 +545,14 @@ def test_schedule_payload_contains_display_ready_appointment(db_session, monkeyp
         {"therapy": "Occupational Therapy", "sessionsPerWeek": 1},
         {"therapy": "Speech Therapy", "sessionsPerWeek": 2},
     ]}
-    assert payload["calendarBreaks"] == [{
-        "afterSlot": 4, "start": "12:35", "end": "13:15", "label": "Lunch break",
-    }]
-    assert payload["slotLabels"][5] == "13:15–13:55"
+    # Without configured shifts every clinician works the original timetable (Shift 1).
+    assert [item["start"] for item in payload["sessions"]] == [
+        "09:00", "09:40", "10:35", "11:15", "11:55", "13:15", "13:55", "14:35", "15:30", "16:10"]
+    assert payload["slotLabels"]["5"] == "13:15–13:55"
+    assert payload["shiftOptions"] == ["Shift 1"]
+    doctor = payload["therapists"][0]
+    assert doctor["shiftName"] == "Shift 1" and doctor["sessions"] == list(range(10))
+    assert {"start": "12:35", "end": "13:15", "kind": "lunch"} in doctor["breaks"]
     assert payload["appointments"] == [{
         "id": appointment.id,
         "date": "2026-09-10",

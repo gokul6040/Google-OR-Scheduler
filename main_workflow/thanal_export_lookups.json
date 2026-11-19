@@ -1,7 +1,7 @@
 {
   "version": 1,
   "target": "thanal/eic/Schedule_Adhoc_Trial_Report",
-  "verified_at": "2026-11-11",
+  "verified_at": "2026-11-19",
   "registration_display": "Name2",
   "approved_branch_ids": [
     "149769000021575634"
@@ -85,6 +85,30 @@
       "Slot_Number": "10",
       "branch_id": "149769000021575634",
       "appointment_slot_number": "10"
+    },
+    {
+      "ID": "149769000335141538",
+      "Start_Time": "12:35:00",
+      "End_Time": "13:15:00",
+      "Slot_Number": "11",
+      "branch_id": "149769000021575634",
+      "appointment_slot_number": "11"
+    },
+    {
+      "ID": "149769000335139843",
+      "Start_Time": "16:50:00",
+      "End_Time": "17:30:00",
+      "Slot_Number": "12",
+      "branch_id": "149769000021575634",
+      "appointment_slot_number": "12"
+    },
+    {
+      "ID": "149769000335153031",
+      "Start_Time": "17:30:00",
+      "End_Time": "18:10:00",
+      "Slot_Number": "13",
+      "branch_id": "149769000021575634",
+      "appointment_slot_number": "13"
     },
     {
       "ID": "149769000024324562",

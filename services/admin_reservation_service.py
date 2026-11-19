@@ -21,7 +21,8 @@ from database.models import (
 from database.repository import (
     ACTIVE_SCHEDULE_STATUSES, _plan_end_date, course_session_counts, course_target,
 )
-from scheduling.slot_config import SLOTS, valid_consecutive_block
+from scheduling.slot_config import SLOTS, known_slot, peak_booked, slot_def, valid_consecutive_block
+from services.shift_service import centre_timetable, load_shift_context
 from services.patient_status_service import lock_patient
 
 
@@ -88,10 +89,11 @@ def _sources(session: Session, source_id: int, whole_visit: bool) -> list[Appoin
 
 
 def _covers(absence, target: date, slot: int) -> bool:
+    from database.repository import absence_sessions
+
+    # Part-day absences are judged by clock time, so shift sessions (e.g. 12:35) count too.
     return absence.date == target and (
-        absence.full_day or (absence.start_slot or 0) <= slot <= (
-            absence.end_slot if absence.end_slot is not None else absence.start_slot or 0
-        )
+        absence.full_day or slot in absence_sessions(absence.start_slot, absence.end_slot)
     )
 
 
@@ -105,7 +107,7 @@ def preview_admin_reservation(
 
 def preview_empty_slot(session: Session, opening: EmptySlot, patient_id: int) -> dict:
     """Preview a new appointment without writing a placeholder appointment."""
-    if not 0 <= opening.slot_index < len(SLOTS):
+    if not known_slot(opening.slot_index):
         raise ValueError("Choose a valid session time")
     for model, identifier in (
         (Therapist, opening.therapist_id), (Department, opening.department_id),
@@ -215,9 +217,14 @@ def _preview_reservation(
         )), None) if opening is None else None
         if current and (opening is not None or any(item.status != AppointmentStatus.PROPOSED for item in current)):
             warn("THERAPIST_CONFLICT", "The therapist already has another saved booking at this time.")
+        # A booking at a different session that overlaps in clock time (e.g. 9:00-9:40 vs 9:20-10:00).
+        if any(item.date == source.date and item.therapist_id == source.therapist_id
+               and item.slot_index != source.slot_index and peak_booked({item.slot_index: 1}, source.slot_index)
+               for item in appointments):
+            warn("THERAPIST_CONFLICT", "The therapist already has another saved booking at this time.")
         slots.append({
             "source_id": source.id, "date": source.date.isoformat(),
-            "slot": source.slot_index, "time": SLOTS[source.slot_index].start_time.strftime("%H:%M"),
+            "slot": source.slot_index, "time": slot_def(source.slot_index).start_time.strftime("%H:%M"),
             "therapist_id": source.therapist_id, "department_id": source.department_id,
             "location_id": source.location_id,
             "requirement_id": requirement.id if requirement else None,
@@ -230,15 +237,15 @@ def _preview_reservation(
     if same_day:
         # Joining the child's existing visit, directly before or after it, is one
         # continuous visit (user decision); anything else is a second visit.
-        taken = sorted([item.slot_index for item in same_day] + [item["slot"] for item in slots])
+        taken = [item.slot_index for item in same_day] + [item["slot"] for item in slots]
         joins = (all(item.location_id == sources[0].location_id for item in same_day)
                  and len(set(taken)) == len(taken)
-                 and taken == list(range(taken[0], taken[0] + len(taken)))
-                 and valid_consecutive_block(taken[0], len(taken)))
+                 and centre_timetable(session, sources[0].location_id).chained(taken))
         if not joins:
             warn("ANOTHER_VISIT", "The patient already has another visit on this date.")
     if any(item.location_id != sources[0].location_id for item in same_day):
         warn("MULTIPLE_BRANCHES", "The patient would attend more than one branch on the same day.")
+    shift_context = load_shift_context(session)
     patient_absences = list(session.scalars(select(PatientAbsence).where(PatientAbsence.patient_id == patient_id)))
     therapist_absences = list(session.scalars(select(TherapistAbsence)))
     for slot in slots:
@@ -246,7 +253,10 @@ def _preview_reservation(
         therapist = session.get(Therapist, slot["therapist_id"])
         if not therapist.active:
             warn("INACTIVE_THERAPIST", "The slot's therapist is inactive.")
-        if any(item.slot_index == slot["slot"] for item in same_day):
+        if slot["slot"] not in shift_context.therapist_sessions(therapist.id, therapist.location_id):
+            shift = shift_context.therapist_shift(therapist.id, therapist.location_id)
+            warn("THERAPIST_OFF_SHIFT", f"This time is outside the doctor's shift ({shift.name if shift else 'Shift 1'}).")
+        if any(peak_booked({item.slot_index: 1}, slot["slot"]) for item in same_day):
             warn("PATIENT_CONFLICT", "The patient already has a booking at this time.")
         if any(_covers(item, target, slot["slot"]) for item in patient_absences):
             warn("PATIENT_ABSENCE", "The patient is recorded as absent or has declined this date/time.")
@@ -264,15 +274,16 @@ def _preview_reservation(
             )) is not None:
                 warn(code, message)
         location = session.get(Location, slot["location_id"])
-        usage = sum(item.location_id == slot["location_id"] and item.date == target and item.slot_index == slot["slot"] for item in remaining)
+        usage = peak_booked(Counter(item.slot_index for item in remaining
+                                    if item.location_id == slot["location_id"] and item.date == target), slot["slot"])
         if not location.active or usage >= location.capacity:
             warn("BRANCH_CAPACITY", "The branch is inactive or its capacity would be exceeded.")
     selected_requirements = {item["requirement_id"] for item in slots}
     if any(item.active and item.location_id in (None, sources[0].location_id)
            and item.id not in selected_requirements for item in requirements):
         warn("CONTINUITY", "Other therapies in this patient's plan are not included in this visit.")
-    selected_slots = sorted(item["slot"] for item in slots)
-    if selected_slots != list(range(selected_slots[0], selected_slots[0] + len(slots))) or not valid_consecutive_block(selected_slots[0], len(slots)):
+    selected_slots = [item["slot"] for item in slots]
+    if len(set(selected_slots)) != len(selected_slots) or not centre_timetable(session, sources[0].location_id).chained(selected_slots):
         warn("CONTINUOUS_BLOCK", "This visit crosses a break or is not a valid continuous block.")
     for item in appointments:
         if item.id in superseded and item.bundle_id:

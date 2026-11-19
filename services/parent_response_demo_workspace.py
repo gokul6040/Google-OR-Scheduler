@@ -24,7 +24,7 @@ from database.models import (
 from database.repository import load_scheduling_problem
 from importers.parent_response_demo_importer import LARGE_FIXTURE, load_parent_response_demo
 from scheduling.schedule_validator import validate_schedule
-from scheduling.slot_config import SLOTS
+from scheduling.slot_config import SLOTS, slot_def
 from services.parent_response_service import process_daily_responses, weekly_progress
 from services.admin_reservation_service import preview_admin_reservation, reserve_admin_slot
 
@@ -49,7 +49,7 @@ def demo_snapshot(session: Session, target_date: date) -> dict:
             "event_id": item.event_id, "patient": patients[appointment.patient_id].patient_code,
             "name": patients[appointment.patient_id].name, "appointment_id": item.appointment_id,
             "reply": item.reply, "scope": item.unavailable_scope,
-            "time": SLOTS[item.appointment_slot].start_time.strftime("%H:%M"),
+            "time": slot_def(item.appointment_slot).start_time.strftime("%H:%M"),
             "processed": item.processed_at is not None,
         })
     rows = [{
@@ -61,8 +61,8 @@ def demo_snapshot(session: Session, target_date: date) -> dict:
         "branch": branches[item.location_id].name,
         "therapy": departments[item.department_id].name,
         "date": item.date.isoformat(), "slot": item.slot_index,
-        "time": SLOTS[item.slot_index].start_time.strftime("%H:%M"),
-        "end_time": SLOTS[item.slot_index].end_time.strftime("%H:%M"),
+        "time": slot_def(item.slot_index).start_time.strftime("%H:%M"),
+        "end_time": slot_def(item.slot_index).end_time.strftime("%H:%M"),
         "status": item.status.value, "bundle": item.bundle_id,
         "reply": group_replies.get((item.patient_id, item.bundle_id, item.date), "NO_REPLY"),
     } for item in appointments]
@@ -284,7 +284,7 @@ class ResponseDemoWorkspace:
                         "therapy": departments[item.department_id].name,
                         "therapist": therapists[item.therapist_id].name,
                         "date": item.date.isoformat(),
-                        "time": SLOTS[item.slot_index].start_time.strftime("%H:%M"),
+                        "time": slot_def(item.slot_index).start_time.strftime("%H:%M"),
                         "bundle": item.bundle_id,
                     } for item in result.alternatives],
                     "unmet": [{

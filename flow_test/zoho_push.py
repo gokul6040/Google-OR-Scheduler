@@ -317,6 +317,12 @@ def write_updates(settings, token, changes, existing, *, verify=verify_target, e
     return confirmed
 
 
+def held_summary(rows: list[dict]) -> list[dict]:
+    """Rows not pushed this time and why (child code and reason only)."""
+    return [{"appointmentId": row["appointmentId"], "patientCode": row.get("patientCode", ""),
+             "reason": row["reason"]} for row in rows]
+
+
 def run_push(settings: ZohoCreatorSettings, access_token: str, base_url: str, admin_token: str, target: date, *, apply: bool,
              exchange: Callable[[str, dict], dict] | None = None,
              verify: Callable = verify_target, key_prefix: str = "test-") -> dict:
@@ -329,10 +335,9 @@ def run_push(settings: ZohoCreatorSettings, access_token: str, base_url: str, ad
     if not apply:
         return {"mode": "PREVIEW ONLY", "date": target.isoformat(), "target": preview["target"],
                 "changesReady": len(preview["changes"]), "wouldAssumeAcceptedVisits": preview["wouldAssumeAcceptedVisits"],
-                "awaitingFinalisation": preview["awaitingFinalisation"], "lastPush": preview["lastPush"]}
-    if preview.get("blockedReasons") and not preview.get("openBatch"):
-        raise ValueError("Resolve export lookup/status issues before pushing: " + "; ".join(dict.fromkeys(
-            row["reason"] for row in preview["blockedReasons"])))
+                "awaitingFinalisation": preview["awaitingFinalisation"], "lastPush": preview["lastPush"],
+                "held": held_summary(preview.get("blockedReasons", []))}
+    # Rows with a lookup/status issue wait on their own; the rest of the day still goes.
     connection = {"token": access_token, "renew_at": monotonic() + 2700}
 
     def token():
@@ -420,13 +425,16 @@ def run_push(settings: ZohoCreatorSettings, access_token: str, base_url: str, ad
                          f"Successful rows were saved; batch retained. {tasks} Fix these records, then push again.")
     result = exchange("finish", {"batchId": batch["id"]})
     summary = {**result, "created": created, "updated": updated, "reconciled": recovered,
-               "assumedAcceptedVisits": batch["assumedAcceptedVisits"], "mode": "APPLIED"}
+               "assumedAcceptedVisits": batch["assumedAcceptedVisits"], "mode": "APPLIED",
+               "held": held_summary(batch.get("held", []))}
     if batch.get("resumed"):
         # Finish the frozen attempt, then catch changes received since its cutoff.
         current = run_push(settings, token(), base_url, admin_token, target, apply=True, exchange=exchange,
                            verify=verify, key_prefix=key_prefix)
         for field in ("created", "updated", "reconciled", "assumedAcceptedVisits", "pushed"):
             current[field] += summary[field]
+        current["held"] = summary["held"] + [item for item in current["held"]
+                                             if item["appointmentId"] not in {h["appointmentId"] for h in summary["held"]}]
         current["resumedBatch"] = batch["id"]
         return current
     return summary

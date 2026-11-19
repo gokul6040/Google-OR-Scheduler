@@ -14,7 +14,8 @@ from database.repository import load_scheduling_problem
 from flow_test.models import FlowOffer
 from scheduling.rules import placement_rejection_reason
 from scheduling.schedule_validator import validate_schedule
-from scheduling.slot_config import SLOTS, slot_label
+from scheduling.slot_config import SLOTS, slot_label, timetable_for
+from services.shift_service import clock_key
 from scheduling.types import BundleItem, TherapyBundle
 from services.admin_reservation_service import RELEASED_STATUSES, is_reserved_source
 from services.rolling_schedule_service import monday
@@ -49,16 +50,16 @@ def preview_chain(session, flow, source_id):
     offered_ids = {int(item) for raw in session.scalars(select(FlowOffer.appointment_ids))
                    for item in json.loads(raw)}
     reserved_ids = set(session.scalars(select(AdminSlotReservation.appointment_id)))
-    candidates = [sorted(group, key=lambda item: item.slot_index) for group in grouped.values()
+    candidates = [sorted(group, key=lambda item: clock_key(item.slot_index)) for group in grouped.values()
                   if all(item.status == AppointmentStatus.PROPOSED and item.id not in offered_ids
                          and item.id not in reserved_ids for item in group)]
     current = list(problem.pinned)
     openings = [(source.date, source.slot_index, source.therapist_id, source.department_id, source.location_id)]
     moves, moved_ids = [], set()
     while openings:
-        openings.sort()
+        openings.sort(key=lambda opening: (opening[0], clock_key(opening[1]), opening[2:]))
         target_date, target_slot, therapist_id, department_id, location_id = openings.pop(0)
-        for group in sorted(candidates, key=lambda items: (items[0].date, items[0].slot_index, items[0].id)):
+        for group in sorted(candidates, key=lambda items: (items[0].date, clock_key(items[0].slot_index), items[0].id)):
             anchor = group[0]
             if (anchor.id in moved_ids or anchor.date <= target_date or not patients[anchor.patient_id].active
                     or (anchor.therapist_id, anchor.department_id, anchor.location_id)
@@ -85,8 +86,11 @@ def preview_chain(session, flow, source_id):
             bundle = TherapyBundle(anchor.bundle_id or f"PIN-{anchor.id}", anchor.patient_id, 0, tuple(items))
             if placement_rejection_reason(problem, bundle, (target_date - start).days, target_slot):
                 continue
-            moved = [replace(item, date=target_date, slot_index=target_slot + row.slot_index - anchor.slot_index)
-                     for item, row in zip(sorted(old, key=lambda item: item.slot_index), group)]
+            targets = timetable_for(problem, anchor.location_id).block(target_slot, len(group))
+            if targets is None:
+                continue
+            moved = [replace(item, date=target_date, slot_index=slot)
+                     for item, slot in zip(sorted(old, key=lambda item: clock_key(item.slot_index)), targets)]
             trial = [item for item in current if item not in old] + moved
             issues, _ = validate_schedule(problem, trial)
             if issues:
@@ -95,7 +99,8 @@ def preview_chain(session, flow, source_id):
                 "patientName": patients[anchor.patient_id].name or patients[anchor.patient_id].patient_code,
                 "fromDate": anchor.date.isoformat(), "fromSlot": anchor.slot_index,
                 "fromTime": slot_label(anchor.slot_index), "toDate": target_date.isoformat(),
-                "toSlot": target_slot, "toTime": slot_label(target_slot), "sessions": len(group)})
+                "toSlot": target_slot, "toSlots": list(targets), "toTime": slot_label(target_slot),
+                "sessions": len(group)})
             moved_ids.update(item.id for item in group)
             openings.extend((item.date, item.slot_index, item.therapist_id, item.department_id, item.location_id)
                             for item in group)
@@ -147,7 +152,7 @@ def save_chain(session, flow, source_id, preview_token, request_id, admin_user):
         for offset, appointment_id in enumerate(move["appointmentIds"]):
             item = session.get(Appointment, appointment_id)
             item.date = date.fromisoformat(move["toDate"])
-            item.slot_index = move["toSlot"] + offset
+            item.slot_index = move["toSlots"][offset] if move.get("toSlots") else move["toSlot"] + offset
             item.source = "manual"
     session.add(AuditLog(action="replacement_chain_approved", entity=f"appointment:{source_id}",
         new_value=json.dumps(reviewed["moves"]), user=admin_user))

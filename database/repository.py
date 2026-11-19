@@ -24,7 +24,7 @@ from database.models import (
     TreatmentRequirement,
 )
 from scheduling.types import RequirementInput, ScheduledAppointment, SchedulingProblem
-from scheduling.slot_config import SLOTS
+from scheduling.slot_config import SLOTS, catalog_slots, known_slot, slot_def, timetable_for
 
 
 ACTIVE_SCHEDULE_STATUSES = (
@@ -80,6 +80,17 @@ def _plan_end_date(start_date: date | None, duration_months: int | None) -> date
     month = month_number % 12 + 1
     end_exclusive = date(year, month, min(start_date.day, monthrange(year, month)[1]))
     return end_exclusive - timedelta(days=1)
+
+
+def absence_sessions(start_slot: int | None, end_slot: int | None) -> list[int]:
+    """Every session overlapping a part-day absence, judged by clock time (not by number)."""
+    first = start_slot or 0
+    last = end_slot if end_slot is not None else first
+    if not (known_slot(first) and known_slot(last)):
+        return []
+    window_start, window_end = slot_def(first).start_time, slot_def(last).end_time
+    return [slot.slot_index for slot in catalog_slots()
+            if slot.start_time < window_end and slot.end_time > window_start]
 
 
 def load_scheduling_problem(
@@ -156,24 +167,32 @@ def load_scheduling_problem(
     # exceptions/preferences.  Loading every generated default row from a
     # hosted database (over 160k patient rows in the live source) delays every
     # weekly preview without adding planning information.
+    # Each clinician works only the sessions of their shift (their centre's default
+    # shift unless assigned another; the original 10 sessions when no shifts exist).
+    from services.shift_service import load_shift_context
+
+    shift_context = load_shift_context(session)
+    all_sessions = [slot.slot_index for slot in catalog_slots()]
     therapist_availability = {
-        (therapist_id, weekday, slot.slot_index)
-        for therapist_id in therapists
+        (therapist_id, weekday, slot)
+        for therapist_id, therapist in therapists.items()
         for weekday in range(6)
-        for slot in SLOTS
+        for slot in shift_context.therapist_sessions(therapist_id, therapist.location_id)
     }
     therapist_unavailable = session.scalars(select(TherapistAvailability).where(
         TherapistAvailability.available.is_(False)
     ))
+    marked_unavailable = set()
     for item in therapist_unavailable:
+        marked_unavailable.add((item.therapist_id, item.day_of_week, item.slot_index))
         therapist_availability.discard((item.therapist_id, item.day_of_week, item.slot_index))
 
     patient_ids = {item.patient_id for item in inputs}
     patient_availability = {
-        (patient_id, weekday, slot.slot_index)
+        (patient_id, weekday, slot)
         for patient_id in patient_ids
         for weekday in range(6)
-        for slot in SLOTS
+        for slot in all_sessions
     }
     patient_preferences = {}
     patient_overrides = session.scalars(select(PatientAvailability).where(or_(
@@ -191,17 +210,13 @@ def load_scheduling_problem(
     for item in session.scalars(select(TherapistAbsence).where(
         TherapistAbsence.date >= week_start, TherapistAbsence.date <= week_end
     )):
-        slots = range(len(SLOTS)) if item.full_day else range(
-            item.start_slot or 0, (item.end_slot or item.start_slot or 0) + 1
-        )
+        slots = all_sessions if item.full_day else absence_sessions(item.start_slot, item.end_slot)
         absences.update((item.therapist_id, item.date, slot) for slot in slots)
     patient_absences = set()
     for item in session.scalars(select(PatientAbsence).where(
         PatientAbsence.date >= week_start, PatientAbsence.date <= week_end
     )):
-        slots = range(len(SLOTS)) if item.full_day else range(
-            item.start_slot or 0, (item.end_slot or item.start_slot or 0) + 1
-        )
+        slots = all_sessions if item.full_day else absence_sessions(item.start_slot, item.end_slot)
         patient_absences.update((item.patient_id, item.date, slot) for slot in slots)
     locations = {item.id: item.capacity for item in session.scalars(select(Location).where(Location.active.is_(True)))}
     active_therapists = {item.id for item in therapists.values() if item.active}
@@ -245,7 +260,22 @@ def load_scheduling_problem(
                 assignment_override="THERAPIST_MISMATCH" in overrides.get(item.id, ()),
                 overridden_warnings=overrides.get(item.id, ()),
             ))
+    # A saved booking stays valid if its clinician's shift changed later: keep that one
+    # session open for them on that weekday (the week has one date per weekday, which
+    # the booking itself occupies) and keep its session in the centre's order.
+    pinned_sessions: dict[int, set[int]] = {}
+    configured = shift_context.configured_locations()
+    for item in pinned:
+        key = (item.therapist_id, item.date.weekday(), item.slot_index)
+        if item.location_id in configured and key not in marked_unavailable:
+            therapist_availability.add(key)
+        pinned_sessions.setdefault(item.location_id, set()).add(item.slot_index)
+    timetables = {
+        location_id: shift_context.timetable(location_id, pinned_sessions.get(location_id, ()))
+        for location_id in configured
+    }
     return SchedulingProblem(
+        timetables=timetables,
         week_start=week_start,
         requirements=inputs,
         therapist_availability=therapist_availability,
@@ -321,9 +351,9 @@ def limit_new_bookings_to_day(problem: SchedulingProblem, target: date) -> None:
     """Keep weekly accounting and allow new placements only on the target day."""
     hold_for_picked_days(problem, target)
     problem.new_booking_slots = {
-        (requirement.therapist_id, requirement.department_id, requirement.location_id, target, slot.slot_index)
+        (requirement.therapist_id, requirement.department_id, requirement.location_id, target, slot)
         for requirement in problem.requirements
-        for slot in SLOTS
+        for slot in timetable_for(problem, requirement.location_id).order
     }
 
 

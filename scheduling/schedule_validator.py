@@ -1,6 +1,6 @@
 from collections import Counter, defaultdict
 
-from scheduling.slot_config import SLOTS, valid_consecutive_block
+from scheduling.slot_config import known_slot, overbooked_moments, timetable_for
 from scheduling.types import ScheduledAppointment, SchedulingProblem, ValidationIssue
 
 
@@ -22,9 +22,14 @@ REPORT_KEYS = (
 def validate_schedule(problem: SchedulingProblem, appointments: list[ScheduledAppointment]):
     issues: list[ValidationIssue] = []
     requirement_map = {item.id: item for item in problem.requirements}
-    therapist_slots = Counter((a.therapist_id, a.date, a.slot_index) for a in appointments)
-    patient_slots = Counter((a.patient_id, a.date, a.slot_index) for a in appointments)
-    location_slots = Counter((a.location_id, a.date, a.slot_index) for a in appointments)
+    # Bookings per clinician/child/room and day, compared by clock time (9:00-9:40 clashes with 9:20-10:00).
+    therapist_slots: dict[tuple, Counter] = defaultdict(Counter)
+    patient_slots: dict[tuple, Counter] = defaultdict(Counter)
+    location_slots: dict[tuple, Counter] = defaultdict(Counter)
+    for a in appointments:
+        therapist_slots[(a.therapist_id, a.date)][a.slot_index] += 1
+        patient_slots[(a.patient_id, a.date)][a.slot_index] += 1
+        location_slots[(a.location_id, a.date)][a.slot_index] += 1
     patient_day_locations: dict[tuple[int, object], set[int]] = defaultdict(set)
     pinned = set(problem.pinned)
 
@@ -40,7 +45,7 @@ def validate_schedule(problem: SchedulingProblem, appointments: list[ScheduledAp
         )
         if mismatched_assignment and not saved_off_plan:
             issues.append(ValidationIssue("wrong_therapist", "Assigned therapist/department mismatch."))
-        if not 0 <= appointment.slot_index < len(SLOTS):
+        if not known_slot(appointment.slot_index):
             issues.append(ValidationIssue("invalid_slot_durations", "Unknown slot index."))
         completed_history = appointment in pinned and appointment.status == "COMPLETED"
         if not completed_history and "THERAPIST_ABSENCE" not in accepted and (appointment.therapist_id, appointment.date, appointment.slot_index) in problem.absences:
@@ -58,14 +63,14 @@ def validate_schedule(problem: SchedulingProblem, appointments: list[ScheduledAp
             ))
         patient_day_locations[(appointment.patient_id, appointment.date)].add(appointment.location_id)
 
-    for count in therapist_slots.values():
-        if count > 1:
+    for booked in therapist_slots.values():
+        for _ in range(overbooked_moments(booked, 1)):
             issues.append(ValidationIssue("therapist_overlaps", "Therapist is double-booked."))
-    for count in patient_slots.values():
-        if count > 1:
+    for booked in patient_slots.values():
+        for _ in range(overbooked_moments(booked, 1)):
             issues.append(ValidationIssue("patient_overlaps", "Patient is double-booked."))
-    for (location_id, _, _), count in location_slots.items():
-        if count > problem.location_capacities.get(location_id, 0):
+    for (location_id, _), booked in location_slots.items():
+        for _ in range(overbooked_moments(booked, problem.location_capacities.get(location_id, 0))):
             issues.append(ValidationIssue("location_capacity_violations", "Location capacity exceeded."))
     for locations in patient_day_locations.values():
         if len(locations) > 1:
@@ -79,23 +84,27 @@ def validate_schedule(problem: SchedulingProblem, appointments: list[ScheduledAp
             by_bundle[appointment.bundle_id].append(appointment)
     for bundle_appointments in by_bundle.values():
         dates = {item.date for item in bundle_appointments}
-        slots = sorted(item.slot_index for item in bundle_appointments)
         locations = {item.location_id for item in bundle_appointments}
         patients = {item.patient_id for item in bundle_appointments}
-        if (slots[-1] - slots[0] + 1 > len(slots) and len(dates) == len(locations) == 1
-                and len(patients) == 1 and pinned.issuperset(bundle_appointments)):
+        if len(dates) != 1 or len(locations) != 1:
+            issues.append(ValidationIssue("broken_consecutive_bundles", "Bundle is not consecutive."))
+            continue
+        # Back-to-back is judged on the centre's session order (clock time), not on numbers.
+        timetable = timetable_for(problem, next(iter(locations)))
+        slots = [item.slot_index for item in bundle_appointments]
+        if len(set(slots)) != len(slots) or any(slot not in timetable.order for slot in slots):
+            issues.append(ValidationIssue("broken_consecutive_bundles", "Bundle is not consecutive."))
+            continue
+        slots.sort(key=timetable.order.index)
+        if len(patients) == 1 and pinned.issuperset(bundle_appointments):
             # An explicitly released session can leave a gap in a saved visit.
             # Use it only to validate the original sequence, never as capacity or demand.
             first = bundle_appointments[0]
             visit = (first.patient_id, first.date, first.location_id, first.bundle_id)
-            slots = sorted(slots + [slot for slot in range(slots[0] + 1, slots[-1])
-                                    if slot not in slots and (*visit, slot) in problem.released_bundle_slots])
-        if (
-            len(dates) != 1
-            or len(locations) != 1
-            or slots != list(range(slots[0], slots[0] + len(slots)))
-            or not valid_consecutive_block(slots[0], len(slots))
-        ):
+            slots = sorted(set(slots) | {slot for slot in timetable.gap_sessions(slots[0], slots[-1])
+                                         if (*visit, slot) in problem.released_bundle_slots},
+                           key=timetable.order.index)
+        if timetable.block(slots[0], len(slots)) != tuple(slots):
             issues.append(ValidationIssue("broken_consecutive_bundles", "Bundle is not consecutive."))
 
     report = {key: sum(issue.code == key for issue in issues) for key in REPORT_KEYS}
